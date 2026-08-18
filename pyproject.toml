@@ -1,0 +1,77 @@
+[project]
+name = "gym-track"
+version = "0.1.0"
+description = "Multi-agent WhatsApp training assistant"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "A",    # flake8-builtins
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez -- naive datetimes are a real hazard here
+    "T20",  # flake8-print -- logging is structured, print() is not
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert on private behaviour and shadow builtins in fixtures.
+"tests/**" = ["A002", "A003"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.13"
+files = ["src/app", "tests"]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_any_generics = true
+no_implicit_reexport = true
+show_error_codes = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: requires ephemeral infrastructure containers",
+    "e2e: exercises the full inbound-to-outbound path",
+]
