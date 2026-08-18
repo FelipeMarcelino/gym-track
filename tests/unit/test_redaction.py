@@ -116,3 +116,47 @@ def test_content_policy_decides_how_much_text_survives(
     redactor = TelemetryRedactor(policy=policy)
 
     assert redactor.redact_text("liga pra +5511912345678") == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "leak"),
+    [
+        ("token=super-secret-value", "super-secret-value"),
+        ("password: hunter2", "hunter2"),
+        ('api_key="abc123"', "abc123"),
+        ("failed with authorization: Bearer xyz.jwt.parts", "xyz.jwt.parts"),
+        ("client_secret=s3cr3t; retrying", "s3cr3t"),
+        ("connecting to postgresql+asyncpg://gym_api:hunter2@db:5432/gym", "hunter2"),
+        ("amqp://gym_track:rabbitpass@broker:5672/", "rabbitpass"),
+    ],
+)
+def test_secrets_written_as_text_are_stripped(
+    redactor: TelemetryRedactor, text: str, leak: str
+) -> None:
+    """Field-name redaction never sees these: client libraries put credentials
+    into exception messages and DSNs, as prose."""
+    redacted = redactor.redact_text(text)
+
+    assert leak not in redacted
+    assert REDACTED in redacted
+
+
+def test_the_key_stays_visible_when_its_value_is_stripped(
+    redactor: TelemetryRedactor,
+) -> None:
+    """Knowing *which* credential failed is the useful half of the message."""
+    assert redactor.redact_text("token=abc") == f"token={REDACTED}"
+
+
+def test_extending_the_deny_list_also_extends_text_redaction() -> None:
+    redactor = TelemetryRedactor(extra_denied_keys=frozenset({"pin"}))
+
+    assert "1234" not in redactor.redact_text("pin=1234")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["ok=1", "reps: 12", "peso=80", "https://example.com/exercises?id=7"],
+)
+def test_harmless_assignments_survive(redactor: TelemetryRedactor, text: str) -> None:
+    assert redactor.redact_text(text) == text

@@ -20,6 +20,22 @@ from typing import Any, Final
 from app.observability.correlation import current_context
 from app.observability.redaction import TelemetryRedactor
 
+#: Keys the formatter owns. An `extra` of the same name is emitted under an
+#: `extra_` prefix instead of replacing them: a record that claims a trace it
+#: was not emitted under is worse than no record at all.
+RESERVED_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "correlation_id",
+        "level",
+        "linked_trace_ids",
+        "logger",
+        "message",
+        "timestamp",
+        "trace_id",
+        "workflow_execution_id",
+    }
+)
+
 #: LogRecord attributes that are metadata about logging itself; anything else a
 #: caller attaches through `extra` is treated as payload and redacted.
 _STANDARD_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
@@ -81,7 +97,8 @@ class StructuredFormatter(logging.Formatter):
         if extras:
             redacted = self._redactor.redact(extras)
             assert isinstance(redacted, Mapping)
-            payload.update(redacted)
+            for key, value in redacted.items():
+                payload[f"extra_{key}" if key in RESERVED_FIELDS else key] = value
 
         if record.exc_info:
             payload["exception"] = self._redactor.redact_text(self.formatException(record.exc_info))

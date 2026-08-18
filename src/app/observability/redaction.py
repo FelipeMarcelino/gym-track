@@ -53,6 +53,23 @@ _PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
 #: A run of digits long enough to be an identifier rather than a set count.
 _LONG_DIGITS = re.compile(r"\b\d{11,}\b")
 
+#: Credentials inside a connection URL. Driver exceptions quote the DSN back at
+#: you, password included.
+_URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^:/@\s]+):([^@\s]+)@")
+
+
+def _secret_assignment_pattern(denied: frozenset[str]) -> re.Pattern[str]:
+    """`token=abc`, `password: hunter2`, `api_key="..."` written inside prose.
+
+    Client libraries put credentials in exception messages all the time, and a
+    deny-list that only inspects field names never sees them. Built from the
+    same deny-list so extending one extends both.
+    """
+    parts = "|".join(sorted(re.escape(part) for part in denied))
+    return re.compile(
+        rf"(?i)\b([\w.-]*(?:{parts})[\w.-]*)\s*[=:]\s*((?:Bearer|Basic|Token)\s+\S+|\"[^\"]*\"|'[^']*'|[^\s,;)\]}}]+)"
+    )
+
 
 class ContentPolicy(StrEnum):
     """How much raw content a component may emit (§30.3).
@@ -76,6 +93,7 @@ class TelemetryRedactor:
     ) -> None:
         self._policy = policy
         self._denied = DENY_LISTED_KEY_PARTS | extra_denied_keys
+        self._secret_assignment = _secret_assignment_pattern(self._denied)
 
     @property
     def policy(self) -> ContentPolicy:
@@ -90,7 +108,9 @@ class TelemetryRedactor:
             return text
         if self._policy in (ContentPolicy.METADATA_ONLY, ContentPolicy.DISABLED):
             return REDACTED
-        redacted = _PHONE.sub(REDACTED, text)
+        redacted = self._secret_assignment.sub(rf"\1={REDACTED}", text)
+        redacted = _URL_CREDENTIALS.sub(rf"\1:{REDACTED}@", redacted)
+        redacted = _PHONE.sub(REDACTED, redacted)
         return _LONG_DIGITS.sub(REDACTED, redacted)
 
     def redact(self, value: Any) -> Any:

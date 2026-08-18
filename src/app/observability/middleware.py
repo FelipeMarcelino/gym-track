@@ -7,6 +7,7 @@ no framework at all on the other side.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from typing import Any, Final
@@ -28,6 +29,12 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 CORRELATION_HEADER: Final = b"x-correlation-id"
 TRACE_HEADER: Final = b"x-trace-id"
 
+#: The shape `new_correlation_id()` produces. An inbound header that does not
+#: match is replaced rather than trusted: the value ends up in every log record
+#: for the request, and a caller-controlled string there is both a PII leak
+#: (`x-correlation-id: +5511912345678`) and an unbounded field.
+_CORRELATION_ID = re.compile(r"^[0-9a-f]{32}$")
+
 
 class CorrelationMiddleware:
     """Opens a request-scoped trace and echoes both ids back on the response.
@@ -46,7 +53,7 @@ class CorrelationMiddleware:
             return
 
         headers: list[tuple[bytes, bytes]] = list(scope.get("headers", []))
-        incoming = _header(headers, CORRELATION_HEADER)
+        incoming = _accepted_correlation_id(_header(headers, CORRELATION_HEADER))
 
         with request_scope(correlation_id=incoming) as context:
 
@@ -59,6 +66,13 @@ class CorrelationMiddleware:
                 await send(message)
 
             await self._app(scope, receive, send_with_correlation)
+
+
+def _accepted_correlation_id(value: str | None) -> str | None:
+    """Honour a caller's correlation id only when it is one of ours."""
+    if value is None or not _CORRELATION_ID.match(value):
+        return None
+    return value
 
 
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:

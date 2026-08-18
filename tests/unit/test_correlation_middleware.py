@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import MutableMapping
 from typing import Any
 
 import pytest
 
-from app.observability import CorrelationMiddleware, current_context
+from app.observability import CorrelationMiddleware, current_context, new_correlation_id
 from app.observability.middleware import CORRELATION_HEADER, TRACE_HEADER
 
 
@@ -49,18 +50,19 @@ async def test_a_request_runs_inside_a_correlation_scope() -> None:
 
 async def test_an_inbound_correlation_id_is_honoured() -> None:
     """A retry or an internal caller keeps its correlation across the boundary."""
+    accepted = new_correlation_id()
 
     async def app(scope: Any, receive: Any, send: Any) -> None:
         context = current_context()
         assert context is not None
-        assert context.correlation_id == "corr-from-caller"
+        assert context.correlation_id == accepted
         await send({"type": "http.response.start", "status": 200, "headers": []})
 
     sent = await _call(
-        CorrelationMiddleware(app), headers=[(b"X-Correlation-Id", b"corr-from-caller")]
+        CorrelationMiddleware(app), headers=[(b"X-Correlation-Id", accepted.encode())]
     )
 
-    assert dict(sent[0]["headers"])[CORRELATION_HEADER] == b"corr-from-caller"
+    assert dict(sent[0]["headers"])[CORRELATION_HEADER] == accepted.encode()
 
 
 async def test_each_request_gets_its_own_trace() -> None:
@@ -106,3 +108,45 @@ async def test_the_scope_closes_even_when_the_application_raises() -> None:
         await _call(CorrelationMiddleware(app))
 
     assert current_context() is None
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        b"+5511912345678",
+        b"nao-e-um-id",
+        b"' OR 1=1--",
+        b"x" * 4096,
+        b"",
+    ],
+)
+async def test_a_correlation_id_that_is_not_ours_is_replaced(supplied: bytes) -> None:
+    """The header ends up in every log record for the request, so a
+    caller-controlled string there is a PII leak and an unbounded field."""
+    seen: dict[str, str] = {}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        context = current_context()
+        assert context is not None
+        seen["correlation_id"] = context.correlation_id
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    await _call(CorrelationMiddleware(app), headers=[(b"x-correlation-id", supplied)])
+
+    assert seen["correlation_id"] != supplied.decode(errors="replace")
+    assert re.fullmatch(r"[0-9a-f]{32}", seen["correlation_id"])
+
+
+async def test_a_correlation_id_in_our_own_format_is_honoured() -> None:
+    minted = new_correlation_id()
+    seen: dict[str, str] = {}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        context = current_context()
+        assert context is not None
+        seen["correlation_id"] = context.correlation_id
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    await _call(CorrelationMiddleware(app), headers=[(b"x-correlation-id", minted.encode())])
+
+    assert seen["correlation_id"] == minted

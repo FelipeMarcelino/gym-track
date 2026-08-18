@@ -151,3 +151,21 @@ def test_no_secret_survives_a_realistic_record() -> None:
     for leak in ("hunter2", "deadbeef", "5511987654321"):
         assert leak not in emitted
     assert "fiz 3 series" in emitted, "operational content must still be readable"
+
+
+def test_an_extra_cannot_hijack_the_canonical_correlation_fields(
+    log_stream: io.StringIO,
+) -> None:
+    """A record claiming a trace it was not emitted under is worse than no
+    record: it breaks exactly the linkage this formatter exists to guarantee."""
+    with request_scope() as context:
+        logging.getLogger("app.api").info(
+            "handled",
+            extra={"trace_id": "hijacked", "level": "CRITICAL", "user_id": "u-1"},
+        )
+
+    record = _records(log_stream)[0]
+    assert record["trace_id"] == context.trace_id
+    assert record["level"] == "INFO"
+    assert record["extra_trace_id"] == "hijacked", "the caller's value is kept, but namespaced"
+    assert record["user_id"] == "u-1"
