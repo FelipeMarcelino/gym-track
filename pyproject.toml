@@ -5,8 +5,12 @@ description = "Multi-agent WhatsApp training assistant"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "alembic>=1.14",
+    "asyncpg>=0.30",
+    "psycopg[binary]>=3.2",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
+    "sqlalchemy[asyncio]>=2.0.36",
 ]
 
 [build-system]
@@ -22,6 +26,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.9",
+    "testcontainers[postgres]>=4.9",
 ]
 
 # ---------------------------------------------------------------------------
@@ -30,7 +35,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests"]
+src = ["src", "tests", "migrations"]
 
 [tool.ruff.lint]
 select = [
@@ -53,13 +58,16 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Tests may assert on private behaviour and shadow builtins in fixtures.
 "tests/**" = ["A002", "A003"]
+# Migration bodies are generated from the models: their long create_table calls
+# are easier to diff against the generator's output when left as emitted.
+"migrations/versions/**" = ["E501"]
 
 # ---------------------------------------------------------------------------
 # mypy
 # ---------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.13"
-files = ["src/app", "tests"]
+files = ["src/app", "tests", "migrations"]
 strict = true
 warn_unreachable = true
 warn_unused_ignores = true

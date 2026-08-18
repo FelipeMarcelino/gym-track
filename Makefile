@@ -11,12 +11,12 @@ sync: ## Install/refresh dependencies into .venv
 	uv sync --frozen
 
 fmt: ## Format the codebase
-	uv run ruff format src tests
-	uv run ruff check --fix src tests
+	uv run ruff format src tests migrations
+	uv run ruff check --fix src tests migrations
 
 lint: ## Check formatting and lint rules
-	uv run ruff format --check src tests
-	uv run ruff check src tests
+	uv run ruff format --check src tests migrations
+	uv run ruff check src tests migrations
 
 typecheck: ## Run mypy in strict mode
 	uv run mypy
@@ -36,3 +36,6 @@ down: ## Stop local infrastructure and drop its volumes
 
 migrate: ## Apply database migrations to the local stack
 	uv run alembic upgrade head
+
+provision: ## Reconcile database roles, passwords and grants with the policy
+	uv run python -m app.infrastructure.postgres.provisioning
