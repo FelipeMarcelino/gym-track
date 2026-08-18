@@ -1,6 +1,8 @@
 # Implementation Plan
 
-Derived from `whatsapp_training_ai_architecture_v1.0.md` (the normative architecture spec).
+Derived from `whatsapp_training_ai_architecture_v1.1.md` (the normative architecture spec).
+v1.1 keeps §1–45 byte-identical to v1.0 and adds the traceability appendix: §46 (Q1–Q160),
+§47 (DEC-001..015) and §48 (traceability maintenance rule).
 This file is the **index**. Each sprint is detailed in its own file under `doc/sprints/`
 and is written **one at a time**, immediately before it starts — not all upfront.
 
@@ -18,6 +20,12 @@ and is written **one at a time**, immediately before it starts — not all upfro
   Tests belong to the workstream that introduces the behavior, not to a cleanup pass at the end.
 - **The spec is normative, the plan is not.** Where this plan and the architecture spec
   disagree, the spec wins, or the spec gets an ADR amending it.
+- **Branch and PR per unit of work.** Per `CLAUDE.md`: features on `feat/<name>`, bugfixes on
+  `hotfix/<name>`, documentation on `doc/<name>`, each merged to `main` through a PR opened with
+  `gh`. A sprint is not a branch — each workstream inside it is.
+- **Every ADR carries traceability.** Per spec §48, an ADR links back to the affected spec
+  section and, where applicable, the originating Q decision and DEC record. Architectural changes
+  are captured as ADRs rather than introduced implicitly in code.
 
 ## Sprint list
 
