@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from app.config import ServiceName
 from app.infrastructure.postgres import models
@@ -192,3 +193,26 @@ def test_domain_layer_does_not_know_about_sqlalchemy() -> None:
     }
     leaking = {path: modules for path, modules in offenders.items() if modules}
     assert not leaking, f"domain modules importing persistence: {leaking}"
+
+
+def test_enum_columns_carry_a_check_constraint() -> None:
+    """`native_enum=False` alone yields a bare VARCHAR: the CHECK is what makes
+    the string-backed enum a real constraint for writes that bypass the ORM."""
+    enum_columns = [
+        (table.name, column.name, column.type)
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, sa.Enum)
+    ]
+    for table_name, column_name, column_type in enum_columns:
+        assert column_type.create_constraint, f"{table_name}.{column_name} would accept any string"
+
+
+def test_enum_check_constraints_reach_the_generated_ddl() -> None:
+    """The constraint must survive into CREATE TABLE, not just live in metadata."""
+    ddl = str(
+        sa.schema.CreateTable(Base.metadata.tables["outbound_messages"]).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+    assert "CHECK (delivery_state IN (" in ddl

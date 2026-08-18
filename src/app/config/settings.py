@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import timedelta
 from enum import StrEnum
 from typing import Any, Final
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,10 +85,11 @@ class PostgresSettings(BaseModel):
         return self._dsn(self.admin)
 
     def _dsn(self, role: PostgresRole) -> str:
-        password = role.password.get_secret_value()
-        return (
-            f"postgresql+asyncpg://{role.user}:{password}@{self.host}:{self.port}/{self.database}"
-        )
+        # Percent-encode the user-info: a generated password containing @, /, ?,
+        # # or % would otherwise change where the driver thinks the host starts.
+        user = quote(role.user, safe="")
+        password = quote(role.password.get_secret_value(), safe="")
+        return f"postgresql+asyncpg://{user}:{password}@{self.host}:{self.port}/{self.database}"
 
 
 class RabbitMQSettings(BaseModel):
@@ -101,9 +103,10 @@ class RabbitMQSettings(BaseModel):
     workflow_prefetch: int = Field(default=1, ge=1)
 
     def url(self) -> str:
-        password = self.password.get_secret_value()
-        virtual_host = self.virtual_host.lstrip("/")
-        return f"amqp://{self.user}:{password}@{self.host}:{self.port}/{virtual_host}"
+        user = quote(self.user, safe="")
+        password = quote(self.password.get_secret_value(), safe="")
+        virtual_host = quote(self.virtual_host.lstrip("/"), safe="")
+        return f"amqp://{user}:{password}@{self.host}:{self.port}/{virtual_host}"
 
 
 class RedisSettings(BaseModel):
@@ -113,7 +116,9 @@ class RedisSettings(BaseModel):
     password: SecretStr | None = None
 
     def url(self) -> str:
-        credentials = "" if self.password is None else f":{self.password.get_secret_value()}@"
+        credentials = (
+            "" if self.password is None else f":{quote(self.password.get_secret_value(), safe='')}@"
+        )
         return f"redis://{credentials}{self.host}:{self.port}/{self.database}"
 
 

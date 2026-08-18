@@ -36,3 +36,6 @@ down: ## Stop local infrastructure and drop its volumes
 
 migrate: ## Apply database migrations to the local stack
 	uv run alembic upgrade head
+
+provision: ## Reconcile database roles, passwords and grants with the policy
+	uv run python -m app.infrastructure.postgres.provisioning

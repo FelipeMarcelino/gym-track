@@ -5,7 +5,9 @@ of the domain model arrives with the domain that writes it.
 
 Every table carries a UUIDv7 primary key (decision D5) and creation/update
 stamps. Enums are stored as checked strings rather than native PostgreSQL enum
-types, so adding a value later is an ordinary migration.
+types -- `create_constraint=True` is what makes the CHECK real, so a value
+written outside the ORM is refused by the database rather than read back later
+as an unknown member.
 
 Revision ID: 0001_walking_skeleton
 Revises:
@@ -33,7 +35,14 @@ def upgrade() -> None:
         sa.Column("timezone", sa.String(length=64), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("active", "blocked", name="userstatus", native_enum=False, length=64),
+            sa.Enum(
+                "active",
+                "blocked",
+                name="userstatus",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -57,7 +66,14 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Uuid(), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("active", "closed", name="conversationstatus", native_enum=False, length=64),
+            sa.Enum(
+                "active",
+                "closed",
+                name="conversationstatus",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column(
@@ -135,7 +151,13 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Uuid(), nullable=False),
         sa.Column(
             "provider",
-            sa.Enum("whatsapp", name="messagingprovider", native_enum=False, length=64),
+            sa.Enum(
+                "whatsapp",
+                name="messagingprovider",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column("external_id_ciphertext", sa.LargeBinary(), nullable=False),
@@ -168,7 +190,14 @@ def upgrade() -> None:
         sa.Column("conversation_id", sa.Uuid(), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("open", "flushed", name="messagebatchstatus", native_enum=False, length=64),
+            sa.Enum(
+                "open",
+                "flushed",
+                name="messagebatchstatus",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column("generation", sa.Integer(), nullable=False),
@@ -213,13 +242,26 @@ def upgrade() -> None:
         sa.Column("conversation_id", sa.Uuid(), nullable=False),
         sa.Column(
             "provider",
-            sa.Enum("whatsapp", name="messagingprovider", native_enum=False, length=64),
+            sa.Enum(
+                "whatsapp",
+                name="messagingprovider",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column("external_message_id", sa.String(length=255), nullable=False),
         sa.Column(
             "direction",
-            sa.Enum("inbound", "outbound", name="messagedirection", native_enum=False, length=64),
+            sa.Enum(
+                "inbound",
+                "outbound",
+                name="messagedirection",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column(
@@ -231,6 +273,7 @@ def upgrade() -> None:
                 "unsupported",
                 name="messagecontenttype",
                 native_enum=False,
+                create_constraint=True,
                 length=64,
             ),
             nullable=False,
@@ -276,7 +319,14 @@ def upgrade() -> None:
         sa.Column("domain_event_id", sa.Uuid(), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("pending", "published", name="outboxstatus", native_enum=False, length=64),
+            sa.Enum(
+                "pending",
+                "published",
+                name="outboxstatus",
+                native_enum=False,
+                create_constraint=True,
+                length=64,
+            ),
             nullable=False,
         ),
         sa.Column("exchange", sa.String(length=128), nullable=False),
@@ -354,6 +404,7 @@ def upgrade() -> None:
                 "failed",
                 name="workflowexecutionstatus",
                 native_enum=False,
+                create_constraint=True,
                 length=64,
             ),
             nullable=False,
@@ -409,6 +460,7 @@ def upgrade() -> None:
                 "failed",
                 name="deliverystate",
                 native_enum=False,
+                create_constraint=True,
                 length=64,
             ),
             nullable=False,

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import load_settings
 from app.infrastructure.postgres import models  # noqa: F401 -- registers the tables
+from app.infrastructure.postgres.autogenerate import include_name
 from app.infrastructure.postgres.base import Base
 
 config = context.config
@@ -41,6 +42,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_name=include_name,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -51,6 +53,7 @@ def _run_migrations(connection: Connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        include_name=include_name,
     )
     with context.begin_transaction():
         context.run_migrations()

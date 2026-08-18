@@ -60,7 +60,7 @@ def postgres_dsn_parts() -> Iterator[tuple[str, int]]:
     if not _docker_is_available():
         pytest.skip("no reachable Docker daemon")
 
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.community.postgres import PostgresContainer
 
     container = PostgresContainer(
         "postgres:17-alpine",

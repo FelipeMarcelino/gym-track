@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from pydantic import SecretStr
+from sqlalchemy import create_engine
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -21,6 +23,7 @@ from app.infrastructure.postgres.models import (
     MessagingProvider,
     User,
 )
+from app.infrastructure.postgres.provisioning import sync_service_roles
 from tests.integration.conftest import alembic_config
 
 pytestmark = [pytest.mark.integration]
@@ -137,6 +140,7 @@ async def test_migrated_schema_matches_the_models(
     from alembic.autogenerate import compare_metadata
     from alembic.migration import MigrationContext
 
+    from app.infrastructure.postgres.autogenerate import include_name
     from app.infrastructure.postgres.base import Base
 
     engine = create_async_engine(migrated_database.postgres.admin_dsn())
@@ -144,7 +148,10 @@ async def test_migrated_schema_matches_the_models(
         async with engine.connect() as connection:
             differences = await connection.run_sync(
                 lambda sync_connection: compare_metadata(
-                    MigrationContext.configure(sync_connection), Base.metadata
+                    MigrationContext.configure(
+                        sync_connection, opts={"include_name": include_name}
+                    ),
+                    Base.metadata,
                 )
             )
     finally:
@@ -221,3 +228,105 @@ async def test_domain_events_are_append_only_for_every_service(
                     await connection.execute(sa.text("UPDATE domain_events SET event_version = 2"))
         finally:
             await engine.dispose()
+
+
+async def test_database_refuses_an_enum_value_written_outside_the_orm(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The CHECK is the point: plain SQL must not be able to store a state the
+    application cannot read back."""
+    async with unit_of_work(session_factory) as session:
+        user = User(locale="pt-BR", timezone="UTC")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.flush()
+        user_id, conversation_id = user.id, conversation.id
+
+    with pytest.raises(sa.exc.IntegrityError):
+        async with unit_of_work(session_factory) as session:
+            await session.execute(
+                sa.text(
+                    "INSERT INTO outbound_messages "
+                    "(id, user_id, conversation_id, response_group_id, sequence, text, "
+                    " delivery_state, attempts, created_at, updated_at) "
+                    "VALUES (gen_random_uuid(), :user_id, :conversation_id, "
+                    " gen_random_uuid(), 1, 'oi', 'teleported', 0, now(), now())"
+                ),
+                {"user_id": user_id, "conversation_id": conversation_id},
+            )
+
+
+# --------------------------------------------------------------------------
+# Provisioning is repeatable, because passwords and grants outlive a migration
+# --------------------------------------------------------------------------
+
+
+async def test_rotated_password_reaches_postgresql_on_reprovision(
+    migrated_database: ApplicationSettings,
+) -> None:
+    """A password rotated after 0002 was stamped must still be applied, or every
+    connection for that service starts failing."""
+    rotated = "rotated$$pass'word@1"
+    settings = migrated_database.model_copy(deep=True)
+    settings.postgres.roles[ServiceName.DISPATCHER].password = SecretStr(rotated)
+
+    admin = create_engine(migrated_database.postgres.admin_dsn().replace("+asyncpg", "+psycopg"))
+    try:
+        with admin.begin() as connection:
+            sync_service_roles(connection, settings)
+    finally:
+        admin.dispose()
+
+    engine = create_async_engine(settings.postgres.dsn_for(ServiceName.DISPATCHER))
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(sa.text("SELECT 1")) == 1
+    finally:
+        await engine.dispose()
+        # Put the password the rest of the session expects back in place.
+        admin = create_engine(
+            migrated_database.postgres.admin_dsn().replace("+asyncpg", "+psycopg")
+        )
+        with admin.begin() as connection:
+            sync_service_roles(connection, migrated_database)
+        admin.dispose()
+
+
+async def test_reprovisioning_revokes_a_privilege_removed_from_the_policy(
+    migrated_database: ApplicationSettings,
+) -> None:
+    """An edited grant must reach databases that were provisioned earlier, or
+    upgraded and fresh environments drift apart."""
+    admin = create_engine(migrated_database.postgres.admin_dsn().replace("+asyncpg", "+psycopg"))
+    original = SERVICE_GRANTS[ServiceName.DISPATCHER]["outbound_messages"]
+    try:
+        SERVICE_GRANTS[ServiceName.DISPATCHER]["outbound_messages"] = ("SELECT",)
+        with admin.begin() as connection:
+            sync_service_roles(connection, migrated_database)
+
+        engine = create_async_engine(migrated_database.postgres.dsn_for(ServiceName.DISPATCHER))
+        try:
+            async with engine.connect() as connection:
+                with pytest.raises(ProgrammingError):
+                    await connection.execute(
+                        sa.text("UPDATE outbound_messages SET updated_at = now()")
+                    )
+        finally:
+            await engine.dispose()
+    finally:
+        SERVICE_GRANTS[ServiceName.DISPATCHER]["outbound_messages"] = original
+        with admin.begin() as connection:
+            sync_service_roles(connection, migrated_database)
+        admin.dispose()
+
+
+def test_provisioning_is_idempotent(migrated_database: ApplicationSettings) -> None:
+    engine = create_engine(migrated_database.postgres.admin_dsn().replace("+asyncpg", "+psycopg"))
+    try:
+        for _ in range(3):
+            with engine.begin() as connection:
+                sync_service_roles(connection, migrated_database)
+    finally:
+        engine.dispose()

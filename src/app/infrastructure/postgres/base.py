@@ -20,10 +20,16 @@ def enum_column(enum_type: type[StrEnum], **kwargs: Any) -> sa.Enum:
     be altered inside a transaction on older servers. A VARCHAR with a CHECK
     constraint keeps the same guarantee at the database level while staying
     cheap to evolve, which matters for a schema this early.
+
+    `create_constraint=True` is not optional here: SQLAlchemy defaults it to
+    False, and without it the column is a plain VARCHAR that accepts any string
+    written outside the ORM -- which is exactly the path that would store an
+    unknown delivery state and break deserialization later.
     """
     return sa.Enum(
         enum_type,
         native_enum=False,
+        create_constraint=True,
         length=64,
         values_callable=lambda enum: [member.value for member in enum],
         **kwargs,

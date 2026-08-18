@@ -6,6 +6,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from pydantic import ValidationError
@@ -210,3 +211,34 @@ def test_settings_are_frozen(env: dict[str, str]) -> None:
 
     with pytest.raises(ValidationError):
         settings.environment = Environment.PRODUCTION
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "p@ss/word",
+        "with#hash?query",
+        "percent%20encoded",
+        "dollar$$quoted",
+        "quote'and\"quote",
+    ],
+)
+def test_dsn_survives_passwords_containing_url_delimiters(
+    env: dict[str, str], password: str
+) -> None:
+    """A generated password routinely contains @ or /, and interpolating it raw
+    moves where the driver thinks the host begins."""
+    secrets = dict(EXAMPLE_SECRETS)
+    secrets["postgres/api/password"] = password
+    secrets["rabbitmq/password"] = password
+    settings = load_settings(MappingSecretsProvider(secrets), _env_file=None)
+
+    dsn = settings.postgres.dsn_for(ServiceName.API)
+    parsed = urlsplit(dsn)
+
+    assert parsed.hostname == "localhost"
+    assert parsed.port == 5432
+    assert parsed.path == "/gym_track"
+    assert parsed.password is not None
+    assert unquote(parsed.password) == password
+    assert urlsplit(settings.rabbitmq.url()).hostname == "localhost"
