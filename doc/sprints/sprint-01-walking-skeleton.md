@@ -94,7 +94,9 @@ visible rather than silent.
 
 Ordered by dependency. Each workstream is independently reviewable, **ships its own tests**, and
 leaves the tree green. Per `CLAUDE.md`: no implementation lands without tests covering it, and
-each workstream is a `feat/` branch with its own PR.
+each workstream is its own branch and PR, prefixed by what it contains: `feat/` for the
+implementation workstreams (WS-1..WS-11), `doc/` for documentation-only ones (WS-12 is ADRs and a
+template — no code), `hotfix/` for defects found after a workstream merges.
 
 ### WS-1 — Project foundation
 1. `pyproject.toml` with `src/app` layout; pin Python 3.13 to match the Nix devshell.
@@ -109,7 +111,7 @@ actually block by a deliberately failing commit on a scratch branch.
 ### WS-2 — Configuration and secrets
 6. `ApplicationSettings` via `pydantic-settings`, nested per §34, **failing loudly at startup**.
 7. `SecretsProvider` port + env-backed implementation (Q144).
-8. Per-service credential sets in config — `api`, `workflow-worker`, `outbox-publisher`, `dispatcher` each carry their own DB user (Q145).
+8. Per-service credential sets in config — `api`, `message-aggregator`, `workflow-worker`, `outbox-publisher`, `dispatcher` each carry their own DB user (Q145). The set must cover **every process that opens a connection**; `message-aggregator` writes `message_batches` and `message_batch_items` in WS-8, so it needs its own role rather than borrowing one.
 9. `.env.example` committed; real `.env` gitignored.
 
 **Tests:** valid env produces a fully populated settings object; a missing required key raises at
@@ -131,15 +133,16 @@ it should not have — least privilege is worthless if nothing verifies it.
 
 ### WS-4 — Observability skeleton
 15. Contextvar correlation context; middleware per request, helper per consumed message.
-16. **One main trace per InputBatch** (Q131): the trace is minted at the webhook, carried through the batch, and background work starts a *new* trace linked by `correlation_id`.
+16. **One main trace per InputBatch** (Q131). The interaction trace is minted by the **aggregator, when the `MessageBatch` is persisted** — not at the webhook. Fragments arrive as N independent webhook requests, and no request can know which batch it will join, so a webhook-minted trace could never be the single shared trace Q131 requires. Each webhook request keeps its own short request trace; `messages` stores that request `trace_id`, and the batch trace links to the request traces it absorbed. Background work started later opens a *new* trace linked by `correlation_id`.
 17. Structured JSON logging emitting `trace_id`, `correlation_id`, `workflow_execution_id`.
 18. `TelemetryRedactor` with a deny-list, running before egress (Q146).
 19. `MetricsPort` and `AITracingPort` with no-op implementations (DEC-013 keeps the two domains separable from day one).
 
 **Tests:** correlation context survives an `await` boundary and does not leak between concurrent
-tasks; a log record emitted inside a request carries that request's `trace_id`; two messages in
-one batch share one trace, and a background job gets a distinct trace with the same
-`correlation_id`; the redactor strips BSUID, phone numbers and secrets — table-driven, since this
+tasks; a log record emitted inside a request carries that request's `trace_id`; **three fragments
+arriving as three separate webhook requests produce three request traces but exactly one
+interaction trace**, which links back to all three; a background job gets a distinct trace
+carrying the same `correlation_id`; the redactor strips BSUID, phone numbers and secrets — table-driven, since this
 test protects §33 and must be cheap to extend.
 
 ### WS-5 — Events and outbox
@@ -167,7 +170,7 @@ DLQ message produces no duplicate business effect**, which is the whole point of
 serializes two concurrent messages for one user.
 
 ### WS-7 — Inbound ingress
-28. `POST /webhooks/whatsapp`: signature verification, parse, identity resolution, dedupe on `UNIQUE(provider, external_message_id)`, persist `messages`, publish `message.received`, return fast (Q112, Q153).
+28. `POST /webhooks/whatsapp`: signature verification, parse, identity resolution, dedupe on `UNIQUE(provider, external_message_id)`, persist `messages` **including the request `trace_id`** so the aggregator can link it to the interaction trace (WS-4 item 16), publish `message.received`, return fast (Q112, Q153).
 29. Conversation resolution: reuse the active conversation or rotate on inactivity (§7.2, Q30).
 30. `GET /health` (liveness) and `GET /ready` (per-process dependency checks).
 31. BSUID as ciphertext + HMAC lookup, `UNIQUE(provider, external_id_lookup_hmac)` (Q143).
@@ -217,7 +220,7 @@ Only what cannot belong to a single workstream.
 
 42. **E2E:** three fragmented messages → one batch → one workflow → one ordered reply in the fake client, asserted from the outside.
 43. **Failure injection (§38):** kill the worker after commit but before ACK; on redelivery assert exactly one `outbound_message` and one workflow execution. Also duplicate outbox publish, Redis loss mid-window, broker disconnect during publish.
-44. **Correlation:** the `trace_id` minted at the webhook appears in the dispatcher's log line for the same interaction, across three process boundaries (Q131).
+44. **Correlation:** the interaction `trace_id` minted by the aggregator appears in the workflow worker's and the dispatcher's log lines for the same interaction, and each contributing webhook request trace is reachable from it (Q131).
 45. Testcontainers fixtures for Postgres/RabbitMQ/Redis, session-scoped so the suite stays fast enough for every PR (Q158).
 
 ### WS-12 — Decision records
@@ -236,7 +239,7 @@ Every item is mechanically verifiable — no "works on my machine".
 - [ ] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone.
 - [ ] `make test` passes: unit + integration + E2E, with containers, in CI.
 - [ ] No workstream was merged without the tests listed under it (`CLAUDE.md` rule 2).
-- [ ] Every workstream shipped as a `feat/` branch with its own PR (`CLAUDE.md` rules 3 and 7).
+- [ ] Every workstream shipped on a correctly prefixed branch with its own PR — `feat/` for WS-1..WS-11, `doc/` for WS-12 (`CLAUDE.md` rules 3, 5, 6 and 7).
 - [ ] Duplicate webhook delivery (same `external_message_id`) creates exactly one `messages` row.
 - [ ] Redelivery of a workflow message after a post-commit crash creates **no** second `outbound_message`.
 - [ ] A DLQ message replayed through the tooling produces no duplicate business effect (Q117).
@@ -244,7 +247,7 @@ Every item is mechanically verifiable — no "works on my machine".
 - [ ] A message arriving at 9s into a 10s cap still respects the absolute window.
 - [ ] Partition assignment for a fixed set of user IDs matches the golden test — the hash contract is frozen.
 - [ ] Every outbox row reaches `PUBLISHED`, or is visibly stuck and alertable; none are silently lost.
-- [ ] One InputBatch produces exactly one main trace; the webhook's `trace_id` reaches the dispatcher's logs (Q131).
+- [ ] Three fragments across three webhook requests produce exactly **one** interaction trace, minted at batch persistence and reaching the dispatcher's logs, with all three request traces linked to it (Q131).
 - [ ] Each service role is refused the writes it should not have, asserted by test (Q145).
 - [ ] No BSUID, phone number or secret appears in any log line (asserted, not assumed).
 - [ ] Startup fails fast and legibly on missing or invalid configuration.
