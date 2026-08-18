@@ -51,7 +51,7 @@ only *reordered* around a working path.
 | Workflow | `workflow-worker` with a **stub handler** producing a fixed `DomainResult` |
 | Outbound | `outbound_messages` with `response_group_id` + `sequence`, dispatcher honouring sequence (§25) |
 | Adapters | `FakeWhatsAppClient` and fake STT — no real Meta call in this sprint |
-| Tests | Unit, integration on ephemeral containers, one E2E, redelivery failure-injection (§38) |
+| Tests | Each workstream ships its own; cross-cutting E2E, failure injection and correlation in WS-11 (§38) |
 | ADRs | ADR-001, ADR-003, ADR-004 — the decisions this skeleton actually commits to |
 
 ### Explicitly out
@@ -67,74 +67,131 @@ is a maintenance cost with no test to justify it.
 
 ## Work breakdown
 
-Ordered by dependency. Each item is independently reviewable and leaves the tree green.
+Ordered by dependency. Each workstream is independently reviewable, **ships its own tests**, and
+leaves the tree green. Per `CLAUDE.md`: no implementation lands without tests covering it.
+Only genuinely cross-cutting verification is deferred to WS-11.
 
 ### WS-1 — Project foundation
 1. `pyproject.toml` with `src/app` layout; pin Python 3.13 to match the Nix devshell.
 2. Create the §6 package tree with `__init__.py` only — no speculative modules.
 3. Tooling: `ruff` (lint+format), `mypy` strict on `src/app`, `pytest` + `pytest-asyncio`.
 4. `Makefile` or `justfile`: `fmt`, `lint`, `typecheck`, `test`, `up`, `migrate`.
-5. CI workflow running lint → typecheck → unit tests on PR (§32.3 PR tier, minus evals).
+5. CI workflow running lint → typecheck → tests on PR (§32.3 PR tier, minus evals).
+
+**Tests:** a smoke test asserting the package imports and the test runner is wired; CI proven by
+a deliberately failing commit on a scratch branch, so we know the gate actually blocks.
 
 ### WS-2 — Configuration
 6. `ApplicationSettings` via `pydantic-settings`, nested per §34, **failing loudly at startup**.
-7. `SecretsProvider` port + env-backed implementation; assert no secret is logged.
+7. `SecretsProvider` port + env-backed implementation.
 8. `.env.example` committed; real `.env` gitignored.
+
+**Tests:** valid env produces a fully populated settings object; missing required key raises at
+startup with a legible message; an out-of-range value (e.g. `partitions = 0`) is rejected;
+`repr()`/serialization of settings never exposes a secret value.
 
 ### WS-3 — Persistence base
 9. SQLAlchemy async engine/session factory; `unit_of_work` context manager owning the transaction.
-10. Base declarative model: UUIDv7-or-v4 PK, `created_at`/`updated_at`, soft-delete mixin.
-11. Repository **ports** in `application/ports`, concrete implementations in `infrastructure/postgres` — domain must not import ORM types (§36).
+10. Base declarative model: UUIDv7 PK, `created_at`/`updated_at`, soft-delete mixin.
+11. Repository **ports** in `application/ports`, implementations in `infrastructure/postgres` — domain must not import ORM types (§36).
 12. Alembic wired to the settings object; migration 0001 for the tables listed above.
 
+**Tests:** `unit_of_work` commits on success and rolls back on exception (integration, real
+Postgres); soft-delete excludes rows from default queries; UUIDv7 values are monotonic within a
+batch; migration 0001 applies and downgrades cleanly; an **architecture test** asserting no
+module under `domain/` imports `sqlalchemy` — that boundary is easy to erode silently.
+
 ### WS-4 — Observability skeleton
-13. Contextvar-based correlation context; middleware populating it per request, worker helper per message.
+13. Contextvar-based correlation context; middleware per request, helper per consumed message.
 14. Structured JSON logging emitting `trace_id`, `correlation_id`, `workflow_execution_id`.
-15. `TelemetryRedactor` with a deny-list; unit-tested that a BSUID never reaches a log record (§30.3, §33.2).
-16. `MetricsPort` and `AITracingPort` with no-op implementations — Datadog/Langfuse arrive later without touching call sites.
+15. `TelemetryRedactor` with a deny-list (§30.3, §33.2).
+16. `MetricsPort` and `AITracingPort` with no-op implementations.
+
+**Tests:** correlation context survives an `await` boundary and does not leak between concurrent
+tasks; a log record emitted inside a request carries the request's `trace_id`; the redactor
+strips BSUID, phone numbers and secrets from a representative payload — table-driven, since this
+is the test that protects §33 and it must be cheap to extend.
 
 ### WS-5 — Events and outbox
-17. `DomainEventEnvelope` dataclass/model per §27.1 with a serialization contract test.
+17. `DomainEventEnvelope` per §27.1.
 18. `record_domain_event()` writing `domain_events` + `outbox_events(PENDING)` **inside the caller's transaction**.
-19. `outbox-publisher` worker: `SELECT ... FOR UPDATE SKIP LOCKED`, publish, await confirm, mark `PUBLISHED`; batched, with backoff.
+19. `outbox-publisher`: `SELECT ... FOR UPDATE SKIP LOCKED`, publish, await confirm, mark `PUBLISHED`; batched, with backoff.
+
+**Tests:** envelope serialization round-trip + a golden fixture freezing the wire format
+(contract test, §38); a rolled-back transaction leaves **no** outbox row — the core atomicity
+claim of §27; two concurrent publishers never claim the same row (`SKIP LOCKED` under real
+Postgres); a publish failure leaves the row `PENDING` and it is retried; duplicate publication is
+tolerated by the consumer via `event_id`.
 
 ### WS-6 — RabbitMQ topology
-20. Declarative topology module: exchanges `whatsapp.inbound`, `workflow`, `domain.events`, `background`, `whatsapp.outbound` (§9.1).
-21. `workflow.00`–`workflow.31` with Single Active Consumer; one worker process may own several partitions.
-22. **Stable partition hash** — `blake2b(user_id.bytes) % 32`, never Python `hash()` (§9.2). Frozen by a golden test with hardcoded expected values.
+20. Declarative topology: exchanges `whatsapp.inbound`, `workflow`, `domain.events`, `background`, `whatsapp.outbound` (§9.1).
+21. `workflow.00`–`workflow.31` with Single Active Consumer; one process may own several partitions.
+22. **Stable partition hash** — `blake2b(user_id.bytes) % 32`, never Python `hash()` (§9.2).
 23. Retry tiers 5s/30s/5m via delayed queues, then DLQ. No `sleep()` inside a consumer (§9.3, §9.4).
 
+**Tests:** a **golden test with hardcoded user-ID → partition pairs**, freezing the hash contract
+forever — this is the single most important unit test in the sprint, because changing it silently
+reorders every user's messages; the hash is stable across processes (subprocess run); topology
+declaration is idempotent on re-run; a message failing three times traverses 5s → 30s → 5m → DLQ
+with the original idempotency key intact; SAC serializes two concurrent messages for one user.
+
 ### WS-7 — Inbound ingress
-24. `POST /webhooks/whatsapp`: signature verification, payload parse, identity resolution (create `users` + `user_identifiers` on first contact), dedupe on `UNIQUE(provider, external_message_id)`, persist `messages`, publish `message.received`, return fast (§8, §35.1).
-25. Conversation resolution: reuse the active conversation or rotate on inactivity (§7.2).
-26. `GET /health` (liveness, no dependencies) and `GET /ready` (checks the dependencies *this* process needs).
-27. BSUID stored as ciphertext + HMAC lookup, `UNIQUE(provider, external_id_lookup_hmac)` (§7.1).
+24. `POST /webhooks/whatsapp`: signature verification, parse, identity resolution, dedupe on `UNIQUE(provider, external_message_id)`, persist `messages`, publish `message.received`, return fast (§8, §35.1).
+25. Conversation resolution: reuse active conversation or rotate on inactivity (§7.2).
+26. `GET /health` (liveness) and `GET /ready` (per-process dependency checks).
+27. BSUID as ciphertext + HMAC lookup, `UNIQUE(provider, external_id_lookup_hmac)` (§7.1).
+
+**Tests:** an invalid signature is rejected before any persistence; the same
+`external_message_id` delivered twice yields exactly one `messages` row; first contact creates
+`users` + `user_identifiers`, second contact reuses them; conversation rotates only past the
+inactivity threshold; HMAC lookup finds a user without decrypting; `/ready` fails when Postgres
+is down and `/health` still succeeds; a **contract test** for the WhatsApp payload parser against
+recorded fixtures (§38), so a provider format change fails loudly.
 
 ### WS-8 — Debounce and batching
 28. `message-aggregator` consuming `message.received`.
 29. Redis debounce keyed `debounce:v1:user:{id}:conversation:{id}`, 3s sliding, 10s absolute cap, TTL always set (§8, §10).
-30. **Generation counter** so a stale timer cannot flush a batch that has since grown. *Design note:* the flush trigger is a delayed RabbitMQ message carrying the generation it was scheduled for; on consume, a generation mismatch means drop. This avoids in-process timers and survives restarts — an implementation choice the spec leaves open.
-31. Persist `message_batches` + ordered `message_batch_items`, emit `InputBatchReady` to the user's workflow partition.
+30. **Generation counter** so a stale timer cannot flush a batch that has since grown. *Design note:* the flush trigger is a delayed RabbitMQ message carrying the generation it was scheduled for; on consume, a generation mismatch means drop. Survives restarts — an implementation choice the spec leaves open.
+31. Persist `message_batches` + ordered `message_batch_items`, emit `InputBatchReady` to the user's partition.
+
+**Tests:** the generation logic is unit-tested **in isolation from Redis first** (pure function
+over state transitions), because this is the subtlest correctness surface in the sprint; then
+integration: three messages within the window produce one batch; a message at 9s into the 10s cap
+still respects the absolute window; a stale flush is dropped without emitting; batch items
+preserve arrival order; every debounce key has a TTL (no unbounded Redis growth); **Redis flushed
+mid-window loses no message**, since §10 declares Redis non-authoritative and recovery from
+persisted `messages` must hold.
 
 ### WS-9 — Workflow worker (stub)
-32. Consume `InputBatchReady`; create or resume `workflow_executions` keyed by batch — redelivery must resume, never duplicate (§28).
-33. **Stub handler**: build a fixed `DomainResult` acknowledging receipt. This is the seam Sprint 3 replaces with `MainGraph`; keep the handler-registry shape from §11.3 so the replacement is additive.
-34. In one transaction: persist `outbound_messages` (with `response_group_id` + `sequence`), append `domain_events`, insert `outbox_events`. ACK only after commit (§9.3, §25).
+32. Consume `InputBatchReady`; create or resume `workflow_executions` keyed by batch (§28).
+33. **Stub handler** producing a fixed `DomainResult`. Keep the handler-registry shape from §11.3 so Sprint 3's `MainGraph` is an additive replacement.
+34. One transaction: persist `outbound_messages` (`response_group_id` + `sequence`), append `domain_events`, insert `outbox_events`. ACK only after commit (§9.3, §25).
+
+**Tests:** redelivery of the same batch resumes the existing `workflow_execution` and creates no
+second one; the domain rows, outbound rows and outbox row commit atomically or not at all; ACK
+happens strictly after commit (asserted by ordering, not by inspection); the handler registry
+resolves a task type to its handler and raises on an unknown type.
 
 ### WS-10 — Outbound dispatch
-35. `whatsapp-dispatcher` consuming outbound events, sending sequence N only after N−1 is dispatch-safe (§25).
-36. `WhatsAppClient` port + `FakeWhatsAppClient` writing to a log/file, asserted by the E2E test.
+35. `whatsapp-dispatcher` sending sequence N only after N−1 is dispatch-safe (§25).
+36. `WhatsAppClient` port + `FakeWhatsAppClient`.
 37. Delivery-state transitions persisted on `outbound_messages`.
 
-### WS-11 — Tests
-38. **Unit:** partition hash stability, debounce generation logic, retry policy, envelope serialization, redactor.
-39. **Integration (Testcontainers):** dedupe under duplicate webhook, outbox publish-and-mark, batch assembly, transaction rollback leaves no orphan outbox row.
-40. **E2E:** three fragmented messages → one batch → one reply in the fake client.
-41. **Failure injection (§38):** kill the worker after commit but before ACK; on redelivery assert exactly one `outbound_message` and one workflow execution.
+**Tests:** a three-message response group is delivered in sequence order, never interleaved;
+a send failure on sequence 2 does not dispatch sequence 3; a retried send does not duplicate a
+delivered message; delivery-state transitions are persisted and monotonic.
+
+### WS-11 — Cross-cutting verification
+Only what cannot belong to a single workstream.
+
+38. **E2E:** three fragmented messages → one batch → one workflow → one ordered reply in the fake client, asserted from the outside.
+39. **Failure injection (§38):** kill the worker after commit but before ACK; on redelivery assert exactly one `outbound_message` and one workflow execution. Also: duplicate outbox publish, Redis loss mid-window, broker disconnect during publish.
+40. **Correlation:** the `trace_id` minted at the webhook appears in the dispatcher's log line for the same interaction, across three process boundaries.
+41. Test infrastructure: Testcontainers fixtures for Postgres/RabbitMQ/Redis, shared and session-scoped so the suite stays fast enough to run on every PR.
 
 ### WS-12 — Decision records
 42. ADR-001 modular monolith with worker entrypoints; ADR-003 at-least-once + outbox + idempotency; ADR-004 32 partitions + SAC + the frozen hash.
-43. `doc/adr/` with a template. Remaining ADRs from §43 are written when their decision is actually taken.
+43. `doc/adr/` with a template. Remaining ADRs from §43 are written when their decision is taken.
 
 ## Definition of Done
 
@@ -142,6 +199,7 @@ Every item is mechanically verifiable — no "works on my machine".
 
 - [ ] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone.
 - [ ] `make test` passes: unit + integration + E2E, with containers, in CI.
+- [ ] No workstream was merged without the tests listed under it (`CLAUDE.md` rule 2).
 - [ ] Duplicate webhook delivery (same `external_message_id`) creates exactly one `messages` row.
 - [ ] Redelivery of a workflow message after a post-commit crash creates **no** second `outbound_message`.
 - [ ] Three messages inside the debounce window produce exactly one `message_batch` and one reply.

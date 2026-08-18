@@ -12,6 +12,10 @@ and is written **one at a time**, immediately before it starts — not all upfro
 - **Detail just-in-time.** Only the current sprint is specified in depth. Later sprints exist
   here as named intent, derived from spec §41, and are explicitly provisional — they will be
   rewritten based on what the previous sprint teaches us.
+- **Plan before code, tests with code.** Per `CLAUDE.md`: no implementation starts without a
+  written plan for it, and no implementation lands without tests covering it. At sprint level the
+  plan is the sprint file; at task level it is a short plan agreed before the first line of code.
+  Tests belong to the workstream that introduces the behavior, not to a cleanup pass at the end.
 - **The spec is normative, the plan is not.** Where this plan and the architecture spec
   disagree, the spec wins, or the spec gets an ADR amending it.
 
