@@ -1,0 +1,17 @@
+{
+  "event_id": "0198f2c7-4a00-7b3c-8f21-6d5e4c3b2a19",
+  "event_type": "message.received",
+  "event_version": 1,
+  "aggregate_type": "message",
+  "aggregate_id": "0198f2c7-4a01-7c4d-9012-3456789abcde",
+  "user_id": "0198f2c7-4a02-7d5e-a123-456789abcdef",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "correlation_id": "c1a2b3c4d5e6f708192a3b4c5d6e7f80",
+  "causation_id": null,
+  "payload": {
+    "conversation_id": "0198f2c7-4a03-7e6f-b234-56789abcdef0",
+    "external_message_id": "wamid.HBgNNTUxMTk5",
+    "content_type": "text"
+  },
+  "occurred_at": "2026-08-18T12:00:00Z"
+}
