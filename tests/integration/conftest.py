@@ -108,6 +108,23 @@ def settings(postgres_dsn_parts: tuple[str, int]) -> Iterator[ApplicationSetting
                 os.environ[key] = value
 
 
+@pytest.fixture(scope="session")
+def rabbitmq_url() -> Iterator[str]:
+    """A RabbitMQ container, alive for the whole session (Q158)."""
+    if not _docker_is_available():
+        pytest.skip("no reachable Docker daemon")
+
+    from testcontainers.community.rabbitmq import RabbitMqContainer
+
+    container = RabbitMqContainer(
+        "rabbitmq:4-alpine", username="gym_track", password="integration-test"
+    )
+    with container:
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(5672)
+        yield f"amqp://gym_track:integration-test@{host}:{port}/"
+
+
 def alembic_config(settings: ApplicationSettings) -> Config:
     config = Config(str(REPO_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
