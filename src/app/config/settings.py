@@ -101,6 +101,29 @@ class RabbitMQSettings(BaseModel):
     # Q115: workflow consumers start at prefetch 1 and are revisited only with
     # a benchmark, not with a hunch.
     workflow_prefetch: int = Field(default=1, ge=1)
+    # §9.4: delays and max attempts are typed configuration, not constants
+    # buried in a consumer. The number of tiers *is* the attempt limit: after
+    # the last one a message goes to the DLQ.
+    retry_delays: tuple[timedelta, ...] = (
+        timedelta(seconds=5),
+        timedelta(seconds=30),
+        timedelta(minutes=5),
+    )
+
+    @model_validator(mode="after")
+    def retry_delays_increase(self) -> RabbitMQSettings:
+        if not self.retry_delays:
+            raise ValueError("at least one retry tier is required before the DLQ")
+        if list(self.retry_delays) != sorted(self.retry_delays):
+            raise ValueError("retry tiers must increase, otherwise a later retry fires sooner")
+        if self.retry_delays[0] <= timedelta(0):
+            raise ValueError("retry delays must be positive")
+        return self
+
+    @property
+    def max_attempts(self) -> int:
+        """Deliveries before the DLQ: the first try plus one per retry tier."""
+        return len(self.retry_delays) + 1
 
     def url(self) -> str:
         user = quote(self.user, safe="")
