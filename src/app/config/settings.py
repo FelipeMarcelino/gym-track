@@ -61,6 +61,9 @@ class PostgresSettings(BaseModel):
     port: int = Field(default=5432, ge=1, le=65535)
     database: str = Field(min_length=1)
     roles: dict[ServiceName, PostgresRole]
+    # DDL identity. Deliberately not one of the service roles: migrations create
+    # and grant those roles, so running them as one of them would defeat Q145.
+    admin: PostgresRole
 
     @model_validator(mode="after")
     def every_service_has_a_role(self) -> PostgresSettings:
@@ -74,7 +77,13 @@ class PostgresSettings(BaseModel):
 
     def dsn_for(self, service: ServiceName) -> str:
         """Async SQLAlchemy DSN for one service, with its own credentials."""
-        role = self.roles[service]
+        return self._dsn(self.roles[service])
+
+    def admin_dsn(self) -> str:
+        """Async SQLAlchemy DSN for migrations, which run as the DDL owner."""
+        return self._dsn(self.admin)
+
+    def _dsn(self, role: PostgresRole) -> str:
         password = role.password.get_secret_value()
         return (
             f"postgresql+asyncpg://{role.user}:{password}@{self.host}:{self.port}/{self.database}"
@@ -152,6 +161,7 @@ SECRET_BINDINGS: Final[dict[str, tuple[str, ...]]] = {
         f"postgres/{service.value}/password": ("postgres", "roles", service.value, "password")
         for service in ServiceName
     },
+    "postgres/admin/password": ("postgres", "admin", "password"),
     "rabbitmq/password": ("rabbitmq", "password"),
     "redis/password": ("redis", "password"),
     "security/whatsapp-app-secret": ("security", "whatsapp_app_secret"),
