@@ -5,3 +5,5 @@ como feat/<nome do branch>
 Bugfix deve ser colocado em branch hotfix/<nome do branch>
 Documentação deve ser adicionado ao branch doc/<nome do branch>
 Utilize o gh para criar um pull request com o novo branch criado
+Use o gh para ler os comentários dos pull requests criados
+Use o gh para fazer o merge do pull request
