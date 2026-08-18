@@ -18,8 +18,10 @@ from app.infrastructure.rabbitmq import dlq
 from app.infrastructure.rabbitmq.connection import (
     IDEMPOTENCY_HEADER,
     build_message,
+    build_raw_message,
     connect,
     declare_topology,
+    open_consumer_channel,
 )
 from app.infrastructure.rabbitmq.retry import RetryPolicy, attempts_of, handle_with_retry
 from app.infrastructure.rabbitmq.topology import (
@@ -299,3 +301,57 @@ async def test_single_active_consumer_serializes_two_messages_for_one_user(
 
     assert sorted(processed) == ["first", "second"]
     assert concurrent_peak == 1, "single active consumer must serialize the partition"
+
+
+async def test_a_malformed_body_still_reaches_the_dlq(channel: AbstractChannel) -> None:
+    """A body the consumer cannot decode must still be movable.
+
+    If routing a failure required decoding the payload, this delivery could
+    never be acked — and at prefetch 1 an undecodable message blocks its
+    partition forever, failing identically after every reconnection.
+    """
+    policy = RetryPolicy((timedelta(milliseconds=100),))
+    exchange = await channel.get_exchange(Exchanges.WORKFLOW, ensure=False)
+    await exchange.publish(
+        build_raw_message(b"this is not json", idempotency_key="op-malformed"),
+        routing_key=QUEUE,
+    )
+
+    async def decodes_the_body(message: AbstractIncomingMessage) -> None:
+        json.loads(message.body)
+
+    for _ in range(2):
+        assert await _consume_one(channel, decodes_the_body, policy=policy) is False
+
+    dead = await dlq.inspect(channel, QUEUE)
+    assert len(dead) == 1
+    assert dead[0].idempotency_key == "op-malformed"
+    assert dead[0].raw_body == b"this is not json", "the body survived byte for byte"
+
+
+async def test_prefetch_stops_one_consumer_from_holding_a_whole_partition(
+    channel: AbstractChannel, rabbitmq_url: str
+) -> None:
+    """SAC picks one consumer; QoS is what stops that consumer from taking the
+    backlog and running its callbacks concurrently (Q114, Q115)."""
+    in_flight: list[str] = []
+    first_delivered = asyncio.Event()
+
+    async def never_acks(message: AbstractIncomingMessage) -> None:
+        in_flight.append(str((message.headers or {})[IDEMPOTENCY_HEADER]))
+        first_delivered.set()
+
+    connection = await connect(rabbitmq_url)
+    try:
+        consumer_channel = await open_consumer_channel(connection, prefetch=1)
+        queue = await consumer_channel.get_queue(QUEUE, ensure=False)
+        await queue.consume(never_acks, no_ack=False)
+
+        await _publish(channel, key="op-8a", body={"value": "first"})
+        await _publish(channel, key="op-8b", body={"value": "second"})
+        await asyncio.wait_for(first_delivered.wait(), timeout=5)
+        await asyncio.sleep(0.5)
+    finally:
+        await connection.close()
+
+    assert in_flight == ["op-8a"], "the second message waited for the first to be acked"

@@ -28,7 +28,7 @@ from app.infrastructure.rabbitmq.connection import (
     ORIGIN_EXCHANGE_HEADER,
     ORIGIN_QUEUE_HEADER,
     ORIGIN_ROUTING_KEY_HEADER,
-    build_message,
+    build_raw_message,
 )
 from app.infrastructure.rabbitmq.topology import dead_letter_queue_name
 
@@ -43,7 +43,10 @@ class DeadLetter:
     origin_routing_key: str
     failure_reason: str | None
     attempts: int
-    payload: dict[str, Any]
+    #: Decoded payload when the body is JSON; None when it is not, which is
+    #: exactly the case an operator most needs to be able to look at.
+    payload: dict[str, Any] | None
+    raw_body: bytes
     headers: dict[str, Any]
 
 
@@ -89,8 +92,12 @@ async def replay(channel: AbstractChannel, queue: str, *, limit: int = 10) -> in
 
         exchange = await channel.get_exchange(dead_letter.origin_exchange, ensure=False)
         await exchange.publish(
-            build_message(
-                dead_letter.payload,
+            build_raw_message(
+                # Replay is a re-delivery of the same message, so the body goes
+                # back exactly as it arrived -- including one that never
+                # decoded, which an operator may be replaying after fixing the
+                # consumer rather than the payload.
+                dead_letter.raw_body,
                 # The whole point of Q117: the replayed message carries the key
                 # it originally had, so a consumer that already applied it
                 # recognises the operation instead of repeating it.
@@ -139,9 +146,11 @@ async def discard(channel: AbstractChannel, queue: str, *, limit: int = 10) -> i
 
 
 def _to_dead_letter(headers: dict[str, Any], body: bytes) -> DeadLetter:
-    payload = json.loads(body)
-    if not isinstance(payload, dict):
-        raise TypeError("dead letter body is not a JSON object")
+    try:
+        decoded = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    payload = decoded if isinstance(decoded, dict) else None
 
     return DeadLetter(
         idempotency_key=str(headers.get(IDEMPOTENCY_HEADER, "")),
@@ -153,5 +162,6 @@ def _to_dead_letter(headers: dict[str, Any], body: bytes) -> DeadLetter:
         ),
         attempts=int(headers.get("x-attempts", 0) or 0),
         payload=payload,
+        raw_body=body,
         headers=dict(headers),
     )

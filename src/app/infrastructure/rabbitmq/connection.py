@@ -59,6 +59,24 @@ async def declare_topology(channel: AbstractChannel, topology: Topology) -> None
             await queue.bind(exchanges[binding.exchange], routing_key=binding.routing_key)
 
 
+async def open_consumer_channel(
+    connection: AbstractRobustConnection,
+    *,
+    prefetch: int,
+) -> AbstractChannel:
+    """A channel with QoS applied, which is what makes prefetch real.
+
+    Single Active Consumer picks *one* consumer per queue; it says nothing
+    about how many unacknowledged deliveries that consumer may hold. Without
+    QoS the broker would hand a partition's whole backlog to one worker, whose
+    async callbacks would then run concurrently -- and the per-user ordering
+    the partition exists to provide would be gone (Q114, Q115).
+    """
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=prefetch)
+    return channel
+
+
 class RabbitMQEventPublisher:
     """The outbox's way out (§27). Publishes and waits for broker confirmation.
 
@@ -102,6 +120,31 @@ def build_message(
     headers: dict[str, Any] | None = None,
 ) -> aio_pika.Message:
     """A persistent message carrying the metadata every hop must preserve."""
+    return build_raw_message(
+        json.dumps(payload).encode(),
+        idempotency_key=idempotency_key,
+        correlation_id=correlation_id,
+        trace_id=trace_id,
+        attempts=attempts,
+        headers=headers,
+    )
+
+
+def build_raw_message(
+    body: bytes,
+    *,
+    idempotency_key: str,
+    correlation_id: str | None = None,
+    trace_id: str | None = None,
+    attempts: int = 0,
+    headers: dict[str, Any] | None = None,
+) -> aio_pika.Message:
+    """Same, for a body that must survive byte for byte.
+
+    The retry path uses this: re-encoding a payload it just decoded would make
+    an undecodable body impossible to move, and a message that cannot be moved
+    is a message that blocks its partition.
+    """
     message_headers: dict[str, Any] = dict(headers or {})
     message_headers[IDEMPOTENCY_HEADER] = idempotency_key
     message_headers[ATTEMPTS_HEADER] = attempts
@@ -111,7 +154,7 @@ def build_message(
         message_headers["trace_id"] = trace_id
 
     return aio_pika.Message(
-        body=json.dumps(payload).encode(),
+        body=body,
         content_type="application/json",
         delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
         message_id=idempotency_key,

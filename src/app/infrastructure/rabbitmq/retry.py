@@ -26,7 +26,7 @@ from app.infrastructure.rabbitmq.connection import (
     ORIGIN_EXCHANGE_HEADER,
     ORIGIN_QUEUE_HEADER,
     ORIGIN_ROUTING_KEY_HEADER,
-    build_message,
+    build_raw_message,
 )
 from app.infrastructure.rabbitmq.topology import (
     Exchanges,
@@ -136,8 +136,11 @@ async def _route_failure(
 
     exchange = await channel.get_exchange(destination_exchange, ensure=False)
     await exchange.publish(
-        build_message(
-            _decoded_payload(message),
+        build_raw_message(
+            # The body travels untouched. Decoding here would mean a message
+            # with a malformed payload could not be routed at all: it would
+            # stay unacked and, at prefetch 1, block its partition forever.
+            message.body,
             idempotency_key=idempotency_key,
             correlation_id=message.correlation_id,
             trace_id=str(headers.get("trace_id")) if headers.get("trace_id") else None,
