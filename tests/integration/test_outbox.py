@@ -247,3 +247,87 @@ async def test_the_published_payload_is_the_frozen_wire_format(
     await OutboxPublisher(session_factory, publisher).publish_pending()
 
     assert publisher.published[0] == recorded
+
+
+async def test_a_poison_row_does_not_stall_the_rest_of_the_batch(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A payload the current schema rejects — corruption, or a rolling deploy
+    mid-version-change — must fail alone, not take every pass down with it."""
+    async with unit_of_work(session_factory) as session:
+        poison = await record_domain_event(
+            session, _envelope(aggregate_id=UUID(int=1)), exchange=EXCHANGE, routing_key=ROUTING_KEY
+        )
+        healthy = await record_domain_event(
+            session, _envelope(aggregate_id=UUID(int=2)), exchange=EXCHANGE, routing_key=ROUTING_KEY
+        )
+
+    async with unit_of_work(session_factory) as session:
+        row = (
+            await session.scalars(
+                sa.select(OutboxEvent).where(OutboxEvent.domain_event_id == poison.event_id)
+            )
+        ).one()
+        row.payload = {"event_type": "message.received", "unknown_field": True}
+
+    publisher = RecordingPublisher()
+    result = await OutboxPublisher(session_factory, publisher).publish_pending()
+
+    assert result.published == 1
+    assert result.failed == 1
+    assert [event.event_id for event in publisher.published] == [healthy.event_id]
+
+    async with session_factory() as session:
+        rows = {
+            row.domain_event_id: row
+            for row in (await session.scalars(sa.select(OutboxEvent))).all()
+        }
+
+    assert rows[healthy.event_id].status is OutboxStatus.PUBLISHED
+    assert rows[poison.event_id].status is OutboxStatus.PENDING
+    assert rows[poison.event_id].attempts == 1
+    assert rows[poison.event_id].last_error is not None, "a stuck row must be visibly stuck"
+
+
+async def test_a_partial_correlation_is_completed_rather_than_dropped(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An envelope carrying a trace but no correlation would otherwise persist a
+    null correlation, and the consumer would mint a fresh one — severing the
+    event from the interaction that caused it."""
+    with interaction_scope(["req-1"]) as context:
+        async with unit_of_work(session_factory) as session:
+            await record_domain_event(
+                session,
+                _envelope(trace_id="explicit-trace"),
+                exchange=EXCHANGE,
+                routing_key=ROUTING_KEY,
+            )
+
+    async with session_factory() as session:
+        event = (await session.scalars(sa.select(DomainEvent))).one()
+
+    assert event.trace_id == "explicit-trace", "an explicit value is never overwritten"
+    assert event.correlation_id == context.correlation_id
+
+
+async def test_both_rows_persist_the_same_payload_even_if_the_caller_mutates_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The envelope is frozen, but its payload dict is not: sharing it between
+    the two rows would let one mutation persist two payloads under one id."""
+    payload = {"conversation_id": "c-1"}
+
+    async with unit_of_work(session_factory) as session:
+        recorded = await record_domain_event(
+            session, _envelope(payload=payload), exchange=EXCHANGE, routing_key=ROUTING_KEY
+        )
+        payload["conversation_id"] = "mutated-after-the-fact"
+
+    async with session_factory() as session:
+        event = (await session.scalars(sa.select(DomainEvent))).one()
+        outbox = (await session.scalars(sa.select(OutboxEvent))).one()
+
+    assert event.payload == outbox.payload["payload"]
+    assert event.payload == {"conversation_id": "c-1"}
+    assert recorded.event_id == outbox.domain_event_id

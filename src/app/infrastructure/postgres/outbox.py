@@ -53,11 +53,21 @@ async def record_domain_event(
     traceable without every call site restating what the context already knows.
     """
     context = current_context()
-    if context is not None and envelope.trace_id is None and envelope.correlation_id is None:
+    if context is not None:
+        # Each field is filled independently: an envelope carrying a trace but
+        # no correlation would otherwise be persisted with a null correlation,
+        # and the consumer would mint a fresh one -- severing the event from
+        # the interaction that caused it.
         envelope = envelope.with_correlation(
-            trace_id=context.trace_id,
-            correlation_id=context.correlation_id,
+            trace_id=envelope.trace_id or context.trace_id,
+            correlation_id=envelope.correlation_id or context.correlation_id,
         )
+
+    # One snapshot feeds both rows. Sharing the caller's dict would let a
+    # mutation after this call persist two different payloads under one
+    # event_id, since the outbox copy is serialized here and the ORM row is
+    # serialized at flush time.
+    serialized = envelope.model_dump(mode="json")
 
     session.add(
         DomainEvent(
@@ -70,7 +80,7 @@ async def record_domain_event(
             trace_id=envelope.trace_id,
             correlation_id=envelope.correlation_id,
             causation_id=envelope.causation_id,
-            payload=envelope.payload,
+            payload=serialized["payload"],
             occurred_at=envelope.occurred_at,
         )
     )
@@ -80,7 +90,7 @@ async def record_domain_event(
             status=OutboxStatus.PENDING,
             exchange=exchange,
             routing_key=routing_key,
-            payload=envelope.model_dump(mode="json"),
+            payload=serialized,
         )
     )
     return envelope

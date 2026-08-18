@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.ports.event_publisher import EventPublisher
@@ -57,7 +58,22 @@ class OutboxPublisher:
             rows = await claim_pending_events(session, limit=self._batch_size)
 
             for row in rows:
-                envelope = DomainEventEnvelope.model_validate(row.payload)
+                try:
+                    envelope = DomainEventEnvelope.model_validate(row.payload)
+                except ValidationError as error:
+                    # A payload the current schema rejects -- corruption, or a
+                    # rolling deploy mid-version-change -- must not take the
+                    # batch down with it. Validating outside the per-row guard
+                    # would roll the whole unit of work back, so the oldest
+                    # poison row would fail every pass forever.
+                    await mark_failed(session, row, repr(error))
+                    failed += 1
+                    logger.error(
+                        "outbox row does not match the envelope schema",
+                        extra={"outbox_event_id": str(row.id), "attempts": row.attempts},
+                    )
+                    continue
+
                 # The event is published under the correlation it was recorded
                 # with, so the publish shows up in the interaction's trace
                 # rather than in the publisher's own.
