@@ -310,3 +310,195 @@ async def _some_exercise(
     async with session_factory() as session:
         exercise = (await session.scalars(sa.select(Exercise).where(Exercise.slug == slug))).one()
     return exercise.id
+
+
+# --------------------------------------------------------------------------
+# Convergence: a correction has to reach a database that already ran the seed
+# --------------------------------------------------------------------------
+
+
+async def test_reseeding_retargets_an_alias_that_moved(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A curation fix that moves an alias to another exercise must land on
+    existing databases too. Skipping the conflict would leave them resolving
+    "supino" to the wrong movement forever, while fresh ones got it right."""
+    wrong_target = await _some_exercise(session_factory, slug="leg-press")
+
+    async with unit_of_work(session_factory) as session:
+        alias = (
+            await session.scalars(
+                sa.select(ExerciseAlias).where(ExerciseAlias.normalized_alias == "supino")
+            )
+        ).one()
+        alias.exercise_id = wrong_target
+
+    await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        alias = (
+            await session.scalars(
+                sa.select(ExerciseAlias).where(ExerciseAlias.normalized_alias == "supino")
+            )
+        ).one()
+        correct = (
+            await session.scalars(sa.select(Exercise).where(Exercise.slug == "supino-reto"))
+        ).one()
+
+    assert alias.exercise_id == correct.id
+
+
+async def test_reseeding_retires_an_alias_the_catalog_dropped(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Soft-deleted rather than deleted: the text is freed by the partial index
+    while the row still explains a resolution somebody acted on last month."""
+    exercise_id = await _some_exercise(session_factory)
+
+    async with unit_of_work(session_factory) as session:
+        session.add(
+            ExerciseAlias(
+                exercise_id=exercise_id,
+                user_id=None,
+                alias="alias que saiu da curadoria",
+                normalized_alias="alias que saiu da curadoria",
+                source=AliasSource.SEED,
+            )
+        )
+
+    report = await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        retired = (
+            await session.scalars(
+                sa.select(ExerciseAlias).where(
+                    ExerciseAlias.normalized_alias == "alias que saiu da curadoria"
+                )
+            )
+        ).one()
+
+    assert report.aliases_retired == 1
+    assert retired.deleted_at is not None
+
+
+async def test_reseeding_does_not_touch_aliases_a_user_learned(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Retirement is scoped to seed-owned global rows. A user's own alias is
+    not the catalog's to withdraw."""
+    exercise_id = await _some_exercise(session_factory, slug="leg-press")
+
+    async with unit_of_work(session_factory) as session:
+        user = User()
+        session.add(user)
+        await session.flush()
+        session.add(
+            ExerciseAlias(
+                exercise_id=exercise_id,
+                user_id=user.id,
+                alias="minha prensa",
+                normalized_alias="minha prensa",
+                source=AliasSource.USER_CONFIRMED,
+            )
+        )
+
+    await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        learned = (
+            await session.scalars(
+                sa.select(ExerciseAlias).where(ExerciseAlias.normalized_alias == "minha prensa")
+            )
+        ).one()
+
+    assert learned.deleted_at is None
+
+
+async def test_reseeding_corrects_a_muscle_role(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A muscle promoted from secondary to primary changes the role on an
+    existing pair. Skipping the conflict would make an old database group its
+    analysis differently from a new one."""
+    async with unit_of_work(session_factory) as session:
+        exercise = (
+            await session.scalars(sa.select(Exercise).where(Exercise.slug == "supino-reto"))
+        ).one()
+        link = (
+            await session.scalars(
+                sa.select(ExerciseMuscle).where(
+                    ExerciseMuscle.exercise_id == exercise.id,
+                    ExerciseMuscle.role == MuscleRole.PRIMARY,
+                )
+            )
+        ).one()
+        link.role = MuscleRole.STABILIZER
+        link_id = link.id
+
+    await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        corrected = await session.get(ExerciseMuscle, link_id)
+
+    assert corrected is not None
+    assert corrected.role is MuscleRole.PRIMARY
+
+
+async def test_reseeding_removes_a_muscle_link_the_catalog_dropped(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with unit_of_work(session_factory) as session:
+        exercise = (
+            await session.scalars(sa.select(Exercise).where(Exercise.slug == "leg-press"))
+        ).one()
+        muscle = (await session.scalars(sa.select(Muscle).where(Muscle.slug == "biceps"))).one()
+        session.add(
+            ExerciseMuscle(exercise_id=exercise.id, muscle_id=muscle.id, role=MuscleRole.SECONDARY)
+        )
+        exercise_id, muscle_id = exercise.id, muscle.id
+
+    report = await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        remaining = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(ExerciseMuscle)
+            .where(
+                ExerciseMuscle.exercise_id == exercise_id,
+                ExerciseMuscle.muscle_id == muscle_id,
+            )
+        )
+
+    assert remaining == 0
+    assert report.links_removed >= 1
+
+
+async def test_reseeding_retires_an_exercise_the_catalog_dropped(
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Soft, always: sets somebody logged point at this row, so a hard delete
+    would either fail on the foreign key or take the history with it."""
+    async with unit_of_work(session_factory) as session:
+        session.add(
+            Exercise(
+                canonical_name="Exercício removido da curadoria",
+                slug="exercicio-removido",
+                activity_type=ActivityType.STRENGTH,
+                default_load_mode=LoadMode.TOTAL,
+            )
+        )
+
+    await _reseed(migrated_database)
+
+    async with session_factory() as session:
+        retired = (
+            await session.scalars(sa.select(Exercise).where(Exercise.slug == "exercicio-removido"))
+        ).one()
+
+    assert retired.deleted_at is not None

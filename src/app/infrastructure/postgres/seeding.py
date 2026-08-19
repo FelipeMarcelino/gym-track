@@ -6,10 +6,16 @@ migration `0005` would reach fresh databases and never the ones already
 running. Migration `0005` calls this so a clean clone has a catalog; `make seed`
 calls it again whenever the curated data changes.
 
-Idempotence is `ON CONFLICT (slug) DO UPDATE` on the three entity tables and
-`ON CONFLICT DO NOTHING` on the join tables and aliases. Updating rather than
-skipping matters: a corrected canonical name has to reach databases that
-already have the old one.
+Convergent, not merely additive. Every conflict updates rather than skips, and
+rows the seed no longer contains are retired. That distinction is the whole
+point: an alias moved to another exercise, a muscle promoted from secondary to
+primary, or an entry removed after a curation mistake must reach databases that
+already have the old version. A seed that only inserts leaves those databases
+resolving user input to the wrong exercise indefinitely, while fresh ones get
+the correction -- the same divergence this module exists to prevent.
+
+Removal is soft wherever history can point at the row: an exercise somebody
+already logged sets against is retired, never deleted.
 """
 
 from __future__ import annotations
@@ -68,10 +74,17 @@ class SeedReport:
     exercises_inserted: int
     exercises_updated: int
     aliases_inserted: int
+    aliases_retired: int = 0
+    links_removed: int = 0
 
     @property
     def changed(self) -> bool:
-        return bool(self.exercises_inserted or self.aliases_inserted)
+        return bool(
+            self.exercises_inserted
+            or self.aliases_inserted
+            or self.aliases_retired
+            or self.links_removed
+        )
 
 
 def seed_catalog_sync(connection: Connection) -> SeedReport:
@@ -101,15 +114,18 @@ def seed_catalog_sync(connection: Connection) -> SeedReport:
     )
 
     exercise_ids, inserted, updated = _upsert_exercises(connection)
-    aliases_inserted = _insert_aliases(connection, exercise_ids)
-    _insert_muscle_links(connection, exercise_ids, muscle_ids)
-    _insert_equipment_links(connection, exercise_ids, equipment_ids)
-    _insert_relations(connection, exercise_ids)
+    aliases_inserted, aliases_retired = _sync_aliases(connection, exercise_ids)
+    removed = _sync_muscle_links(connection, exercise_ids, muscle_ids)
+    removed += _sync_equipment_links(connection, exercise_ids, equipment_ids)
+    removed += _sync_relations(connection, exercise_ids)
+    removed += _retire_stale_exercises(connection)
 
     report = SeedReport(
         exercises_inserted=inserted,
         exercises_updated=updated,
         aliases_inserted=aliases_inserted,
+        aliases_retired=aliases_retired,
+        links_removed=removed,
     )
     logger.info(
         "catalog seeded",
@@ -117,6 +133,8 @@ def seed_catalog_sync(connection: Connection) -> SeedReport:
             "exercises_inserted": report.exercises_inserted,
             "exercises_updated": report.exercises_updated,
             "aliases_inserted": report.aliases_inserted,
+            "aliases_retired": report.aliases_retired,
+            "links_removed": report.links_removed,
         },
     )
     return report
@@ -173,34 +191,6 @@ def _upsert_exercises(connection: Connection) -> tuple[dict[str, UUID], int, int
     return ids, len(seeded - existing), len(seeded & existing)
 
 
-def _insert_aliases(connection: Connection, exercise_ids: dict[str, UUID]) -> int:
-    inserted = 0
-    for exercise in CATALOG_SEED:
-        for alias in _unique_aliases(exercise):
-            statement = insert(ExerciseAlias).values(
-                id=new_uuid7(),
-                exercise_id=exercise_ids[exercise.slug],
-                user_id=None,
-                alias=alias,
-                normalized_alias=normalize_for_match(alias),
-                source=AliasSource.SEED,
-            )
-            result = connection.execute(
-                # The unique index is partial, so PostgreSQL cannot infer it
-                # from the column alone: the predicate has to match the index's
-                # own, or the statement fails with "no unique or exclusion
-                # constraint matching the ON CONFLICT specification".
-                statement.on_conflict_do_nothing(
-                    index_elements=["normalized_alias"],
-                    index_where=sa.text("user_id IS NULL AND deleted_at IS NULL"),
-                )
-            )
-            # `rowcount` is -1, not 0, when ON CONFLICT DO NOTHING skips a
-            # row, so a plain sum reports a negative number of insertions.
-            inserted += 1 if result.rowcount == 1 else 0
-    return inserted
-
-
 def _unique_aliases(exercise: SeedExercise) -> list[str]:
     """The exercise's aliases plus its canonical name, deduplicated by normal form.
 
@@ -213,9 +203,92 @@ def _unique_aliases(exercise: SeedExercise) -> list[str]:
     return list(seen.values())
 
 
-def _insert_muscle_links(
+def _sync_aliases(connection: Connection, exercise_ids: dict[str, UUID]) -> tuple[int, int]:
+    """Upsert every seeded alias and retire the ones the seed dropped.
+
+    The conflict target is `normalized_alias` alone, so a correction that moves
+    an alias to another exercise has to *update* `exercise_id` -- skipping
+    would leave the database pointing at the old movement forever, which is
+    precisely the silent wrong-exercise failure the catalog is written to avoid.
+    """
+    desired: dict[str, tuple[UUID, str]] = {}
+    for exercise in CATALOG_SEED:
+        for alias in _unique_aliases(exercise):
+            desired[normalize_for_match(alias)] = (exercise_ids[exercise.slug], alias)
+
+    # Counted against what was already there: ON CONFLICT DO UPDATE reports one
+    # affected row whether it inserted or updated, so the statement cannot tell
+    # us which happened.
+    existing = {
+        normalized
+        for (normalized,) in connection.execute(
+            sa.select(ExerciseAlias.normalized_alias).where(
+                ExerciseAlias.user_id.is_(None), ExerciseAlias.deleted_at.is_(None)
+            )
+        ).all()
+    }
+    inserted = len(set(desired) - existing)
+
+    for normalized, (exercise_id, alias) in desired.items():
+        statement = insert(ExerciseAlias).values(
+            id=new_uuid7(),
+            exercise_id=exercise_id,
+            user_id=None,
+            alias=alias,
+            normalized_alias=normalized,
+            source=AliasSource.SEED,
+        )
+        connection.execute(
+            # The unique index is partial, so PostgreSQL cannot infer it from
+            # the column alone: the predicate has to match the index's own, or
+            # the statement fails with "no unique or exclusion constraint
+            # matching the ON CONFLICT specification".
+            statement.on_conflict_do_update(
+                index_elements=["normalized_alias"],
+                index_where=sa.text("user_id IS NULL AND deleted_at IS NULL"),
+                set_={
+                    "exercise_id": statement.excluded.exercise_id,
+                    "alias": statement.excluded.alias,
+                    "source": statement.excluded.source,
+                },
+            )
+        )
+
+    retired = _retire_stale_aliases(connection, set(desired))
+    return inserted, retired
+
+
+def _retire_stale_aliases(connection: Connection, desired: set[str]) -> int:
+    """Soft-delete global aliases the seed no longer claims.
+
+    Soft, not hard: the partial unique index excludes deleted rows, so the text
+    is freed for reuse while the row stays available to explain a resolution
+    somebody made a decision on last month.
+    """
+    result = connection.execute(
+        sa.update(ExerciseAlias)
+        .where(
+            ExerciseAlias.user_id.is_(None),
+            ExerciseAlias.source == AliasSource.SEED,
+            ExerciseAlias.deleted_at.is_(None),
+            ExerciseAlias.normalized_alias.not_in(desired) if desired else sa.true(),
+        )
+        .values(deleted_at=sa.func.now())
+    )
+    return int(result.rowcount or 0)
+
+
+def _sync_muscle_links(
     connection: Connection, exercise_ids: dict[str, UUID], muscle_ids: dict[str, UUID]
-) -> None:
+) -> int:
+    """Upsert the roles and drop links the seed dropped.
+
+    A muscle promoted from secondary to primary changes the *role* on an
+    existing pair, so the conflict has to update it. Skipping would leave an
+    existing database grouping analysis differently from a fresh one.
+    """
+    desired: set[tuple[UUID, UUID]] = set()
+
     for exercise in CATALOG_SEED:
         roles = (
             (exercise.primary_muscles, MuscleRole.PRIMARY),
@@ -224,47 +297,148 @@ def _insert_muscle_links(
         )
         for slugs, role in roles:
             for slug in slugs:
+                exercise_id, muscle_id = exercise_ids[exercise.slug], muscle_ids[slug]
+                desired.add((exercise_id, muscle_id))
+                statement = insert(ExerciseMuscle).values(
+                    id=new_uuid7(),
+                    exercise_id=exercise_id,
+                    muscle_id=muscle_id,
+                    role=role,
+                )
                 connection.execute(
-                    insert(ExerciseMuscle)
-                    .values(
-                        id=new_uuid7(),
-                        exercise_id=exercise_ids[exercise.slug],
-                        muscle_id=muscle_ids[slug],
-                        role=role,
+                    statement.on_conflict_do_update(
+                        constraint="uq_exercise_muscles_pair",
+                        set_={"role": statement.excluded.role},
                     )
-                    .on_conflict_do_nothing(constraint="uq_exercise_muscles_pair")
                 )
 
+    return _delete_stale_muscle_links(connection, exercise_ids, desired)
 
-def _insert_equipment_links(
+
+def _retire_stale_exercises(connection: Connection) -> int:
+    """Soft-delete exercises the catalog no longer contains.
+
+    Soft, always: sets somebody logged last month point at these rows, and a
+    hard delete would either fail on the foreign key or take the history with
+    it. A retired exercise stops being resolvable and stays explainable.
+    """
+    slugs = [exercise.slug for exercise in CATALOG_SEED]
+    result = connection.execute(
+        sa.update(Exercise)
+        .where(Exercise.slug.not_in(slugs), Exercise.deleted_at.is_(None))
+        .values(deleted_at=sa.func.now())
+    )
+    return int(result.rowcount or 0)
+
+
+def _sync_equipment_links(
     connection: Connection, exercise_ids: dict[str, UUID], equipment_ids: dict[str, UUID]
-) -> None:
+) -> int:
+    desired: set[tuple[UUID, UUID]] = set()
+
     for exercise in CATALOG_SEED:
         for position, slug in enumerate(exercise.equipment):
+            exercise_id, equipment_id = exercise_ids[exercise.slug], equipment_ids[slug]
+            desired.add((exercise_id, equipment_id))
+            statement = insert(ExerciseEquipment).values(
+                id=new_uuid7(),
+                exercise_id=exercise_id,
+                equipment_id=equipment_id,
+                is_primary=position == 0,
+            )
             connection.execute(
-                insert(ExerciseEquipment)
-                .values(
-                    id=new_uuid7(),
-                    exercise_id=exercise_ids[exercise.slug],
-                    equipment_id=equipment_ids[slug],
-                    is_primary=position == 0,
+                statement.on_conflict_do_update(
+                    constraint="uq_exercise_equipment_pair",
+                    set_={"is_primary": statement.excluded.is_primary},
                 )
-                .on_conflict_do_nothing(constraint="uq_exercise_equipment_pair")
             )
 
+    return _delete_stale_equipment_links(connection, exercise_ids, desired)
 
-def _insert_relations(connection: Connection, exercise_ids: dict[str, UUID]) -> None:
+
+def _delete_stale_muscle_links(
+    connection: Connection,
+    exercise_ids: dict[str, UUID],
+    desired: set[tuple[UUID, UUID]],
+) -> int:
+    """Remove muscle links for seeded exercises that the seed no longer declares.
+
+    Hard delete: a join row carries no history of its own, and leaving a muscle
+    attached after curation removed it is what makes two databases disagree.
+    Only seeded exercises are touched.
+    """
+    seeded = set(exercise_ids.values())
+    found = connection.execute(
+        sa.select(ExerciseMuscle.id, ExerciseMuscle.exercise_id, ExerciseMuscle.muscle_id).where(
+            ExerciseMuscle.exercise_id.in_(seeded)
+        )
+    ).all()
+    stale = [row[0] for row in found if (row[1], row[2]) not in desired]
+    if not stale:
+        return 0
+
+    result = connection.execute(sa.delete(ExerciseMuscle).where(ExerciseMuscle.id.in_(stale)))
+    return int(result.rowcount or 0)
+
+
+def _delete_stale_equipment_links(
+    connection: Connection,
+    exercise_ids: dict[str, UUID],
+    desired: set[tuple[UUID, UUID]],
+) -> int:
+    seeded = set(exercise_ids.values())
+    found = connection.execute(
+        sa.select(
+            ExerciseEquipment.id,
+            ExerciseEquipment.exercise_id,
+            ExerciseEquipment.equipment_id,
+        ).where(ExerciseEquipment.exercise_id.in_(seeded))
+    ).all()
+    stale = [row[0] for row in found if (row[1], row[2]) not in desired]
+    if not stale:
+        return 0
+
+    result = connection.execute(sa.delete(ExerciseEquipment).where(ExerciseEquipment.id.in_(stale)))
+    return int(result.rowcount or 0)
+
+
+def _sync_relations(connection: Connection, exercise_ids: dict[str, UUID]) -> int:
+    desired: set[tuple[UUID, UUID, str]] = set()
+
     for relation in SEED_RELATIONS:
+        from_id = exercise_ids[relation.from_slug]
+        to_id = exercise_ids[relation.to_slug]
+        desired.add((from_id, to_id, relation.relation_type.value))
         connection.execute(
             insert(ExerciseRelation)
             .values(
                 id=new_uuid7(),
-                from_exercise_id=exercise_ids[relation.from_slug],
-                to_exercise_id=exercise_ids[relation.to_slug],
+                from_exercise_id=from_id,
+                to_exercise_id=to_id,
                 relation_type=relation.relation_type,
             )
             .on_conflict_do_nothing(constraint="uq_exercise_relations")
         )
+
+    seeded = set(exercise_ids.values())
+    rows = connection.execute(
+        sa.select(
+            ExerciseRelation.id,
+            ExerciseRelation.from_exercise_id,
+            ExerciseRelation.to_exercise_id,
+            ExerciseRelation.relation_type,
+        ).where(ExerciseRelation.from_exercise_id.in_(seeded))
+    ).all()
+    stale = [
+        identifier
+        for identifier, from_id, to_id, relation_type in rows
+        if (from_id, to_id, str(relation_type)) not in desired
+    ]
+    if not stale:
+        return 0
+
+    result = connection.execute(sa.delete(ExerciseRelation).where(ExerciseRelation.id.in_(stale)))
+    return int(result.rowcount or 0)
 
 
 def main() -> None:  # pragma: no cover - thin entrypoint, exercised via seed_catalog_sync
