@@ -16,6 +16,7 @@ state and applies it. Migration 0002 calls it to provision a new database, and
 
 from __future__ import annotations
 
+import logging
 import re
 
 import sqlalchemy as sa
@@ -23,6 +24,8 @@ from sqlalchemy.engine import Connection
 
 from app.config import ApplicationSettings, ServiceName
 from app.infrastructure.postgres.grants import SERVICE_GRANTS
+
+logger = logging.getLogger(__name__)
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
@@ -58,13 +61,27 @@ def _role_exists(connection: Connection, role: str) -> bool:
     return found is not None
 
 
+def existing_tables(connection: Connection) -> frozenset[str]:
+    """The tables that exist right now, in the public schema."""
+    rows = connection.execute(
+        sa.text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+    ).scalars()
+    return frozenset(rows)
+
+
 def sync_service_roles(connection: Connection, settings: ApplicationSettings) -> None:
     """Create or update every service role and reset its grants to the policy.
 
     Idempotent by construction: privileges are revoked before being granted, so
     a privilege removed from :data:`SERVICE_GRANTS` disappears on the next run
     instead of lingering on databases that were provisioned earlier.
+
+    Tables the policy mentions but the database does not have yet are skipped.
+    Migration 0002 runs long before the tables later migrations create, and
+    granting on a table that does not exist aborts the whole upgrade -- so each
+    migration that adds tables calls this again, and the grants converge.
     """
+    present = existing_tables(connection)
     for service in ServiceName:
         role = settings.postgres.roles[service]
         name = _identifier(role.user)
@@ -77,6 +94,12 @@ def sync_service_roles(connection: Connection, settings: ApplicationSettings) ->
         connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {name}"))
 
         for table, privileges in SERVICE_GRANTS[service].items():
+            if table not in present:
+                logger.info(
+                    "skipping a grant for a table that does not exist yet",
+                    extra={"table": table, "role": name},
+                )
+                continue
             granted = ", ".join(_privilege(privilege) for privilege in privileges)
             connection.execute(sa.text(f"GRANT {granted} ON {_identifier(table)} TO {name}"))
 

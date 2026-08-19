@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help sync fmt lint typecheck test check up down logs demo migrate provision
+.PHONY: help sync fmt lint typecheck test check up down logs demo migrate provision seed
 
 COMPOSE := docker compose -f docker/compose.yaml
 
@@ -47,3 +47,6 @@ migrate: ## Apply database migrations to the local stack
 
 provision: ## Reconcile database roles, passwords and grants with the policy
 	uv run python -m app.infrastructure.postgres.provisioning
+
+seed: ## Reconcile the exercise catalog with the curated data
+	uv run python -m app.infrastructure.postgres.seeding
