@@ -214,8 +214,11 @@ class MessageBatchItem(Base):
 
     __tablename__ = "message_batch_items"
     __table_args__ = (
-        sa.UniqueConstraint("message_batch_id", "message_id", name="uq_batch_items_batch_message"),
         sa.UniqueConstraint("message_batch_id", "position", name="uq_batch_items_batch_position"),
+        # A message belongs to at most one batch, ever. Without this, two
+        # concurrent flushes could each build a batch from the same fragments
+        # and produce two workflow executions for one interaction.
+        sa.UniqueConstraint("message_id", name="uq_batch_items_message"),
     )
 
     message_batch_id: Mapped[UUID] = mapped_column(

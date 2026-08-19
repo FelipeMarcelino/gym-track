@@ -57,7 +57,7 @@ def test_migration_0001_covers_exactly_the_sprint_tables() -> None:
         ("workflow_executions", ("message_batch_id",)),
         ("processed_operations", ("operation_id",)),
         ("outbox_events", ("domain_event_id",)),
-        ("message_batch_items", ("message_batch_id", "message_id")),
+        ("message_batch_items", ("message_id",)),
         ("message_batch_items", ("message_batch_id", "position")),
     ],
 )

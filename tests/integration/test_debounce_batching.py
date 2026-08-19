@@ -143,6 +143,11 @@ async def _register(
     )
 
 
+async def _count(session_factory: async_sessionmaker[AsyncSession], model: Any) -> int:
+    async with session_factory() as session:
+        return int(await session.scalar(sa.select(sa.func.count()).select_from(model)) or 0)
+
+
 async def test_three_fragments_inside_the_window_become_one_batch(
     aggregator: MessageAggregator,
     scheduler: RecordingScheduler,
@@ -188,7 +193,7 @@ async def test_batch_items_preserve_arrival_order(
 ) -> None:
     """Order comes from the durable rows, not from Redis (§10)."""
     user_id, conversation_id = conversation
-    base = datetime.now(UTC)
+    base = datetime.now(UTC) - timedelta(seconds=5)
     expected = []
     for index, text in enumerate(["primeiro", "segundo", "terceiro"]):
         message_id = await _add_message(
@@ -362,12 +367,13 @@ async def test_redis_flushed_mid_window_loses_no_message(
     await aggregator.on_flush(scheduler.last)
 
     async with session_factory() as session:
-        stored = (await session.scalars(sa.select(Message))).all()
-        items = (await session.scalars(sa.select(MessageBatchItem))).all()
+        items = (
+            await session.scalars(sa.select(MessageBatchItem).order_by(MessageBatchItem.position))
+        ).all()
 
-    assert len(stored) == 2, "the messages themselves survive a Redis wipe"
-    assert len(items) == 1, "the wiped fragment is not in this batch"
-    assert items[0].message_id == second
+    assert [item.message_id for item in items] == [first, second], (
+        "the fragment whose debounce state was wiped must still reach a batch"
+    )
 
 
 async def test_a_trigger_for_an_unknown_window_does_nothing(
@@ -418,3 +424,121 @@ async def test_the_scheduled_delay_shrinks_as_the_cap_approaches(
     await _register(aggregator, user_id=user_id, conversation_id=conversation_id, message_id=later)
 
     assert scheduler.scheduled[-1][1] <= 1000, "the delay was capped by the absolute window"
+
+
+async def test_a_trigger_without_a_window_still_batches_what_is_waiting(
+    aggregator: MessageAggregator,
+    scheduler: RecordingScheduler,
+    redis: Redis,
+    session_factory: async_sessionmaker[AsyncSession],
+    conversation: tuple[UUID, UUID],
+) -> None:
+    """A durable trigger outliving its Redis key must not become a no-op: the
+    fragments are in `messages`, and Redis is not the authority (§10)."""
+    user_id, conversation_id = conversation
+    message_id = await _add_message(
+        session_factory, user_id=user_id, conversation_id=conversation_id, text="oi"
+    )
+    await _register(
+        aggregator, user_id=user_id, conversation_id=conversation_id, message_id=message_id
+    )
+
+    await redis.flushall()
+
+    assert await aggregator.on_flush(scheduler.last) is not None
+
+    async with session_factory() as session:
+        item = (await session.scalars(sa.select(MessageBatchItem))).one()
+
+    assert item.message_id == message_id
+
+
+async def test_a_redelivered_registration_does_not_produce_a_second_batch(
+    aggregator: MessageAggregator,
+    scheduler: RecordingScheduler,
+    session_factory: async_sessionmaker[AsyncSession],
+    conversation: tuple[UUID, UUID],
+) -> None:
+    """RabbitMQ delivery is at-least-once, so the same event arrives twice. The
+    message is already in a batch, so the second window has nothing to take."""
+    user_id, conversation_id = conversation
+    message_id = await _add_message(
+        session_factory, user_id=user_id, conversation_id=conversation_id, text="oi"
+    )
+    await _register(
+        aggregator, user_id=user_id, conversation_id=conversation_id, message_id=message_id
+    )
+    assert await aggregator.on_flush(scheduler.last) is not None
+
+    await _register(
+        aggregator, user_id=user_id, conversation_id=conversation_id, message_id=message_id
+    )
+    assert await aggregator.on_flush(scheduler.last) is None
+
+    assert await _count(session_factory, MessageBatch) == 1
+    assert await _count(session_factory, MessageBatchItem) == 1
+
+
+async def test_a_failed_persist_leaves_the_window_claimable(
+    aggregator: MessageAggregator,
+    scheduler: RecordingScheduler,
+    store: RedisDebounceStore,
+    session_factory: async_sessionmaker[AsyncSession],
+    conversation: tuple[UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing the window before the commit would strand every fragment in it
+    when the database is briefly unavailable."""
+    user_id, conversation_id = conversation
+    message_id = await _add_message(
+        session_factory, user_id=user_id, conversation_id=conversation_id, text="oi"
+    )
+    await _register(
+        aggregator, user_id=user_id, conversation_id=conversation_id, message_id=message_id
+    )
+
+    class TransientOutageError(RuntimeError):
+        pass
+
+    async def failing_persist(*args: Any, **kwargs: Any) -> None:
+        raise TransientOutageError
+
+    monkeypatch.setattr(aggregator, "_persist_batch", failing_persist)
+    with pytest.raises(TransientOutageError):
+        await aggregator.on_flush(scheduler.last)
+
+    monkeypatch.undo()
+    assert await store.read(user_id=user_id, conversation_id=conversation_id) is not None
+    assert await aggregator.on_flush(scheduler.last) is not None
+
+
+async def test_a_fragment_arriving_during_a_flush_keeps_its_own_window(
+    aggregator: MessageAggregator,
+    scheduler: RecordingScheduler,
+    session_factory: async_sessionmaker[AsyncSession],
+    conversation: tuple[UUID, UUID],
+) -> None:
+    """It must not be swept into a batch whose flush was already decided —
+    otherwise it loses the debounce interval it was entitled to."""
+    user_id, conversation_id = conversation
+    first = await _add_message(
+        session_factory, user_id=user_id, conversation_id=conversation_id, text="primeiro"
+    )
+    await _register(aggregator, user_id=user_id, conversation_id=conversation_id, message_id=first)
+
+    # Arrives "later" than the flush's claim time.
+    late = await _add_message(
+        session_factory,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        text="tarde",
+        received_at=datetime.now(UTC) + timedelta(seconds=5),
+    )
+
+    await aggregator.on_flush(scheduler.last)
+
+    async with session_factory() as session:
+        items = (await session.scalars(sa.select(MessageBatchItem))).all()
+
+    assert [item.message_id for item in items] == [first]
+    assert late not in [item.message_id for item in items]

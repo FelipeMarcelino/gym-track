@@ -36,6 +36,7 @@ from app.infrastructure.postgres.models import (
     MessageBatch,
     MessageBatchItem,
     MessageBatchStatus,
+    MessageDirection,
 )
 from app.infrastructure.postgres.outbox import record_domain_event
 from app.infrastructure.rabbitmq.partitioning import queue_for_user
@@ -100,11 +101,11 @@ class MessageAggregator:
         """Register a fragment and schedule the flush it might trigger."""
         user_id = UUID(str(payload["user_id"]))
         conversation_id = UUID(str(payload["conversation_id"]))
-        message_id = UUID(str(payload["message_id"]))
 
-        registered = await self._store.register(
-            user_id=user_id, conversation_id=conversation_id, message_id=message_id
-        )
+        # Nothing here needs the message id: the fragment is already durable,
+        # and the batch is composed from `messages` at flush time. A redelivery
+        # of this event therefore costs an extra trigger, never a second batch.
+        registered = await self._store.register(user_id=user_id, conversation_id=conversation_id)
         delay = next_flush_delay(
             registered.window,
             now=datetime.now(UTC),
@@ -128,19 +129,15 @@ class MessageAggregator:
         tell a real flush from a dropped trigger.
         """
         trigger = FlushTrigger.from_payload(payload)
+        claim_time = datetime.now(UTC)
         window = await self._store.read(
             user_id=trigger.user_id, conversation_id=trigger.conversation_id
         )
 
-        if window is None:
-            # Already flushed by another trigger, or the key expired. Either
-            # way there is nothing waiting.
-            return None
-
-        if not should_flush(
+        if window is not None and not should_flush(
             scheduled_generation=trigger.generation,
             window=window,
-            now=datetime.now(UTC),
+            now=claim_time,
             absolute=self._settings.workflow.max_batch_window,
         ):
             logger.debug(
@@ -152,24 +149,38 @@ class MessageAggregator:
             )
             return None
 
-        message_ids = await self._store.take(
-            user_id=trigger.user_id, conversation_id=trigger.conversation_id
-        )
-        if not message_ids:
-            return None
+        if window is None:
+            # The key expired or Redis lost it. §10 says Redis is not the
+            # authority, so a missing window is not "nothing to do" -- the
+            # fragments are still in `messages`, waiting to be batched.
+            logger.info(
+                "flushing without a debounce window; rebuilding from messages",
+                extra={"conversation_id": str(trigger.conversation_id)},
+            )
+            window = DebounceWindow(
+                generation=trigger.generation,
+                window_started_at=claim_time,
+                last_message_at=claim_time,
+            )
 
-        return await self._persist_batch(trigger, window, message_ids)
+        batch_id = await self._persist_batch(trigger, window, claim_time)
+
+        # Only now: a failure before the commit leaves the window in place, so
+        # the retried trigger still has something to act on.
+        await self._store.close(user_id=trigger.user_id, conversation_id=trigger.conversation_id)
+        return batch_id
 
     async def _persist_batch(
         self,
         trigger: FlushTrigger,
         window: DebounceWindow,
-        message_ids: list[UUID],
-    ) -> UUID:
+        claim_time: datetime,
+    ) -> UUID | None:
         async with unit_of_work(self._session_factory) as session:
-            # Ordering comes from the durable rows, not from Redis: §10 makes
-            # Redis a hint, and arrival order is a property of `messages`.
-            ordered = await self._ordered_messages(session, message_ids)
+            # Membership, order and recovery all come from the durable rows.
+            ordered = await self._unbatched_messages(session, trigger, claim_time)
+            if not ordered:
+                return None
             request_traces = [message.trace_id for message in ordered if message.trace_id]
 
             # The single interaction trace for this batch is minted here, at
@@ -215,12 +226,29 @@ class MessageAggregator:
                 )
                 return batch.id
 
-    async def _ordered_messages(
-        self, session: AsyncSession, message_ids: list[UUID]
+    async def _unbatched_messages(
+        self, session: AsyncSession, trigger: FlushTrigger, claim_time: datetime
     ) -> list[Message]:
+        """Inbound messages of this conversation that no batch has claimed yet.
+
+        This query is what makes Redis genuinely non-authoritative: a fragment
+        whose debounce state was lost is still picked up by the next flush of
+        its conversation, and a redelivered `message.received` cannot create a
+        second batch for a message that already belongs to one.
+
+        The `received_at <= claim_time` bound keeps a fragment that arrives
+        while this flush is running out of it, so it still gets its own
+        debounce window instead of being swept in early.
+        """
         rows = await session.scalars(
             sa.select(Message)
-            .where(Message.id.in_(message_ids))
+            .outerjoin(MessageBatchItem, MessageBatchItem.message_id == Message.id)
+            .where(
+                Message.conversation_id == trigger.conversation_id,
+                Message.direction == MessageDirection.INBOUND,
+                Message.received_at <= claim_time,
+                MessageBatchItem.id.is_(None),
+            )
             .order_by(Message.received_at, Message.id)
         )
         return list(rows.all())
