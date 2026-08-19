@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help sync fmt lint typecheck test check up down migrate
+.PHONY: help sync fmt lint typecheck test check up down logs demo migrate provision
 
 COMPOSE := docker compose -f docker/compose.yaml
 
@@ -11,12 +11,12 @@ sync: ## Install/refresh dependencies into .venv
 	uv sync --frozen
 
 fmt: ## Format the codebase
-	uv run ruff format src tests migrations
-	uv run ruff check --fix src tests migrations
+	uv run ruff format src tests migrations scripts
+	uv run ruff check --fix src tests migrations scripts
 
 lint: ## Check formatting and lint rules
-	uv run ruff format --check src tests migrations
-	uv run ruff check src tests migrations
+	uv run ruff format --check src tests migrations scripts
+	uv run ruff check src tests migrations scripts
 
 typecheck: ## Run mypy in strict mode
 	uv run mypy
@@ -26,13 +26,21 @@ test: ## Run the test suite
 
 check: lint typecheck test ## Everything CI runs
 
-# up/down/migrate drive files that land later in this sprint: docker/compose.yaml
-# in WS-2 (local infra) and the Alembic environment in WS-3 (persistence base).
-up: ## Start local infrastructure (postgres, rabbitmq, redis)
-	$(COMPOSE) up -d --wait
+# `up` builds the application image as well, so a change to a worker is picked
+# up without a separate build step. Migrations run as a one-shot compose service
+# before any process starts; `migrate` here is for a stack you are already
+# running against from the host.
+up: ## Start the whole stack: infrastructure and every application process
+	$(COMPOSE) up -d --wait --build
 
-down: ## Stop local infrastructure and drop its volumes
+down: ## Stop the stack and drop its volumes
 	$(COMPOSE) down -v
+
+logs: ## Follow the logs of every application process
+	$(COMPOSE) logs -f api message-aggregator workflow-worker outbox-publisher whatsapp-dispatcher
+
+demo: ## Send a fragmented message to the running stack and report the reply
+	uv run python scripts/demo.py
 
 migrate: ## Apply database migrations to the local stack
 	uv run alembic upgrade head

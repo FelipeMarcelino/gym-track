@@ -26,8 +26,28 @@ devshell would shadow it and lose the Desktop context.
 | `make typecheck` | `mypy --strict` |
 | `make test` | Test suite |
 | `make check` | Everything CI runs |
-| `make up` / `make down` | Local infrastructure (arrives in WS-2) |
-| `make migrate` | Apply database migrations (arrives in WS-3) |
+| `make up` / `make down` | The whole stack: infrastructure and every process |
+| `make logs` | Follow the application processes |
+| `make demo` | Send a fragmented message to the running stack |
+| `make migrate` | Apply migrations from the host |
+| `make provision` | Reconcile database roles and grants with the policy |
+
+## Running the walking skeleton
+
+```bash
+make up      # postgres, rabbitmq, redis, migrations, api and four workers
+make demo    # three fragments in; one batch, one workflow, one reply out
+make logs    # follow the processes
+make down    # stop everything and drop the volumes
+```
+
+`make up` builds one image and runs it as five roles (ADR-001). Migrations run
+as a one-shot service that every process waits for, so a fresh volume produces
+a working stack rather than a race.
+
+Locally the dispatcher uses `FakeWhatsAppClient`: there is no Meta integration
+yet (decision D6), and nothing leaves the machine. In a deployed environment
+that process refuses to start rather than silently dropping replies.
 
 ## Layout
 
