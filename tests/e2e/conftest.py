@@ -22,18 +22,12 @@ from app.api.app import create_app
 from app.api.dependencies import ApiContext
 from app.application.ports.event_publisher import EventPublisher
 from app.config import ApplicationSettings
-from app.infrastructure.rabbitmq.connection import (
-    RabbitMQEventPublisher,
-    connect,
-    declare_topology,
-)
+from app.infrastructure.rabbitmq.connection import RabbitMQEventPublisher, connect
 from app.infrastructure.rabbitmq.scheduling import RabbitMQFlushScheduler
 from app.infrastructure.rabbitmq.topology import (
     DEBOUNCE_DELAY_QUEUE,
     DEBOUNCE_FLUSH_QUEUE,
     build_topology,
-    dead_letter_queue_name,
-    retry_queue_name,
 )
 from app.infrastructure.redis.debounce import RedisDebounceStore
 from app.infrastructure.whatsapp.fake_client import FakeWhatsAppClient
@@ -42,6 +36,7 @@ from app.workers.dispatcher import WhatsAppDispatcher
 from app.workers.message_aggregator import FlushScheduler, MessageAggregator
 from app.workers.outbox_publisher import OutboxPublisher
 from app.workers.workflow_worker import WorkflowWorker
+from tests.conftest import redeclare_topology
 
 BSUID = "5511987654321"
 
@@ -145,10 +140,9 @@ async def skeleton(
 
     connection = await connect(rabbitmq_url)
     channel = await connection.channel(publisher_confirms=True)
-    await declare_topology(
+    await redeclare_topology(
         channel, build_topology(migrated_database.rabbitmq, partitions=partitions)
     )
-    await _purge(channel, migrated_database, partitions)
 
     app = create_app(
         ApiContext(settings=migrated_database, engine=admin_engine, session_factory=session_factory)
@@ -183,25 +177,3 @@ async def skeleton(
 
     await redis.aclose()
     await connection.close()
-
-
-async def _purge(channel: AbstractChannel, settings: ApplicationSettings, partitions: int) -> None:
-    from app.infrastructure.rabbitmq.partitioning import partition_queue_name
-
-    names = [
-        *WORKED_QUEUES,
-        *(partition_queue_name(index, partitions) for index in range(partitions)),
-    ]
-    for name in list(names):
-        names.extend(
-            retry_queue_name(name, tier)
-            for tier in range(1, len(settings.rabbitmq.retry_delays) + 1)
-        )
-        names.append(dead_letter_queue_name(name))
-
-    for name in dict.fromkeys(names):
-        try:
-            queue = await channel.get_queue(name, ensure=False)
-            await queue.purge()
-        except Exception:
-            pass

@@ -30,6 +30,7 @@ from app.infrastructure.rabbitmq.topology import (
     dead_letter_queue_name,
     retry_queue_name,
 )
+from tests.conftest import redeclare_topology
 
 pytestmark = [pytest.mark.integration]
 
@@ -55,7 +56,7 @@ async def channel(rabbitmq_url: str, settings: RabbitMQSettings) -> AsyncIterato
     try:
         async with connection:
             open_channel = await connection.channel(publisher_confirms=True)
-            await declare_topology(open_channel, build_topology(settings, partitions=2))
+            await redeclare_topology(open_channel, build_topology(settings, partitions=2))
             await _drain(open_channel)
             yield open_channel
     finally:
