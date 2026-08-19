@@ -26,6 +26,7 @@ from app.config.secrets import EnvironmentSecretsProvider
 
 ENV_PREFIX: Final = "GYM_TRACK_"
 ENV_NESTED_DELIMITER: Final = "__"
+ENV_FILE: Final = ".env"
 
 
 class Environment(StrEnum):
@@ -204,7 +205,7 @@ class ApplicationSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
         env_nested_delimiter=ENV_NESTED_DELIMITER,
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
@@ -264,6 +265,12 @@ def load_settings(
     manager is in play it is authoritative, and an ambient environment variable
     must not be able to shadow it.
     """
-    provider = EnvironmentSecretsProvider() if secrets is None else secrets
+    if secrets is None:
+        # The same file the settings themselves are loaded from, unless the
+        # caller opted out of dotenv entirely.
+        # Whatever pydantic-settings would read, secrets read too: one path, a
+        # layered sequence, or nothing when the caller opted out.
+        secrets = EnvironmentSecretsProvider(env_file=overrides.get("_env_file", ENV_FILE))
+    provider = secrets
     values = _deep_merge(build_secret_tree(provider), overrides)
     return ApplicationSettings(**values)
