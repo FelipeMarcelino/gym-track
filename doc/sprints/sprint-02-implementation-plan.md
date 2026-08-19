@@ -1,7 +1,3 @@
-The file write wasn't permitted, so here is the complete plan as requested — output only, nothing written to the repo.
-
----
-
 # Sprint 2 — Task-level Implementation Plan
 
 Companion to `doc/sprints/sprint-02-deterministic-workout-domain.md`. The sprint file states *what* ships and *why*; this states *where the code goes*, *what its signatures are*, *which migration carries the schema*, and *which test files fail when it is wrong*.
@@ -549,14 +545,14 @@ WS-8's builder must never copy the activity value into the sets. WS-4 ships the 
 
 | | Path | Purpose |
 | --- | --- | --- |
-| + | `migrations/versions/0006_training_sessions.py` | `training_sessions` |
+| + | `migrations/versions/0006_training_sessions.py` | `training_sessions` and `audit_events` |
 | + | `src/app/domain/training/sessions.py` | Pure expiry policy |
 | + | `src/app/application/services/training_sessions.py` | `TrainingSessionManager` |
 | + | `src/app/infrastructure/redis/session_hints.py` | Non-authoritative hints (§18) |
 | + | `src/app/workers/session_expiration_worker.py` | The background sweep (Q31) |
 | + | `src/app/entrypoints/session_expiration_worker.py` | Its process |
 | ~ | `src/app/config/settings.py` | `ServiceName.SESSION_EXPIRATION_WORKER` |
-| ~ | `models.py`, `grants.py` | Model + grants |
+| ~ | `models.py`, `grants.py` | `TrainingSession`, `AuditEvent`, `ActorType` + grants |
 | ~ | `docker/compose.yaml`, `.env.example` | Role env vars + a service |
 | ~ | `tests/conftest.py` | `TRUNCATE` list (roles come from the `ServiceName` loop) |
 | ~ | `tests/unit/test_persistence_contracts.py`, `tests/unit/test_entrypoints.py` | New table, new entrypoint |
@@ -568,6 +564,12 @@ WS-8's builder must never copy the activity value into the sets. WS-4 ships the 
 `down_revision = "0005_exercise_catalog"`.
 
 `training_sessions`: `user_id FK`, `conversation_id FK NULL`, `status` (`ACTIVE`/`CLOSED`), `started_at`, `last_activity_at`, `finished_at NULL`, `closed_by` (`LAZY`/`WORKER`/`EXPLICIT`, nullable), `expected_version int NOT NULL DEFAULT 1`, soft-delete.
+
+`audit_events` (append-only, no soft delete) is created by this same migration: `actor_type str(32)` (`USER`/`SYSTEM`/`OPERATOR`), `actor_user_id FK NULL`, `action str(64)`, `entity_type str(64)`, `entity_id UUID`, `workflow_execution_id FK NULL`, `metadata JSONB`, `occurred_at`. Index `(entity_type, entity_id)`; index `(actor_user_id, occurred_at)`.
+
+It lands here rather than with the workout schema because **sessions are the first thing this sprint mutates**, and a table that appears one migration after its first auditable event is a gap nobody notices until an audit asks about the missing week. §26 makes it append-only, so it joins `APPEND_ONLY_TABLES` and the existing invariant test starts covering it immediately: no role may UPDATE or DELETE.
+
+It is not a second copy of `domain_events`. An event says what happened so consumers can react; an audit row says who caused it. They answer different questions when somebody asks why a set exists.
 
 ```python
 sa.Index(
@@ -654,10 +656,15 @@ The entrypoint follows `entrypoints/outbox_publisher.py`: `worker_runtime(...)`,
 ServiceName.SESSION_EXPIRATION_WORKER: {
     "users": ("SELECT",),
     "training_sessions": ("SELECT", "UPDATE"),   # no INSERT: it never opens one
+    "audit_events": ("SELECT", "INSERT"),        # it closes sessions, so it attributes them
     "domain_events": ("SELECT", "INSERT"),
     "outbox_events": ("SELECT", "INSERT"),
 }
-ServiceName.WORKFLOW_WORKER: { ..., "training_sessions": ("SELECT", "INSERT", "UPDATE") }
+ServiceName.WORKFLOW_WORKER: {
+    ...,
+    "training_sessions": ("SELECT", "INSERT", "UPDATE"),
+    "audit_events": ("SELECT", "INSERT"),
+}
 ```
 
 The expiration worker having no `INSERT` is a real constraint, not decoration: a bug that made the sweep *open* a session would be refused by PostgreSQL rather than discovered in a user's history.
@@ -672,6 +679,9 @@ The expiration worker having no `INSERT` is a real constraint, not decoration: a
 | " | a call after the timeout closes the old one (`status=CLOSED`, `closed_by=LAZY`, `finished_at` set) and opens a new one |
 | " | the same expiry through `SessionExpirationWorker.run_once` → `closed_by=WORKER` |
 | " | a `training_session.finished` domain event and its outbox row exist after each close |
+| " | **each close writes an `audit_events` row**: the lazy path with `actor_type=USER` and `metadata.closed_by="lazy"`, the worker path with `actor_type=SYSTEM` and `"worker"` — a session that closed itself with nobody attributed is the audit gap this table exists to prevent |
+| " | opening a session writes `training_session.started`, so a session's whole lifecycle is attributable rather than only its end |
+| `tests/integration/test_persistence.py` (~) | no service role can UPDATE or DELETE `audit_events`, asserted with each role's own credentials |
 | " | **a stale Redis hint for a user whose `last_activity_at` is recent closes nothing** (§18) |
 | " | two concurrent `start_or_resume` calls for one user (`asyncio.gather`, two sessions, real Postgres) yield one row — assert `SELECT count(*)`, not return values |
 | " | `performed_at` is "now", never taken from message content (Q32) — asserted in WS-9 where rows exist, stubbed here |
@@ -757,6 +767,9 @@ class ExerciseGroupType(StrEnum): # Q51
 
 `downgrade()` drops entity_sources, exercise_sets, session_exercises, exercise_groups.
 
+`audit_events` is **not** created here — see WS-5, where it lands with the first
+thing that mutates.
+
 ## Block-index rule (Q58)
 
 Implemented in WS-9's service, specified here because the schema is what makes it checkable:
@@ -771,7 +784,7 @@ async def next_block_index(
 
 ## Grants
 
-`workflow-worker` gets `SELECT, INSERT, UPDATE` on `session_exercises`, `exercise_sets`, `exercise_groups`, and `SELECT, INSERT` on `entity_sources` — never `UPDATE`, because provenance is history. No other service gets anything.
+`workflow-worker` gets `SELECT, INSERT, UPDATE` on `session_exercises`, `exercise_sets`, `exercise_groups`, and `SELECT, INSERT` on `entity_sources` — never `UPDATE`, because provenance is history. Its `audit_events` grant was already added in WS-5, with the table. No other service gets anything.
 
 ## Tests
 
@@ -1184,9 +1197,12 @@ Transaction body, in order, inside a single `unit_of_work`:
 2. `sessions.start_or_resume(...)` then `sessions.touch(...)`.
 3. Per activity: `next_block_index(...)`, insert or reuse the `session_exercises` row, insert `exercise_sets` with provenance and metric versions.
 4. Insert `entity_sources`: one per created `session_exercise` and per created `exercise_set`, pointing at the batch and at every source message, `source_role=CREATED_FROM` (§26.2).
-5. `record_domain_event(... "workout.logged" ...)` on `Exchanges.DOMAIN_EVENTS`, payload naming the session, the exercises and the set count.
+5. Insert `audit_events` for **every** entity this transaction mutated, not only the created sets: `training_session.started` when step 2 opened one, `training_session.closed` when step 2 lazily closed a stale one (`metadata.closed_by="lazy"`), `exercise_group.created` when a group was built, and `workout.logged` per created `session_exercise` and `exercise_set`. `actor_type=USER` with `actor_user_id` from the batch, carrying the `workflow_execution_id` (§15, §26).
 
-There is no step between the domain write and the outbox write. That is the claim WS-11's failure-injection test exists to prove, and this ordering is what makes it provable.
+   Auditing only the leaves would leave the session a set belongs to unattributed, and the session is the row an operator asks about first.
+6. `record_domain_event(... "workout.logged" ...)` on `Exchanges.DOMAIN_EVENTS`, payload naming the session, the exercises and the set count.
+
+There is no step between the domain write, the audit write and the outbox write. That is the claim WS-11's failure-injection test exists to prove, and this ordering is what makes it provable.
 
 ```python
 # domain/training/confirmations.py  — pure, D8
@@ -1242,7 +1258,8 @@ The `LOG_WORKOUT` handler returns a `DomainResult` with `visibility=USER_VISIBLE
 
 | File | Assertion |
 | --- | --- |
-| `tests/integration/test_workout_logging.py` | one exercise, three sets → 1 `training_sessions`, 1 `session_exercises`, 3 `exercise_sets`, ≥4 `entity_sources`, 1 `domain_events`, 1 `outbox_events`, in one transaction |
+| `tests/integration/test_workout_logging.py` | one exercise, three sets → 1 `training_sessions`, 1 `session_exercises`, 3 `exercise_sets`, ≥4 `entity_sources`, ≥4 `audit_events`, 1 `domain_events`, 1 `outbox_events`, in one transaction |
+| `tests/integration/test_workout_logging.py` | every service role is refused UPDATE and DELETE on `audit_events`, asserted with that role's own credentials — the same protection `domain_events` has |
 | " | **redelivery**: two calls with the same `operation_id` → `count(exercise_sets)` is 3 both times, `count(domain_events WHERE event_type='workout.logged')` is 1. Asserted on row counts, never on `result.replayed` alone |
 | " | two concurrent calls with the same `operation_id` (`asyncio.gather`, real Postgres) → 3 sets total |
 | " | a failure mid-transaction (patched to raise after the sets are added) leaves zero `training_sessions`, zero `exercise_sets`, zero `outbox_events` |
@@ -1372,7 +1389,7 @@ The worker is constructed with `build_task_handlers(workout=..., builder=...)`, 
 | --- | --- |
 | redelivery after commit | replay the same `InputBatchReady` through RabbitMQ; `count(exercise_sets)` unchanged, `count(domain_events WHERE event_type='workout.logged')` still 1 |
 | duplicate outbox publication | publish the same `workout.logged` envelope twice; no second set, no second outbound message (dedupe on `event_id`) |
-| crash between domain write and outbox write | patch `record_domain_event` to raise *after* the sets are added; assert **zero** sets and **zero** outbox rows — the window does not exist because it is one transaction, and this test proves it rather than asserting it in prose |
+| crash between domain write and outbox write | patch `record_domain_event` to raise *after* the sets are added; assert **zero** sets, **zero** audit rows and **zero** outbox rows — the window does not exist because it is one transaction, and this test proves it rather than asserting it in prose |
 | worker killed after commit, before ACK | (reuses Sprint 1's harness) one training session, three sets, one outbound message |
 
 ## `make demo`
