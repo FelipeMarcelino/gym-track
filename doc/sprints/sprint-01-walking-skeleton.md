@@ -1,6 +1,6 @@
 # Sprint 1 — Walking Skeleton
 
-**Status:** Planned
+**Status:** Done — 2026-08-19
 **Spec basis:** v1.1 — §5, §6, §7, §8, §9, §10, §26, §27, §28, §30, §33, §34, §35, §36, §37, §38, §41 Phase 0, §48
 **Decision records exercised:** DEC-005, DEC-006, DEC-010, DEC-013, DEC-015
 **Depends on:** nothing (repo contains only the spec, `CLAUDE.md` and a Nix devshell)
@@ -223,6 +223,17 @@ Only what cannot belong to a single workstream.
 44. **Correlation:** the interaction `trace_id` minted by the aggregator appears in the workflow worker's and the dispatcher's log lines for the same interaction, and each contributing webhook request trace is reachable from it (Q131).
 45. Testcontainers fixtures for Postgres/RabbitMQ/Redis, session-scoped so the suite stays fast enough for every PR (Q158).
 
+### WS-13 — Process entrypoints (added during the sprint)
+51. One entrypoint per role under `app/entrypoints/`, one image that runs any of
+    them, and compose services for all five behind a one-shot migration service.
+52. `make demo`: post a fragmented message to the running stack and require the
+    reply it should produce.
+
+**Tests:** the dispatcher refuses to start in a deployed environment without a
+real provider client; one stop event is shared by every consumer in a process,
+because a handler per consumer means SIGTERM wakes only the last; the outbox
+loop drains a burst without pacing itself and still stops when asked.
+
 ### WS-12 — Decision records
 46. Write `doc/adr/` with a template that **requires** a traceability block: affected spec section, related DEC, originating Q numbers (§48).
 47. ADR-001 modular monolith with worker entrypoints (DEC-015, Q151-Q160).
@@ -234,25 +245,42 @@ Remaining ADRs from §43 are written when their decision is actually taken.
 
 ## Definition of Done
 
-Every item is mechanically verifiable — no "works on my machine".
+Every item is mechanically verifiable — no "works on my machine". All verified
+on 2026-08-19 against `main`; 509 tests, green in CI with containers.
 
-- [ ] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone.
-- [ ] `make test` passes: unit + integration + E2E, with containers, in CI.
-- [ ] No workstream was merged without the tests listed under it (`CLAUDE.md` rule 2).
-- [ ] Every workstream shipped on a correctly prefixed branch with its own PR — `feat/` for WS-1..WS-11, `doc/` for WS-12 (`CLAUDE.md` rules 3, 5, 6 and 7).
-- [ ] Duplicate webhook delivery (same `external_message_id`) creates exactly one `messages` row.
-- [ ] Redelivery of a workflow message after a post-commit crash creates **no** second `outbound_message`.
-- [ ] A DLQ message replayed through the tooling produces no duplicate business effect (Q117).
-- [ ] Three messages inside the debounce window produce exactly one `message_batch` and one reply.
-- [ ] A message arriving at 9s into a 10s cap still respects the absolute window.
-- [ ] Partition assignment for a fixed set of user IDs matches the golden test — the hash contract is frozen.
-- [ ] Every outbox row reaches `PUBLISHED`, or is visibly stuck and alertable; none are silently lost.
-- [ ] Three fragments across three webhook requests produce exactly **one** interaction trace, minted at batch persistence and reaching the dispatcher's logs, with all three request traces linked to it (Q131).
-- [ ] Each service role is refused the writes it should not have, asserted by test (Q145).
-- [ ] No BSUID, phone number or secret appears in any log line (asserted, not assumed).
-- [ ] Startup fails fast and legibly on missing or invalid configuration.
-- [ ] `mypy --strict` clean on `src/app`; `ruff` clean.
-- [ ] ADR-001, ADR-003, ADR-004 and ADR-011 committed, each with a §48 traceability block.
+- [x] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone. *Verified against the running stack — five application containers behind a one-shot migration service — by posting three signed webhooks and reading back one batch, one workflow execution and one dispatched reply, with the interaction trace present in three separate containers' logs. `make demo` is that check in executable form, and it fails when the dispatcher is stopped.*
+- [x] `make test` passes: unit + integration + E2E, with containers, in CI.
+- [x] No workstream was merged without the tests listed under it (`CLAUDE.md` rule 2).
+- [x] Every workstream shipped on a correctly prefixed branch with its own PR — PRs #4-#16, plus hotfix #17.
+- [x] Duplicate webhook delivery (same `external_message_id`) creates exactly one `messages` row.
+- [x] Redelivery of a workflow message after a post-commit crash creates **no** second `outbound_message`.
+- [x] A DLQ message replayed through the tooling produces no duplicate business effect (Q117).
+- [x] Three messages inside the debounce window produce exactly one `message_batch` and one reply.
+- [x] A message arriving at 9s into a 10s cap still respects the absolute window.
+- [x] Partition assignment for a fixed set of user IDs matches the golden test — the hash contract is frozen.
+- [x] Every outbox row reaches `PUBLISHED`, or is visibly stuck and alertable; none are silently lost.
+- [x] Three fragments across three webhook requests produce exactly **one** interaction trace, minted at batch persistence and reaching the dispatcher's logs, with all three request traces linked to it (Q131).
+- [x] Each service role is refused the writes it should not have, asserted by test (Q145) — and exercised with that role's own credentials, not the admin's.
+- [x] No BSUID, phone number or secret appears in any log line (asserted, not assumed).
+- [x] Startup fails fast and legibly on missing or invalid configuration.
+- [x] `mypy --strict` clean on `src/app`; `ruff` clean.
+- [x] ADR-001, ADR-003, ADR-004 and ADR-011 committed, each with a §48 traceability block.
+
+## What the implementation changed
+
+Deviations and additions worth carrying forward, all of them found by a test or
+a review rather than by planning:
+
+| Change | Why |
+| --- | --- |
+| Migrations 0003 and 0004, beyond the planned 0001-0002 | Audio messages needed a `provider_media_id` or speech-to-text would have had nothing to fetch; and "one active conversation per user" and "one batch per message" became database invariants after two concurrency findings |
+| Role and grant provisioning moved out of migration 0002 into `app/infrastructure/postgres/provisioning.py`, exposed as `make provision` | A migration runs once and is stamped forever, so a rotated password never reached PostgreSQL and an edited grant reached only fresh databases |
+| Batch membership derived from `messages` rather than from a Redis list | Holding membership in Redis made it authoritative in practice, contradicting §10; the flush now sweeps the conversation's unbatched messages |
+| `DomainEventEnvelope.from_message` as the only door into a consumer | Both workers had accepted a flattened payload the outbox never publishes, and the fixtures manufactured that shape, so the tests were complicit |
+| Per-message transactions and a provider idempotency key in the dispatcher | A crash between "the provider accepted" and "the row says so" would otherwise resend, breaking Q120 exactly where it matters |
+| `disable_existing_loggers=False` in the Alembic environment | Running a migration in-process silently switched off every application logger |
+| Secrets read from the dotenv file the settings already use | `.env.example` documented secrets that the provider never read from a file, so a clean clone could not boot |
+| WS-13: process entrypoints, an application image and compose services for all five roles | The plan's workstreams built every component but no process to run them: compose started only infrastructure, and the e2e suite constructed the pipeline in-process. Review of this closeout caught the acceptance criterion being marked done on that basis |
 
 ## Decisions needed
 
