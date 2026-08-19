@@ -25,6 +25,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+class EnvelopeDecodeError(ValueError):
+    """A consumed message is not a domain event envelope."""
+
+
 class DomainEventEnvelope(BaseModel):
     """One thing that happened, with the metadata needed to trace and dedupe it."""
 
@@ -42,6 +46,19 @@ class DomainEventEnvelope(BaseModel):
     causation_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     occurred_at: datetime = Field(default_factory=_now)
+
+    @classmethod
+    def from_message(cls, body: dict[str, Any]) -> Self:
+        """Parse a consumed message body.
+
+        Consumers take *envelopes*, never bare payloads: the publisher
+        serializes the whole envelope, and the trace and correlation a consumer
+        needs live at the top level rather than inside `payload`.
+        """
+        try:
+            return cls.model_validate(body)
+        except Exception as error:
+            raise EnvelopeDecodeError(str(error)) from error
 
     def with_correlation(
         self,

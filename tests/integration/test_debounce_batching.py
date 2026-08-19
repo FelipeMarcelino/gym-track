@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import ApplicationSettings
+from app.domain.events import DomainEventEnvelope
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
     Conversation,
@@ -135,11 +136,17 @@ async def _register(
     message_id: UUID,
 ) -> None:
     await aggregator.on_message_received(
-        {
-            "user_id": str(user_id),
-            "conversation_id": str(conversation_id),
-            "message_id": str(message_id),
-        }
+        DomainEventEnvelope(
+            event_type="message.received",
+            aggregate_type="message",
+            aggregate_id=message_id,
+            user_id=user_id,
+            payload={
+                "message_id": str(message_id),
+                "user_id": str(user_id),
+                "conversation_id": str(conversation_id),
+            },
+        ).model_dump(mode="json")
     )
 
 

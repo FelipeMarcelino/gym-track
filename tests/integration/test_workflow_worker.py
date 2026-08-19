@@ -10,6 +10,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.domain.events import DomainEventEnvelope
 from app.graphs.main.handlers import ACKNOWLEDGEMENT
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
@@ -29,6 +30,7 @@ from app.infrastructure.postgres.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
+from app.workers.message_aggregator import INPUT_BATCH_READY
 from app.workers.workflow_worker import RESPONSE_READY, WorkflowWorker
 
 pytestmark = [pytest.mark.integration]
@@ -80,13 +82,29 @@ async def _seed_batch(
                 )
             )
 
-        return {
-            "message_batch_id": str(batch.id),
-            "user_id": str(user.id),
-            "conversation_id": str(conversation.id),
-            "trace_id": batch.trace_id,
-            "correlation_id": batch.correlation_id,
-        }
+        # Exactly what the aggregator's outbox row carries.
+        return DomainEventEnvelope(
+            event_type=INPUT_BATCH_READY,
+            aggregate_type="message_batch",
+            aggregate_id=batch.id,
+            user_id=user.id,
+            trace_id=batch.trace_id,
+            correlation_id=batch.correlation_id,
+            payload={
+                "message_batch_id": str(batch.id),
+                "user_id": str(user.id),
+                "conversation_id": str(conversation.id),
+            },
+        ).model_dump(mode="json")
+
+
+def _envelope_for_missing_batch() -> dict[str, Any]:
+    return DomainEventEnvelope(
+        event_type=INPUT_BATCH_READY,
+        aggregate_type="message_batch",
+        aggregate_id=uuid4(),
+        payload={"message_batch_id": str(uuid4())},
+    ).model_dump(mode="json")
 
 
 async def _count(session_factory: async_sessionmaker[AsyncSession], model: Any) -> int:
@@ -109,7 +127,7 @@ async def test_a_batch_produces_one_execution_and_one_response_group(
         outbound = (await session.scalars(sa.select(OutboundMessage))).one()
 
     assert execution.status is WorkflowExecutionStatus.SUCCEEDED
-    assert execution.message_batch_id == UUID(payload["message_batch_id"])
+    assert execution.message_batch_id == UUID(payload["payload"]["message_batch_id"])
     assert outbound.text == ACKNOWLEDGEMENT
     assert outbound.sequence == 0
     assert outbound.delivery_state is DeliveryState.PENDING
@@ -212,13 +230,14 @@ async def test_the_execution_inherits_the_interaction_trace(
 
     assert execution.trace_id == payload["trace_id"]
     assert outbound.trace_id == payload["trace_id"]
+    assert payload["trace_id"] is not None
 
 
 async def test_a_missing_batch_is_an_error_rather_than_a_silent_skip(
     worker: WorkflowWorker,
 ) -> None:
     with pytest.raises(LookupError, match="does not exist"):
-        await worker.handle({"message_batch_id": str(uuid4())})
+        await worker.handle(_envelope_for_missing_batch())
 
 
 async def test_the_batch_fragments_reach_the_handler_in_order(

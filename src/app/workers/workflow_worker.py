@@ -67,12 +67,18 @@ class WorkflowWorker:
         # batch; until then every batch is one conversation task.
         self._task_type = task_type
 
-    async def handle(self, payload: dict[str, Any]) -> WorkflowOutcome:
-        """Process one InputBatchReady. Safe to call twice with the same batch."""
-        message_batch_id = UUID(str(payload["message_batch_id"]))
+    async def handle(self, body: dict[str, Any]) -> WorkflowOutcome:
+        """Process one InputBatchReady. Safe to call twice with the same batch.
+
+        `body` is the serialized `DomainEventEnvelope` exactly as the outbox
+        publisher put it on the wire -- not a flattened payload. Taking a shape
+        production never publishes is a bug a unit test cannot see.
+        """
+        envelope = DomainEventEnvelope.from_message(body)
+        message_batch_id = UUID(str(envelope.payload["message_batch_id"]))
         headers = {
-            "trace_id": payload.get("trace_id"),
-            "correlation_id": payload.get("correlation_id"),
+            "trace_id": envelope.trace_id,
+            "correlation_id": envelope.correlation_id,
         }
 
         with consumed_message_scope(headers):

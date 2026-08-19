@@ -97,10 +97,15 @@ class MessageAggregator:
         self._scheduler = scheduler
         self._settings = settings
 
-    async def on_message_received(self, payload: dict[str, Any]) -> None:
-        """Register a fragment and schedule the flush it might trigger."""
-        user_id = UUID(str(payload["user_id"]))
-        conversation_id = UUID(str(payload["conversation_id"]))
+    async def on_message_received(self, body: dict[str, Any]) -> None:
+        """Register a fragment and schedule the flush it might trigger.
+
+        `body` is the serialized envelope the API's outbox published, so the
+        identifiers are read from `payload` rather than from the top level.
+        """
+        envelope = DomainEventEnvelope.from_message(body)
+        user_id = UUID(str(envelope.payload["user_id"]))
+        conversation_id = UUID(str(envelope.payload["conversation_id"]))
 
         # Nothing here needs the message id: the fragment is already durable,
         # and the batch is composed from `messages` at flush time. A redelivery
