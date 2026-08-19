@@ -281,3 +281,84 @@ async def test_an_empty_response_group_is_an_error(
 
     with pytest.raises(LookupError, match="no messages"):
         await dispatcher.dispatch(envelope)
+
+
+async def test_the_dispatcher_role_can_read_what_it_needs_to_send(
+    client: FakeWhatsAppClient,
+    migrated_database: ApplicationSettings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Run with the dispatcher's own credentials, not the admin's.
+
+    The admin-backed factory the other tests use would hide a missing grant,
+    and a deployed dispatcher would then abort every group before reaching the
+    provider (Q145).
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.config import ServiceName
+    from app.infrastructure.postgres.engine import create_session_factory
+
+    envelope = await _seed_group(session_factory, migrated_database, "primeira", "segunda")
+
+    engine = create_async_engine(migrated_database.postgres.dsn_for(ServiceName.DISPATCHER))
+    try:
+        constrained = WhatsAppDispatcher(
+            session_factory=create_session_factory(engine),
+            client=client,
+            settings=migrated_database,
+        )
+        result = await constrained.dispatch(envelope)
+    finally:
+        await engine.dispose()
+
+    assert result.dispatched == 2
+    assert client.texts == ["primeira", "segunda"]
+
+
+async def test_a_send_accepted_before_a_crash_is_not_sent_twice(
+    dispatcher: WhatsAppDispatcher,
+    client: FakeWhatsAppClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    migrated_database: ApplicationSettings,
+) -> None:
+    """The window between "provider accepted" and "row updated" cannot be closed,
+    so the idempotency key is what makes crossing it safe."""
+    envelope = await _seed_group(session_factory, migrated_database, "unica")
+    response_group_id = UUID(envelope["payload"]["response_group_id"])
+
+    async with session_factory() as session:
+        message = (await session.scalars(sa.select(OutboundMessage))).one()
+        message_id = message.id
+
+    # Simulate: the provider accepted it, then the process died before the
+    # state could be recorded.
+    await client.send_text(recipient=BSUID, text="unica", idempotency_key=str(message_id))
+    async with unit_of_work(session_factory) as session:
+        crashed = (await session.scalars(sa.select(OutboundMessage))).one()
+        crashed.delivery_state = DeliveryState.DISPATCHING
+
+    result = await dispatcher.dispatch(envelope)
+
+    assert len(client.sent) == 1, "the provider must see this message exactly once"
+    assert result.dispatched == 1
+    assert await _states(session_factory, response_group_id) == [DeliveryState.DISPATCHED]
+
+
+async def test_a_permanently_failed_message_is_not_retried_by_a_duplicate_event(
+    dispatcher: WhatsAppDispatcher,
+    client: FakeWhatsAppClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    migrated_database: ApplicationSettings,
+) -> None:
+    """At-least-once publication means this event arrives more than once."""
+    envelope = await _seed_group(session_factory, migrated_database, "unica")
+    client.failures["unica"] = PermanentSendError("invalid recipient")
+    client.sticky = True
+
+    first = await dispatcher.dispatch(envelope)
+    second = await dispatcher.dispatch(envelope)
+
+    assert first.failed == 1
+    assert second.failed == 1
+    assert client.sent == [], "the provider is never called again for a rejected message"

@@ -37,6 +37,12 @@ class SentMessage:
 
 
 class WhatsAppClient(Protocol):
-    async def send_text(self, *, recipient: str, text: str) -> SentMessage:
-        """Deliver one message, or raise a Send error."""
+    async def send_text(self, *, recipient: str, text: str, idempotency_key: str) -> SentMessage:
+        """Deliver one message, or raise a Send error.
+
+        `idempotency_key` is stable per outbound message and survives a crash,
+        so a dispatcher that died between a successful send and its commit can
+        send again without the user receiving the message twice. Without it,
+        Q120 would hold only while the process stays alive.
+        """
         ...

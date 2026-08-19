@@ -47,12 +47,23 @@ logger = logging.getLogger(__name__)
 #: makes redelivery of the group safe (Q120).
 ALLOWED_TRANSITIONS: Final[dict[DeliveryState, frozenset[DeliveryState]]] = {
     DeliveryState.PENDING: frozenset({DeliveryState.DISPATCHING, DeliveryState.FAILED}),
+    # Re-claiming a message left DISPATCHING by a crashed dispatcher is a
+    # transition to itself: the provider may or may not have accepted it, and
+    # the idempotency key is what makes sending again safe.
     DeliveryState.DISPATCHING: frozenset(
-        {DeliveryState.DISPATCHED, DeliveryState.FAILED, DeliveryState.PENDING}
+        {
+            DeliveryState.DISPATCHING,
+            DeliveryState.DISPATCHED,
+            DeliveryState.FAILED,
+            DeliveryState.PENDING,
+        }
     ),
     DeliveryState.DISPATCHED: frozenset({DeliveryState.DELIVERED}),
     DeliveryState.DELIVERED: frozenset(),
-    DeliveryState.FAILED: frozenset({DeliveryState.DISPATCHING}),
+    # Terminal. A duplicate `response.ready` -- from the at-least-once outbox
+    # or a DLQ replay -- must not make the dispatcher call a provider that has
+    # already rejected this message. Reviving it is an operator action.
+    DeliveryState.FAILED: frozenset(),
 }
 
 #: States that mean "this message is done; the next one may go".
@@ -106,66 +117,65 @@ class WhatsAppDispatcher:
             return await self._dispatch_group(response_group_id)
 
     async def _dispatch_group(self, response_group_id: UUID) -> DispatchResult:
+        """Deliver the group one message at a time, committing between sends.
+
+        Each message gets its own transaction on purpose. A single transaction
+        around the whole group would mean that a dispatcher dying after the
+        provider accepted a message -- but before the commit -- rolls that
+        message back to PENDING even though the user already has it.
+
+        The window cannot be closed entirely: a crash between "provider
+        accepted" and "row updated" is always possible. What closes it is the
+        idempotency key, which is stable per outbound message, so the resend
+        after the crash resolves to the same provider message instead of a
+        second one.
+        """
         dispatched = 0
         skipped = 0
         failed = 0
-        # Raised only after the transaction commits. Raising inside it would
-        # roll back the prefix that *did* go out, and the next delivery would
-        # send those messages to the user a second time -- the exact failure
-        # Q120 forbids.
         transient: TransientSendError | None = None
 
-        async with unit_of_work(self._session_factory) as session:
-            messages = await self._group(session, response_group_id)
-            if not messages:
-                raise LookupError(f"response group {response_group_id} has no messages")
+        recipient = await self._recipient_for(response_group_id)
 
-            recipient = await self._recipient(session, messages[0].user_id)
+        for message_id, text in await self._pending_messages(response_group_id):
+            state = await self._claim(message_id)
+            if state is None:
+                skipped += 1
+                continue
+            if state is DeliveryState.FAILED:
+                # A message that was permanently rejected stops the group, just
+                # as it did on the attempt that rejected it.
+                failed += 1
+                break
 
-            for message in messages:
-                if message.delivery_state in DISPATCH_SAFE:
-                    # Q120: a retry of the group must not resend what already
-                    # went out. This skip is the entire guarantee.
-                    skipped += 1
-                    continue
-
-                transition(message, DeliveryState.DISPATCHING)
-                message.attempts += 1
-
-                try:
-                    sent = await self._client.send_text(recipient=recipient, text=message.text)
-                except PermanentSendError as error:
-                    transition(message, DeliveryState.FAILED)
-                    message.failure_reason = repr(error)[:2000]
-                    failed += 1
-                    logger.error(
-                        "outbound message permanently rejected",
-                        extra={
-                            "response_group_id": str(response_group_id),
-                            "sequence": message.sequence,
-                        },
-                    )
-                    # The rest of the group is not sent: a reply missing its
-                    # middle is worse than a reply that is late.
-                    break
-                except TransientSendError as error:
-                    transition(message, DeliveryState.PENDING)
-                    message.failure_reason = None
-                    transient = error
-                    logger.warning(
-                        "outbound message deferred to the retry tiers",
-                        extra={
-                            "response_group_id": str(response_group_id),
-                            "sequence": message.sequence,
-                            "attempts": message.attempts,
-                        },
-                    )
-                    break
-                else:
-                    transition(message, DeliveryState.DISPATCHED)
-                    message.provider_message_id = sent.provider_message_id
-                    message.dispatched_at = datetime.now(UTC)
-                    dispatched += 1
+            try:
+                sent = await self._client.send_text(
+                    recipient=recipient,
+                    text=text,
+                    # Stable across restarts and redeliveries: the row's own id.
+                    idempotency_key=str(message_id),
+                )
+            except PermanentSendError as error:
+                await self._record_failure(message_id, error)
+                failed += 1
+                logger.error(
+                    "outbound message permanently rejected",
+                    extra={"response_group_id": str(response_group_id)},
+                )
+                # The rest of the group is not sent: a reply missing its middle
+                # is worse than a reply that is late.
+                break
+            except TransientSendError as error:
+                await self._release(message_id)
+                transient = error
+                logger.warning(
+                    "outbound message deferred to the retry tiers",
+                    extra={"response_group_id": str(response_group_id)},
+                )
+                break
+            else:
+                await self._record_dispatched(message_id, sent.provider_message_id)
+                dispatched += 1
 
         if transient is not None:
             raise transient
@@ -176,6 +186,82 @@ class WhatsAppDispatcher:
             skipped=skipped,
             failed=failed,
         )
+
+    async def _pending_messages(self, response_group_id: UUID) -> list[tuple[UUID, str]]:
+        """The group in sequence order, as plain values.
+
+        Read outside the per-message transactions, so nothing is held open
+        across a provider call.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    sa.select(OutboundMessage)
+                    .where(OutboundMessage.response_group_id == response_group_id)
+                    .order_by(OutboundMessage.sequence)
+                )
+            ).all()
+
+        if not rows:
+            raise LookupError(f"response group {response_group_id} has no messages")
+        return [(row.id, row.text) for row in rows]
+
+    async def _claim(self, message_id: UUID) -> DeliveryState | None:
+        """Move a message into DISPATCHING, or report why it was not sent.
+
+        Returns None when the message is already dispatch-safe (Q120: the
+        skip that keeps a retry from resending what went out), FAILED when it
+        is terminally rejected, and DISPATCHING once claimed.
+        """
+        async with unit_of_work(self._session_factory) as session:
+            message = await self._locked(session, message_id)
+            if message.delivery_state in DISPATCH_SAFE:
+                return None
+            if message.delivery_state is DeliveryState.FAILED:
+                return DeliveryState.FAILED
+
+            transition(message, DeliveryState.DISPATCHING)
+            message.attempts += 1
+            return DeliveryState.DISPATCHING
+
+    async def _record_dispatched(self, message_id: UUID, provider_message_id: str) -> None:
+        async with unit_of_work(self._session_factory) as session:
+            message = await self._locked(session, message_id)
+            transition(message, DeliveryState.DISPATCHED)
+            message.provider_message_id = provider_message_id
+            message.dispatched_at = datetime.now(UTC)
+            message.failure_reason = None
+
+    async def _record_failure(self, message_id: UUID, error: PermanentSendError) -> None:
+        async with unit_of_work(self._session_factory) as session:
+            message = await self._locked(session, message_id)
+            transition(message, DeliveryState.FAILED)
+            message.failure_reason = repr(error)[:2000]
+
+    async def _release(self, message_id: UUID) -> None:
+        async with unit_of_work(self._session_factory) as session:
+            message = await self._locked(session, message_id)
+            transition(message, DeliveryState.PENDING)
+            message.failure_reason = None
+
+    async def _locked(self, session: AsyncSession, message_id: UUID) -> OutboundMessage:
+        message = await session.scalar(
+            sa.select(OutboundMessage).where(OutboundMessage.id == message_id).with_for_update()
+        )
+        if message is None:  # pragma: no cover - the row was read moments ago
+            raise LookupError(f"outbound message {message_id} vanished")
+        return message
+
+    async def _recipient_for(self, response_group_id: UUID) -> str:
+        async with self._session_factory() as session:
+            user_id = await session.scalar(
+                sa.select(OutboundMessage.user_id).where(
+                    OutboundMessage.response_group_id == response_group_id
+                )
+            )
+            if user_id is None:
+                raise LookupError(f"response group {response_group_id} has no messages")
+            return await self._recipient(session, user_id)
 
     async def mark_delivered(self, response_group_id: UUID, sequence: int) -> None:
         """Record a provider delivery receipt (§25)."""

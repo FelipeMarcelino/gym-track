@@ -30,8 +30,15 @@ class FakeWhatsAppClient:
     failures: dict[str, SendError] = field(default_factory=dict)
     sticky: bool = False
     sent: list[RecordedSend] = field(default_factory=list)
+    #: Accepted sends by idempotency key, mirroring a provider that
+    #: deduplicates. It is what a redelivered send resolves against.
+    accepted: dict[str, SentMessage] = field(default_factory=dict)
 
-    async def send_text(self, *, recipient: str, text: str) -> SentMessage:
+    async def send_text(self, *, recipient: str, text: str, idempotency_key: str) -> SentMessage:
+        already = self.accepted.get(idempotency_key)
+        if already is not None:
+            return already
+
         failure = self.failures.get(text)
         if failure is not None:
             if not self.sticky:
@@ -39,7 +46,9 @@ class FakeWhatsAppClient:
             raise failure
 
         self.sent.append(RecordedSend(recipient=recipient, text=text))
-        return SentMessage(provider_message_id=f"wamid.fake.{uuid4()}")
+        sent = SentMessage(provider_message_id=f"wamid.fake.{uuid4()}")
+        self.accepted[idempotency_key] = sent
+        return sent
 
     def fail_once(self, text: str, *, permanent: bool = False) -> None:
         self.failures[text] = (

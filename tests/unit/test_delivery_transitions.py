@@ -26,7 +26,7 @@ def message(state: DeliveryState) -> OutboundMessage:
         (DeliveryState.DISPATCHING, DeliveryState.DISPATCHED),
         (DeliveryState.DISPATCHED, DeliveryState.DELIVERED),
         (DeliveryState.DISPATCHING, DeliveryState.PENDING),
-        (DeliveryState.FAILED, DeliveryState.DISPATCHING),
+        (DeliveryState.DISPATCHING, DeliveryState.DISPATCHING),
     ],
 )
 def test_allowed_transitions_move_a_delivery_forward(
@@ -47,6 +47,8 @@ def test_allowed_transitions_move_a_delivery_forward(
         (DeliveryState.DELIVERED, DeliveryState.FAILED),
         (DeliveryState.DISPATCHED, DeliveryState.DISPATCHING),
         (DeliveryState.DISPATCHED, DeliveryState.PENDING),
+        (DeliveryState.FAILED, DeliveryState.DISPATCHING),
+        (DeliveryState.FAILED, DeliveryState.PENDING),
     ],
 )
 def test_a_delivery_never_moves_backwards(current: DeliveryState, target: DeliveryState) -> None:
@@ -57,6 +59,13 @@ def test_a_delivery_never_moves_backwards(current: DeliveryState, target: Delive
 
 def test_delivered_is_terminal() -> None:
     assert ALLOWED_TRANSITIONS[DeliveryState.DELIVERED] == frozenset()
+
+
+def test_failed_is_terminal() -> None:
+    """A duplicate `response.ready` — from the at-least-once outbox or a DLQ
+    replay — must not make the dispatcher call a provider that already rejected
+    this message. Reviving it is an operator action, not a retry."""
+    assert ALLOWED_TRANSITIONS[DeliveryState.FAILED] == frozenset()
 
 
 def test_dispatch_safe_states_are_the_ones_a_retry_skips() -> None:
