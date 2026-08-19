@@ -114,7 +114,17 @@ class WhatsAppDispatcher:
         with consumed_message_scope(
             {"trace_id": envelope.trace_id, "correlation_id": envelope.correlation_id}
         ):
-            return await self._dispatch_group(response_group_id)
+            result = await self._dispatch_group(response_group_id)
+            logger.info(
+                "response group dispatched",
+                extra={
+                    "response_group_id": str(response_group_id),
+                    "dispatched": result.dispatched,
+                    "skipped": result.skipped,
+                    "failed": result.failed,
+                },
+            )
+            return result
 
     async def _dispatch_group(self, response_group_id: UUID) -> DispatchResult:
         """Deliver the group one message at a time, committing between sends.

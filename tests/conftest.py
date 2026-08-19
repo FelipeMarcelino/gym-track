@@ -1,4 +1,8 @@
-"""Ephemeral real infrastructure for the integration suite (Q158).
+"""Ephemeral real infrastructure for every suite that needs it (Q158).
+
+Kept at the root of `tests/` rather than under `integration/` so the end-to-end
+suite shares the same containers: one PostgreSQL, one RabbitMQ and one Redis
+per session, however many suites use them.
 
 Containers are session-scoped: the suite runs on every PR, so paying the
 startup cost once is the difference between a gate people keep and a gate
@@ -21,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import ApplicationSettings, ServiceName, load_settings
 from app.infrastructure.postgres.engine import create_session_factory
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 ADMIN_USER = "gym_track"
 ADMIN_PASSWORD = "integration-test"

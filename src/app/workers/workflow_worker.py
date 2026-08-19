@@ -123,6 +123,18 @@ class WorkflowWorker:
                 execution.status = WorkflowExecutionStatus.SUCCEEDED
                 execution.finished_at = datetime.now(UTC)
 
+                # The happy path has to be visible too: a pipeline that only
+                # logs its failures cannot be traced through, and Q131's whole
+                # point is that one interaction is followable end to end.
+                logger.info(
+                    "workflow execution completed",
+                    extra={
+                        "message_batch_id": str(message_batch_id),
+                        "outbound_messages": len(result.messages),
+                        "task_type": result.task_type.value,
+                    },
+                )
+
             # The commit has happened. Only now may the message be acked.
             return WorkflowOutcome(
                 workflow_execution_id=execution.id,

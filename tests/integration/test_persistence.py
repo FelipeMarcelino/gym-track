@@ -24,7 +24,7 @@ from app.infrastructure.postgres.models import (
     User,
 )
 from app.infrastructure.postgres.provisioning import sync_service_roles
-from tests.integration.conftest import alembic_config
+from tests.conftest import alembic_config
 
 pytestmark = [pytest.mark.integration]
 
