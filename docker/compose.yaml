@@ -1,11 +1,45 @@
-# Local infrastructure only (§37.2, Q157). Application processes are not here
-# yet: they arrive with the API in WS-7 and the workers in WS-8..WS-10.
+# The walking skeleton, runnable: `make up` brings up the infrastructure and
+# every application process, and a signed webhook comes back as a reply.
 #
 # Qdrant is deliberately absent this sprint. Nothing retrieves yet, and an
 # unused service is maintenance cost with no test behind it; it joins in
 # Sprint 8 with the knowledge pipeline.
 
 name: gym-track
+
+x-app: &app
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  environment: &app-environment
+    GYM_TRACK_ENVIRONMENT: local
+    GYM_TRACK_POSTGRES__HOST: postgres
+    GYM_TRACK_POSTGRES__DATABASE: gym_track
+    GYM_TRACK_POSTGRES__ADMIN__USER: gym_track
+    GYM_TRACK_POSTGRES__ROLES__API__USER: gym_api
+    GYM_TRACK_POSTGRES__ROLES__MESSAGE-AGGREGATOR__USER: gym_message_aggregator
+    GYM_TRACK_POSTGRES__ROLES__WORKFLOW-WORKER__USER: gym_workflow_worker
+    GYM_TRACK_POSTGRES__ROLES__OUTBOX-PUBLISHER__USER: gym_outbox_publisher
+    GYM_TRACK_POSTGRES__ROLES__DISPATCHER__USER: gym_dispatcher
+    GYM_TRACK_RABBITMQ__HOST: rabbitmq
+    GYM_TRACK_RABBITMQ__USER: gym_track
+    GYM_TRACK_REDIS__HOST: redis
+    # Local development only. Real values come from a secrets manager through
+    # the same SecretsProvider port (Q144).
+    GYM_TRACK_SECRET_POSTGRES_ADMIN_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_API_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_MESSAGE_AGGREGATOR_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_WORKFLOW_WORKER_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_OUTBOX_PUBLISHER_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_DISPATCHER_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_RABBITMQ_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_SECURITY_WHATSAPP_APP_SECRET: local-dev-only
+    GYM_TRACK_SECRET_SECURITY_BSUID_ENCRYPTION_KEY: local-dev-only-32-bytes-minimum!!
+    GYM_TRACK_SECRET_SECURITY_BSUID_LOOKUP_HMAC_KEY: local-dev-only-32-bytes-minimum!
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
 
 services:
   postgres:
@@ -52,6 +86,44 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # Schema and per-service roles, applied once before anything connects. Every
+  # application service waits for this to succeed, so a fresh volume produces a
+  # working stack rather than a race between migrations and workers.
+  migrate:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.api"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  message-aggregator:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.message_aggregator"]
+
+  workflow-worker:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.workflow_worker"]
+
+  outbox-publisher:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.outbox_publisher"]
+
+  whatsapp-dispatcher:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.dispatcher"]
 
 volumes:
   postgres-data:
