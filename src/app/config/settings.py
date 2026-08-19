@@ -268,8 +268,9 @@ def load_settings(
     if secrets is None:
         # The same file the settings themselves are loaded from, unless the
         # caller opted out of dotenv entirely.
-        env_file = overrides.get("_env_file", ENV_FILE)
-        secrets = EnvironmentSecretsProvider(env_file=env_file)
+        # Whatever pydantic-settings would read, secrets read too: one path, a
+        # layered sequence, or nothing when the caller opted out.
+        secrets = EnvironmentSecretsProvider(env_file=overrides.get("_env_file", ENV_FILE))
     provider = secrets
     values = _deep_merge(build_secret_tree(provider), overrides)
     return ApplicationSettings(**values)

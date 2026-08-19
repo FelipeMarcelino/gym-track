@@ -281,3 +281,44 @@ def test_an_exported_secret_wins_over_the_dotenv_file(
     settings = load_settings(_env_file=str(env_file))
 
     assert settings.security.whatsapp_app_secret.get_secret_value() == "from-the-environment"
+
+
+def test_layered_dotenv_files_override_in_pydantic_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_env_file` may be a sequence, and the later file wins — for secrets too,
+    or the two halves of one configuration disagree about which file is
+    authoritative."""
+    for key in list(EXAMPLE_ENV) + [secret_name_to_env_var(n) for n in SECRET_BINDINGS]:
+        monkeypatch.delenv(key, raising=False)
+
+    base = tmp_path / ".env"
+    base.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    override = tmp_path / ".env.production"
+    override.write_text(
+        "GYM_TRACK_POSTGRES__HOST=db.internal\n"
+        "GYM_TRACK_SECRET_SECURITY_WHATSAPP_APP_SECRET=from-the-later-file\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(_env_file=(str(base), str(override)))
+
+    assert settings.postgres.host == "db.internal"
+    assert settings.security.whatsapp_app_secret.get_secret_value() == "from-the-later-file"
+    assert settings.rabbitmq.password.get_secret_value() == "local-dev-only", (
+        "values the later file does not mention still come from the base file"
+    )
+
+
+def test_a_missing_dotenv_file_is_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deployments export their configuration and ship no file at all."""
+    for key, value in EXAMPLE_ENV.items():
+        monkeypatch.setenv(key, value)
+    for name, value in EXAMPLE_SECRETS.items():
+        monkeypatch.setenv(secret_name_to_env_var(name), value)
+
+    settings = load_settings(_env_file=str(tmp_path / "absent.env"))
+
+    assert settings.postgres.host == "localhost"

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -17,6 +17,18 @@ from pydantic import SecretStr
 from app.application.ports.secrets import MissingSecretError
 
 SECRET_ENV_PREFIX = "GYM_TRACK_SECRET_"
+
+#: What pydantic-settings accepts for `_env_file`: one path, several in
+#: precedence order, or nothing.
+DotenvSource = str | Path | Sequence[str | Path] | None
+
+
+def _dotenv_paths(env_file: DotenvSource) -> list[Path]:
+    if env_file is None:
+        return []
+    candidates = [env_file] if isinstance(env_file, str | Path) else list(env_file)
+    return [Path(candidate) for candidate in candidates if Path(candidate).is_file()]
+
 
 _NON_ALPHANUMERIC = re.compile(r"[^A-Za-z0-9]+")
 
@@ -44,13 +56,17 @@ class EnvironmentSecretsProvider:
         self,
         environ: Mapping[str, str] | None = None,
         *,
-        env_file: str | Path | None = None,
+        env_file: DotenvSource = None,
     ) -> None:
         from_file: dict[str, str] = {}
-        if env_file is not None and Path(env_file).is_file():
-            from_file = {
-                key: value for key, value in dotenv_values(env_file).items() if value is not None
-            }
+        # Layered dotenv files are pydantic-settings' own contract: later files
+        # override earlier ones, and production setups use that to keep a base
+        # file and an environment-specific one. Secrets have to layer the same
+        # way, or the two halves of one configuration disagree.
+        for path in _dotenv_paths(env_file):
+            from_file.update(
+                {key: value for key, value in dotenv_values(path).items() if value is not None}
+            )
 
         ambient = os.environ if environ is None else environ
         self._environ = {**from_file, **ambient}
