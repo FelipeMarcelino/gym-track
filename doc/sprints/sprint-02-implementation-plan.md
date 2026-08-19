@@ -1,7 +1,3 @@
-The file write wasn't permitted, so here is the complete plan as requested — output only, nothing written to the repo.
-
----
-
 # Sprint 2 — Task-level Implementation Plan
 
 Companion to `doc/sprints/sprint-02-deterministic-workout-domain.md`. The sprint file states *what* ships and *why*; this states *where the code goes*, *what its signatures are*, *which migration carries the schema*, and *which test files fail when it is wrong*.
@@ -690,10 +686,10 @@ The expiration worker having no `INSERT` is a real constraint, not decoration: a
 
 | | Path | Purpose |
 | --- | --- | --- |
-| + | `migrations/versions/0007_workout_domain.py` | Four tables |
-| + | `src/app/domain/training/provenance.py` | `Provenance`, `SourceRole`, `ExerciseGroupType` |
-| ~ | `models.py` | `SessionExercise`, `ExerciseSet`, `ExerciseGroup`, `EntitySource` |
-| ~ | `grants.py`, `tests/unit/test_persistence_contracts.py`, `tests/conftest.py` | The four lists |
+| + | `migrations/versions/0007_workout_domain.py` | Five tables |
+| + | `src/app/domain/training/provenance.py` | `Provenance`, `SourceRole`, `ExerciseGroupType`, `ActorType` |
+| ~ | `models.py` | `SessionExercise`, `ExerciseSet`, `ExerciseGroup`, `EntitySource`, `AuditEvent` |
+| ~ | `grants.py`, `tests/unit/test_persistence_contracts.py`, `tests/conftest.py` | The five lists, and `audit_events` joins `APPEND_ONLY_TABLES` so the existing invariant test covers it |
 
 ## Domain enums
 
@@ -755,7 +751,11 @@ class ExerciseGroupType(StrEnum): # Q51
 
 **`entity_sources`** (append-only, no soft delete): `entity_type str(64)`, `entity_id UUID`, `message_id FK NULL`, `message_batch_id FK NULL`, `source_role`. `CHECK (message_id IS NOT NULL OR message_batch_id IS NOT NULL)`; index `(entity_type, entity_id)`; index `(message_batch_id)`.
 
-`downgrade()` drops entity_sources, exercise_sets, session_exercises, exercise_groups.
+**`audit_events`** (append-only, no soft delete): `actor_type str(32)` (`USER`/`SYSTEM`/`OPERATOR`), `actor_user_id FK NULL`, `action str(64)` (`workout.logged`, `training_session.closed`, ...), `entity_type str(64)`, `entity_id UUID`, `workflow_execution_id FK NULL`, `metadata JSONB`, `occurred_at`. Index `(entity_type, entity_id)`; index `(actor_user_id, occurred_at)`.
+
+§15 puts this table inside the workout transaction and §26 calls it append-only, so it is protected the way `domain_events` already is: **no service role gets UPDATE or DELETE on it**, and WS-1's grant additions carry INSERT and SELECT only. It is not the same thing as `domain_events` — an event says what happened for consumers to react to, an audit row says who caused it, and the two answer different questions when someone asks why a set exists.
+
+`downgrade()` drops entity_sources, audit_events, exercise_sets, session_exercises, exercise_groups.
 
 ## Block-index rule (Q58)
 
@@ -1184,9 +1184,10 @@ Transaction body, in order, inside a single `unit_of_work`:
 2. `sessions.start_or_resume(...)` then `sessions.touch(...)`.
 3. Per activity: `next_block_index(...)`, insert or reuse the `session_exercises` row, insert `exercise_sets` with provenance and metric versions.
 4. Insert `entity_sources`: one per created `session_exercise` and per created `exercise_set`, pointing at the batch and at every source message, `source_role=CREATED_FROM` (§26.2).
-5. `record_domain_event(... "workout.logged" ...)` on `Exchanges.DOMAIN_EVENTS`, payload naming the session, the exercises and the set count.
+5. Insert `audit_events`: one row per created `session_exercise` and per created `exercise_set`, `actor_type=USER`, `actor_user_id` from the batch, `action="workout.logged"`, carrying the `workflow_execution_id` (§15, §26).
+6. `record_domain_event(... "workout.logged" ...)` on `Exchanges.DOMAIN_EVENTS`, payload naming the session, the exercises and the set count.
 
-There is no step between the domain write and the outbox write. That is the claim WS-11's failure-injection test exists to prove, and this ordering is what makes it provable.
+There is no step between the domain write, the audit write and the outbox write. That is the claim WS-11's failure-injection test exists to prove, and this ordering is what makes it provable.
 
 ```python
 # domain/training/confirmations.py  — pure, D8
@@ -1242,7 +1243,8 @@ The `LOG_WORKOUT` handler returns a `DomainResult` with `visibility=USER_VISIBLE
 
 | File | Assertion |
 | --- | --- |
-| `tests/integration/test_workout_logging.py` | one exercise, three sets → 1 `training_sessions`, 1 `session_exercises`, 3 `exercise_sets`, ≥4 `entity_sources`, 1 `domain_events`, 1 `outbox_events`, in one transaction |
+| `tests/integration/test_workout_logging.py` | one exercise, three sets → 1 `training_sessions`, 1 `session_exercises`, 3 `exercise_sets`, ≥4 `entity_sources`, ≥4 `audit_events`, 1 `domain_events`, 1 `outbox_events`, in one transaction |
+| `tests/integration/test_workout_logging.py` | every service role is refused UPDATE and DELETE on `audit_events`, asserted with that role's own credentials — the same protection `domain_events` has |
 | " | **redelivery**: two calls with the same `operation_id` → `count(exercise_sets)` is 3 both times, `count(domain_events WHERE event_type='workout.logged')` is 1. Asserted on row counts, never on `result.replayed` alone |
 | " | two concurrent calls with the same `operation_id` (`asyncio.gather`, real Postgres) → 3 sets total |
 | " | a failure mid-transaction (patched to raise after the sets are added) leaves zero `training_sessions`, zero `exercise_sets`, zero `outbox_events` |
@@ -1372,7 +1374,7 @@ The worker is constructed with `build_task_handlers(workout=..., builder=...)`, 
 | --- | --- |
 | redelivery after commit | replay the same `InputBatchReady` through RabbitMQ; `count(exercise_sets)` unchanged, `count(domain_events WHERE event_type='workout.logged')` still 1 |
 | duplicate outbox publication | publish the same `workout.logged` envelope twice; no second set, no second outbound message (dedupe on `event_id`) |
-| crash between domain write and outbox write | patch `record_domain_event` to raise *after* the sets are added; assert **zero** sets and **zero** outbox rows — the window does not exist because it is one transaction, and this test proves it rather than asserting it in prose |
+| crash between domain write and outbox write | patch `record_domain_event` to raise *after* the sets are added; assert **zero** sets, **zero** audit rows and **zero** outbox rows — the window does not exist because it is one transaction, and this test proves it rather than asserting it in prose |
 | worker killed after commit, before ACK | (reuses Sprint 1's harness) one training session, three sets, one outbound message |
 
 ## `make demo`
