@@ -36,6 +36,9 @@ class InboundMessage:
     external_message_id: str
     content_type: MessageContentType
     text: str | None
+    #: The provider's id for attached media, kept so speech-to-text can fetch
+    #: it later. Losing it makes an accepted audio message unusable.
+    media_id: str | None
     sent_at: datetime
     #: What the provider called this message type, kept even when unsupported
     #: so the gap is measurable rather than invisible.
@@ -71,9 +74,12 @@ def _parse_message(raw: dict[str, Any]) -> InboundMessage | None:
     content_type = _CONTENT_TYPES.get(provider_type, MessageContentType.UNSUPPORTED)
 
     text: str | None = None
+    media_id: str | None = None
     if content_type is MessageContentType.TEXT:
         body = raw.get("text")
         text = body.get("body") if isinstance(body, dict) else None
+    else:
+        media_id = _media_id(raw, provider_type)
 
     return InboundMessage(
         provider=MessagingProvider.WHATSAPP,
@@ -81,9 +87,20 @@ def _parse_message(raw: dict[str, Any]) -> InboundMessage | None:
         external_message_id=external_message_id,
         content_type=content_type,
         text=text,
+        media_id=media_id,
         sent_at=_timestamp(raw.get("timestamp")),
         provider_type=provider_type,
     )
+
+
+def _media_id(raw: dict[str, Any], provider_type: str) -> str | None:
+    """Meta nests the media object under the message's own type name."""
+    media = raw.get(provider_type)
+    if isinstance(media, dict):
+        identifier = media.get("id")
+        if isinstance(identifier, str):
+            return identifier
+    return None
 
 
 def _timestamp(value: Any) -> datetime:

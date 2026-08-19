@@ -130,3 +130,25 @@ def test_an_unparseable_timestamp_falls_back_to_now() -> None:
     (message,) = parse_webhook(payload)
 
     assert (datetime.now(UTC) - message.sent_at).total_seconds() < 5
+
+
+def test_an_audio_message_keeps_the_provider_media_reference() -> None:
+    """Without the media id an accepted audio message is unusable: the webhook
+    has already returned 202 and speech-to-text has nothing to fetch."""
+    (message,) = parse_webhook(fixture("whatsapp_audio_message"))
+
+    assert message.media_id == "1044829965957442"
+
+
+def test_a_text_message_has_no_media_reference() -> None:
+    (message,) = parse_webhook(fixture("whatsapp_text_message"))
+
+    assert message.media_id is None
+
+
+def test_an_unsupported_media_type_still_keeps_its_reference() -> None:
+    """A sticker is not actionable yet, but the reference is what makes it
+    actionable later without asking the user to send it again."""
+    messages = parse_webhook(fixture("whatsapp_batched_messages"))
+
+    assert messages[-1].media_id == "9999"

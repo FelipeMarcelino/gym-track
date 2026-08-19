@@ -323,3 +323,119 @@ async def test_ready_fails_while_health_still_succeeds_when_postgres_is_gone(
     assert health.status_code == 200
     assert ready.status_code == 503
     assert ready.json()["checks"] == {"postgres": False}
+
+
+async def test_an_audio_message_stores_its_media_reference(
+    post: Any, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    body = json.dumps(
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "from": BSUID,
+                                        "id": "wamid.audio",
+                                        "timestamp": "1755518400",
+                                        "type": "audio",
+                                        "audio": {"id": "media-123", "voice": True},
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ).encode()
+
+    await post(body)
+
+    async with session_factory() as session:
+        message = (await session.scalars(sa.select(Message))).one()
+
+    assert message.provider_media_id == "media-123"
+
+
+async def test_a_redelivery_does_not_touch_conversation_state(
+    post: Any,
+    session_factory: async_sessionmaker[AsyncSession],
+    context: ApiContext,
+) -> None:
+    """A retry arriving after the timeout used to close the live conversation
+    and open an empty one — committed, because the ingest path exits its unit
+    of work successfully once it recognises the duplicate."""
+    await post(webhook_body("wamid.1"))
+
+    timeout = context.settings.workflow.conversation_timeout
+    async with unit_of_work(session_factory) as session:
+        conversation = (await session.scalars(sa.select(Conversation))).one()
+        conversation.last_activity_at = datetime.now(UTC) - timeout - timedelta(minutes=1)
+        stale_activity = conversation.last_activity_at
+        conversation_id = conversation.id
+
+    response = await post(webhook_body("wamid.1"))
+
+    assert response.json() == {"accepted": 0, "duplicates": 1}
+
+    async with session_factory() as session:
+        conversations = (await session.scalars(sa.select(Conversation))).all()
+
+    assert len(conversations) == 1, "a redelivery must not rotate the conversation"
+    assert conversations[0].id == conversation_id
+    assert conversations[0].status is ConversationStatus.ACTIVE
+    assert conversations[0].last_activity_at == stale_activity
+
+
+async def test_concurrent_first_contact_creates_exactly_one_user(
+    post: Any, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Both requests can miss the identity lookup; the loser must find the
+    winner's row rather than return a 500."""
+    import asyncio
+
+    responses = await asyncio.gather(
+        post(webhook_body("wamid.a")),
+        post(webhook_body("wamid.b")),
+        post(webhook_body("wamid.c")),
+    )
+
+    assert [response.status_code for response in responses] == [202, 202, 202]
+    assert await _count(session_factory, User) == 1
+    assert await _count(session_factory, UserIdentifier) == 1
+    assert await _count(session_factory, Message) == 3
+
+
+async def test_concurrent_deliveries_after_a_timeout_do_not_split_the_conversation(
+    post: Any,
+    session_factory: async_sessionmaker[AsyncSession],
+    context: ApiContext,
+) -> None:
+    """Two rotations would put one user's fragments into two threads (§7.2)."""
+    import asyncio
+
+    await post(webhook_body("wamid.seed"))
+
+    timeout = context.settings.workflow.conversation_timeout
+    async with unit_of_work(session_factory) as session:
+        conversation = (await session.scalars(sa.select(Conversation))).one()
+        conversation.last_activity_at = datetime.now(UTC) - timeout - timedelta(minutes=1)
+
+    await asyncio.gather(
+        post(webhook_body("wamid.x")),
+        post(webhook_body("wamid.y")),
+    )
+
+    async with session_factory() as session:
+        active = (
+            await session.scalars(
+                sa.select(Conversation).where(Conversation.status == ConversationStatus.ACTIVE)
+            )
+        ).all()
+        total = (await session.scalars(sa.select(Conversation))).all()
+
+    assert len(active) == 1, "only one conversation may be active for a user"
+    assert len(total) == 2, "the timed-out one was closed, not duplicated"

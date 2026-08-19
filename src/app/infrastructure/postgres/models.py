@@ -110,6 +110,17 @@ class Conversation(Base, SoftDeleteMixin):
     """A conversational window; rotates after inactivity (§7.2, Q30)."""
 
     __tablename__ = "conversations"
+    __table_args__ = (
+        # One active conversation per user, enforced by the database. Two
+        # concurrent messages arriving after a timeout would otherwise both
+        # rotate, splitting one user's fragments across two threads.
+        sa.Index(
+            "uq_conversations_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=sa.text("status = 'active' AND deleted_at IS NULL"),
+        ),
+    )
 
     user_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
@@ -154,6 +165,10 @@ class Message(Base):
         enum_column(MessageContentType), default=MessageContentType.TEXT, nullable=False
     )
     text: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # The provider's handle for attached media. Without it an accepted audio
+    # message is unusable: speech-to-text has nothing to fetch, and the webhook
+    # has already returned 202.
+    provider_media_id: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     provider_sent_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )

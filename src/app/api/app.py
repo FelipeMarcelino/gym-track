@@ -17,6 +17,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, status
 
 from app.api.dependencies import ApiContext
 from app.application.services.ingestion import (
+    find_existing_message,
     persist_inbound_message,
     resolve_conversation,
     resolve_user,
@@ -124,6 +125,16 @@ async def _ingest(context: ApiContext, inbound: InboundMessage) -> bool:
     trace_id = correlation.trace_id if correlation else None
 
     async with unit_of_work(context.session_factory) as session:
+        # Checked first, so a redelivery never advances conversation activity
+        # or rotates a live conversation on its way to being recognised.
+        known = await find_existing_message(session, inbound)
+        if known is not None:
+            logger.info(
+                "duplicate webhook delivery ignored",
+                extra={"external_message_id": inbound.external_message_id},
+            )
+            return False
+
         user = await resolve_user(
             session,
             provider=inbound.provider,
