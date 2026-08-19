@@ -66,6 +66,8 @@ Two consequences worth stating up front:
 | Effort | `EffortNormalizer`, deterministic half only: RPE, RIR mapping, a fixed pt-BR phrase table | §14.3 |
 | Sessions | `training_sessions`, `TrainingSessionManager`, lazy expiry plus `session-expiration-worker` | §18, Q31, Q32 |
 | Workout schema | `session_exercises` with `exercise_block_index`, `exercise_sets`, `exercise_groups`, `entity_sources` | §26, §26.2, Q51, Q54, Q58 |
+| Audit trail | `audit_events`, append-only, written in the same transaction as the mutation it describes | §15, §26 |
+| Task routing | A deterministic pre-router choosing the task type from the batch, replacing the worker's fixed one | §11.3, §12 |
 | Resolver | Stages 1-4 (user alias, global alias, canonical, fuzzy) with confidence routing | §16, Q41, Q42 |
 | Input contract | `StructuredWorkoutInput`, frozen by a golden fixture | §15, Q56 |
 | Commands | `WorkoutCommandBuilder`, `LogWorkoutCommand`, `WorkoutApplicationService` | §15, Q56, Q57 |
@@ -102,8 +104,13 @@ after a merge, one PR each, reviewed and CI-green before merging.
 
 ### WS-1 — Exercise catalog schema and seed
 1. Migration: the seven catalog tables, with `UNIQUE(canonical_name)` on
-   exercises and alias uniqueness scoped by `(user_id, normalized_alias)` —
-   a global alias uses a null `user_id`.
+   exercises and alias uniqueness expressed as **two partial unique indexes**:
+   one on `(normalized_alias) WHERE user_id IS NULL` for global aliases, one on
+   `(user_id, normalized_alias) WHERE user_id IS NOT NULL` for learned ones.
+   A single `UNIQUE(user_id, normalized_alias)` would not do: PostgreSQL treats
+   NULLs as distinct, so it would happily accept two global aliases with the
+   same text — and stage 2 of the resolver would then have to choose between
+   them.
 2. `exercise_muscles.role` as PRIMARY/SECONDARY/STABILIZER (Q43);
    `exercise_relations.type` as VARIATION_OF/SUBSTITUTE_FOR/SIMILAR_MOVEMENT/
    PROGRESSION_OF/REGRESSION_OF (Q44).
@@ -113,8 +120,9 @@ after a merge, one PR each, reviewed and CI-green before merging.
 5. Grants for the new tables per service role (Q145).
 
 **Tests:** the seed applies twice with the same result; a duplicate canonical
-name is refused; a global and a user alias may share text while two global
-aliases may not; every seeded exercise has at least one PRIMARY muscle; every
+name is refused; **two global aliases with the same text are refused by the
+database**, while a global and a user alias may share text and two users may
+each learn the same alias; every seeded exercise has at least one PRIMARY muscle; every
 alias normalizes to something the resolver can match; migration up and down.
 
 ### WS-2 — Activity model and validator
@@ -175,27 +183,32 @@ unique index).
 
 ### WS-6 — Workout domain schema
 19. Migration: `session_exercises` (with `exercise_block_index`), `exercise_sets`,
-    `exercise_groups`, `entity_sources`, all soft-deletable where §26 says so.
+    `exercise_groups`, `entity_sources` and `audit_events`, soft-deletable where
+    §26 says so — `audit_events` is append-only and therefore never is.
 20. `provenance` on values that can be inherited: EXPLICIT or INHERITED (§14.4).
 21. `expected_version` on mutable rows, so Sprint 4's corrections have optimistic
     concurrency to build on (§17).
 22. `entity_sources` links every created row to the message or batch it came
     from (§26.2).
+23. `audit_events` records who changed what: §15 puts it inside the workout
+    transaction, and §26 makes it append-only. No service role gets UPDATE or
+    DELETE on it, the same way `domain_events` is protected.
 
 **Tests:** consecutive sets of one exercise share a block; returning to that
 exercise after another creates a second block with a higher index (Q58); sets
 keep their order within a block; every persisted set is reachable from its source
 message through `entity_sources`; a soft-deleted set leaves the block's ordering
-intact.
+intact; **no service role can update or delete an `audit_events` row**, asserted
+with that role's own credentials.
 
 ### WS-7 — Exercise resolver, deterministic stages
-23. Stages in the normative order: exact user alias, exact global alias,
+24. Stages in the normative order: exact user alias, exact global alias,
     canonical name, normalized lexical/fuzzy (§16 items 1-4).
-24. Normalization for matching: casefold, strip accents, collapse whitespace and
+25. Normalization for matching: casefold, strip accents, collapse whitespace and
     punctuation.
-25. `ExerciseResolution` with `raw_name`, `exercise_id`, `canonical_name`,
+26. `ExerciseResolution` with `raw_name`, `exercise_id`, `canonical_name`,
     `method`, `confidence`, `candidates[]` and `requires_clarification`.
-26. Confidence routing (Q42): high resolves, medium returns candidates, low or
+27. Confidence routing (Q42): high resolves, medium returns candidates, low or
     ambiguous sets `requires_clarification`. Stages 5-7 are declared and
     explicitly unimplemented.
 
@@ -208,11 +221,11 @@ the worst failure this system can have; two equally-scored candidates set
 `requires_clarification` rather than picking the first.
 
 ### WS-8 — Input contract and command builder
-27. `StructuredWorkoutInput`: the extractor's future output, as a typed model.
-28. Golden fixture freezing it, as a contract test.
-29. Fragment inheritance: one stated load applied to several rep counts, with
+28. `StructuredWorkoutInput`: the extractor's future output, as a typed model.
+29. Golden fixture freezing it, as a contract test.
+30. Fragment inheritance: one stated load applied to several rep counts, with
     provenance recorded per value (§14.4, Q54).
-30. `WorkoutCommandBuilder` producing a `LogWorkoutCommand`; ambiguous items are
+31. `WorkoutCommandBuilder` producing a `LogWorkoutCommand`; ambiguous items are
     excluded from the command before it is built, valid ones are kept (Q56).
 
 **Tests:** the golden fixture round-trips and rejects unknown fields; `80 kg:
@@ -221,49 +234,60 @@ containing one resolvable and one ambiguous exercise carries only the first and
 reports the second; an empty command is refused rather than committed.
 
 ### WS-9 — Application service and the LOG_WORKOUT handler
-31. `WorkoutApplicationService`: one transaction for domain rows,
-    `entity_sources`, `domain_events` and `outbox_events` (§15, Q57).
-32. Idempotency by `operation_id` through `processed_operations` (§28), so a
+32. `WorkoutApplicationService`: one transaction for domain rows,
+    `entity_sources`, `audit_events`, `domain_events` and `outbox_events`
+    (§15, Q57).
+33. Idempotency by `operation_id` through `processed_operations` (§28), so a
     redelivered batch cannot log the same sets twice.
-33. Register `LOG_WORKOUT` in the §11.3 handler registry, replacing the stub for
-    inputs that parse as workouts.
-34. A deterministic confirmation naming what was recorded, and a deterministic
+34. Register `LOG_WORKOUT` in the §11.3 handler registry.
+35. **A routing step before the registry lookup.** `WorkflowWorker` currently
+    resolves a task type fixed at construction (`task_type=CONVERSATION`), so
+    the batch text never influences which handler runs — registering
+    `LOG_WORKOUT` alone would leave every message going to the acknowledgement
+    handler and the sprint's demo would pass through the stub. A deterministic
+    `route_task_type(texts) -> TaskType` decides per batch, and the worker's
+    constructor default disappears with it. Sprint 3 replaces that function with
+    the LLM `IntentRouter` (§12) and nothing else in the worker changes.
+36. A deterministic confirmation naming what was recorded, and a deterministic
     clarification request when something essential is missing.
 
-**Tests:** redelivery of the same batch produces no second set and no second
-event — asserted on row counts, not on a return value; a handler failure leaves
-nothing behind; the confirmation names the exercise and the set count; the
-clarification names the missing field; `mypy --strict` still clean with the
-domain in place.
+**Tests:** a batch whose text parses as a workout routes to `LOG_WORKOUT` and
+one that does not routes to `CONVERSATION`, asserted through the worker rather
+than through the router in isolation; redelivery of the same batch produces no
+second set and no second event — asserted on row counts, not on a return value;
+a handler failure leaves nothing behind, `audit_events` included; the
+confirmation names the exercise and the set count; the clarification names the
+missing field; `mypy --strict` still clean with the domain in place.
 
 ### WS-10 — Strict-syntax input adapter (temporary)
-35. A rigid parser for a documented syntax (`#log <exercise> <load> <reps...>`),
+37. A rigid parser for a documented syntax (`#log <exercise> <load> <reps...>`),
     producing `StructuredWorkoutInput`.
-36. Anything that does not match falls through to Sprint 1's acknowledgement
+38. Anything that does not match falls through to Sprint 1's acknowledgement
     handler — an unparsed message is never silently dropped.
-37. Documented in the README as temporary, with the sprint that removes it.
+39. Documented in the README as temporary, with the sprint that removes it.
 
 **Tests:** contract tests over the syntax including its failure modes; a
 non-matching message still gets the acknowledgement; the adapter never invents a
 value the syntax did not contain.
 
 ### WS-11 — Cross-cutting verification
-38. **E2E:** a WhatsApp message in the strict syntax produces persisted sets and
+40. **E2E:** a WhatsApp message in the strict syntax produces persisted sets and
     a confirmation, asserted from outside through the running stack.
-39. **E2E:** an incomplete message produces a clarification and persists no sets.
-40. **Failure injection (§38):** redelivery after commit, duplicate publication,
+41. **E2E:** an incomplete message produces a clarification and persists no sets.
+42. **Failure injection (§38):** redelivery after commit, duplicate publication,
     and a crash between the domain write and the outbox write (which must be
     impossible — same transaction — and the test proves it).
-41. `make demo` extended to the workout path, failing when the domain does not
+43. `make demo` extended to the workout path, failing when the domain does not
     persist what it should.
 
 ### WS-12 — Decision records
-42. **ADR-012** — exercise resolution stops at deterministic stages this sprint,
+44. **ADR-012** — exercise resolution stops at deterministic stages this sprint,
     with the chosen confidence thresholds and why silence beats a wrong guess
     (§16, Q41, Q42).
-43. **ADR-013** — the strict-syntax adapter as a temporary seam: what it is for,
-    what it must never grow into, and when it is removed.
-44. **ADR-014** — derived metrics are versioned deterministic code paths
+45. **ADR-013** — the deterministic input path as a temporary seam: the
+    strict-syntax adapter *and* the deterministic task router — what they are
+    for, what they must never grow into, and the sprint that removes them.
+46. **ADR-014** — derived metrics are versioned deterministic code paths
     (§14.1, Q52, DEC-001).
 
 ## Definition of Done
@@ -281,6 +305,9 @@ Every item is mechanically verifiable — no "works on my machine".
 - [ ] A raw name matching a user alias resolves to that user's exercise even when a global alias says otherwise (§16 order).
 - [ ] A fuzzy match below the threshold resolves to nothing and asks, rather than to the closest exercise.
 - [ ] Every persisted set is reachable from the message that created it through `entity_sources` (§26.2).
+- [ ] A `#log` message routes to `LOG_WORKOUT` and an ordinary message to `CONVERSATION`, asserted through the worker — registering a handler is not the same as reaching it.
+- [ ] Two global aliases with the same normalized text are refused by the database, not by application code.
+- [ ] Every workout mutation writes an `audit_events` row in the same transaction, and no service role can update or delete one (§15, §26).
 - [ ] Redelivery of a workflow message creates no second set, asserted on row counts.
 - [ ] A session opens on the first log, is reused inside the timeout, and is closed by both the lazy path and the expiration worker.
 - [ ] A Redis expiry hint cannot close a session PostgreSQL considers active (§18).
