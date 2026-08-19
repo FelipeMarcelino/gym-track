@@ -37,7 +37,9 @@ EXPECTED_ADRS = {
 
 
 def test_the_sprint_shipped_the_records_it_promised() -> None:
-    assert {path.name for path in ADRS} == EXPECTED_ADRS
+    """A subset check, not equality: later sprints add the remaining §43
+    records, and this test must not be the thing that forbids them."""
+    assert {path.name for path in ADRS} >= EXPECTED_ADRS
 
 
 def test_a_template_exists_for_the_next_one() -> None:
@@ -85,6 +87,30 @@ def test_referenced_decision_records_exist_in_the_spec(adr: Path) -> None:
 
     for dec in set(re.findall(r"DEC-\d{3}", content)):
         assert f"## {dec} —" in spec, f"{adr.name} references {dec}, which the spec does not define"
+
+
+def _referenced_questions(content: str) -> set[str]:
+    """Expand `Q151-Q160` into every question it claims to cover."""
+    questions: set[str] = set()
+
+    for start, end in re.findall(r"Q(\d+)\s*[-\u2013]\s*Q(\d+)", content):
+        questions.update(f"Q{number}" for number in range(int(start), int(end) + 1))
+    questions.update(re.findall(r"\bQ\d+\b", content))
+    return questions
+
+
+@pytest.mark.parametrize("adr", ADRS, ids=lambda path: path.name)
+def test_referenced_interview_questions_exist_in_the_spec(adr: Path) -> None:
+    """A typo like Q999 satisfies the shape of a traceability block while
+    pointing nowhere, which is worse than an empty block: it looks checked."""
+    spec = SPEC.read_text(encoding="utf-8")
+    known = set(re.findall(r"^\| (Q\d+) \|", spec, flags=re.MULTILINE))
+    assert known, "the spec's question matrix was not found"
+
+    traceability = adr.read_text(encoding="utf-8").split("## Context", 1)[0]
+    unknown = sorted(_referenced_questions(traceability) - known)
+
+    assert not unknown, f"{adr.name} references questions the spec does not define: {unknown}"
 
 
 @pytest.mark.parametrize("adr", ADRS, ids=lambda path: path.name)
