@@ -54,6 +54,9 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
     },
     ServiceName.DISPATCHER: {
         "users": ("SELECT",),
+        # It resolves the recipient's plaintext identifier before every send;
+        # without this grant a deployed dispatcher aborts every group.
+        "user_identifiers": ("SELECT",),
         "conversations": ("SELECT",),
         "outbound_messages": ("SELECT", "UPDATE"),
         "domain_events": ("SELECT", "INSERT"),
