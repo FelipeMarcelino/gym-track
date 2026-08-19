@@ -13,6 +13,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
+    "redis>=5.2",
     "sqlalchemy[asyncio]>=2.0.36",
 ]
 
@@ -30,7 +31,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.9",
-    "testcontainers[postgres,rabbitmq]>=4.9",
+    "testcontainers[postgres,rabbitmq,redis]>=4.9",
 ]
 
 # ---------------------------------------------------------------------------
