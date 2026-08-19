@@ -67,3 +67,95 @@ def test_an_empty_pin_falls_back_to_every_partition(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("GYM_TRACK_WORKFLOW_PARTITIONS_OWNED", "")
 
     assert _owned_partitions(4) == [0, 1, 2, 3]
+
+
+# --------------------------------------------------------------------------
+# Graceful shutdown
+# --------------------------------------------------------------------------
+
+
+async def test_one_stop_event_is_shared_by_every_consumer() -> None:
+    """A workflow worker runs up to 32 consumers. Installing a signal handler
+    per consumer means each installation replaces the last, so SIGTERM would
+    wake only one of them and the process would have to be killed."""
+    from app.entrypoints.runtime import shutdown_event
+
+    first = shutdown_event()
+    second = shutdown_event()
+
+    assert first is second
+
+    first.set()
+    assert second.is_set()
+
+
+async def test_every_waiter_wakes_on_the_stop_event() -> None:
+    import asyncio
+
+    from app.entrypoints.runtime import shutdown_event
+
+    stop = shutdown_event()
+    stop.clear()
+    waiters = [asyncio.create_task(stop.wait()) for _ in range(5)]
+    await asyncio.sleep(0)
+
+    stop.set()
+    await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
+
+    assert all(task.done() for task in waiters)
+    stop.clear()
+
+
+async def test_the_outbox_loop_stops_when_asked() -> None:
+    """SIGTERM during a shutdown must end the loop rather than let the process
+    be killed with a connection open."""
+    import asyncio
+
+    from app.entrypoints.outbox_publisher import publish_until_stopped
+    from app.workers.outbox_publisher import PublishResult
+
+    passes = 0
+
+    class CountingPublisher:
+        async def publish_pending(self) -> PublishResult:
+            nonlocal passes
+            passes += 1
+            return PublishResult(published=0, failed=0)
+
+    stop = asyncio.Event()
+    loop = asyncio.create_task(
+        publish_until_stopped(CountingPublisher(), stop, idle_interval=0.01)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0.05)
+    stop.set()
+
+    await asyncio.wait_for(loop, timeout=1)
+    assert passes >= 1
+
+
+async def test_the_outbox_loop_keeps_draining_while_there_is_work() -> None:
+    """A burst must not be paced by the idle interval."""
+    import asyncio
+
+    from app.entrypoints.outbox_publisher import publish_until_stopped
+    from app.workers.outbox_publisher import PublishResult
+
+    remaining = 5
+
+    class BurstPublisher:
+        async def publish_pending(self) -> PublishResult:
+            nonlocal remaining
+            if remaining:
+                remaining -= 1
+                return PublishResult(published=10, failed=0)
+            return PublishResult(published=0, failed=0)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        publish_until_stopped(BurstPublisher(), stop, idle_interval=5)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0.05)
+
+    assert remaining == 0, "the burst drained without waiting out the idle interval"
+    stop.set()
+    await asyncio.wait_for(task, timeout=1)

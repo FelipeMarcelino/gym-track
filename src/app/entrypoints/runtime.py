@@ -100,22 +100,40 @@ async def consume_forever(
     await _until_stopped()
 
 
+#: One stop event per process. A worker runs several consumers -- the
+#: aggregator two, a workflow worker up to 32 -- and installing a handler per
+#: consumer means each installation replaces the previous one, so SIGTERM wakes
+#: only the last. Everything shares this event instead.
+_stop_event: asyncio.Event | None = None
+_stop_loop: asyncio.AbstractEventLoop | None = None
+
+
+def shutdown_event() -> asyncio.Event:
+    """The process-wide stop signal, with handlers installed exactly once."""
+    global _stop_event, _stop_loop
+
+    loop = asyncio.get_running_loop()
+    if _stop_event is not None and _stop_loop is loop:
+        return _stop_event
+
+    _stop_event = asyncio.Event()
+    _stop_loop = loop
+    for received in (signal.SIGTERM, signal.SIGINT):
+        # Not every platform supports signal handlers on the loop; a worker
+        # that cannot listen for them still runs, it just stops less politely.
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(received, _stop_event.set)
+    return _stop_event
+
+
 async def _until_stopped() -> None:
     """Block until SIGTERM or SIGINT.
 
-    §37.4 wants a graceful stop: the consumer is cancelled, in-flight work
+    §37.4 wants a graceful stop: consumers stop receiving, in-flight work
     finishes its transaction, and unacked deliveries return to the queue for
     another worker rather than being lost.
     """
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    for received in (signal.SIGTERM, signal.SIGINT):
-        with_handler = getattr(loop, "add_signal_handler", None)
-        if with_handler is not None:
-            loop.add_signal_handler(received, stop.set)
-
-    await stop.wait()
+    await shutdown_event().wait()
 
 
 def run(main: Callable[[], Coroutine[Any, Any, None]]) -> None:
