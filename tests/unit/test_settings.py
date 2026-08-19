@@ -242,3 +242,42 @@ def test_dsn_survives_passwords_containing_url_delimiters(
     assert parsed.password is not None
     assert unquote(parsed.password) == password
     assert urlsplit(settings.rabbitmq.url()).hostname == "localhost"
+
+
+def test_a_dotenv_copied_from_the_example_is_enough_to_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `.env.example` promise, taken literally.
+
+    Settings were loaded from `.env` while secrets were read only from the
+    process environment, so a `.env` copied from the committed example
+    populated every non-secret value and silently none of the secrets — and a
+    clean clone could not run `make migrate`.
+    """
+    for key in list(EXAMPLE_ENV) + [secret_name_to_env_var(n) for n in SECRET_BINDINGS]:
+        monkeypatch.delenv(key, raising=False)
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    settings = load_settings(_env_file=str(env_file))
+
+    assert settings.postgres.host == "localhost"
+    assert settings.security.whatsapp_app_secret.get_secret_value() == "local-dev-only"
+    assert settings.postgres.roles[ServiceName.API].password.get_secret_value() == "local-dev-only"
+
+
+def test_an_exported_secret_wins_over_the_dotenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment exports its secrets; a stale file must not shadow them."""
+    for key in list(EXAMPLE_ENV) + [secret_name_to_env_var(n) for n in SECRET_BINDINGS]:
+        monkeypatch.delenv(key, raising=False)
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("GYM_TRACK_SECRET_SECURITY_WHATSAPP_APP_SECRET", "from-the-environment")
+
+    settings = load_settings(_env_file=str(env_file))
+
+    assert settings.security.whatsapp_app_secret.get_secret_value() == "from-the-environment"

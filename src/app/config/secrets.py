@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic import SecretStr
 
 from app.application.ports.secrets import MissingSecretError
@@ -30,10 +32,28 @@ class EnvironmentSecretsProvider:
     The prefix keeps secrets in their own namespace: settings read
     ``GYM_TRACK_*`` and secrets read ``GYM_TRACK_SECRET_*``, so a value can
     never drift from one category into the other by accident.
+
+    A dotenv file is read as well, because the settings are already loaded that
+    way: a `.env` copied from `.env.example` that populates every non-secret
+    value and silently none of the secrets is a trap, and the committed example
+    documents both.  Real environment variables win over the file, so an
+    exported secret always overrides a checked-out one.
     """
 
-    def __init__(self, environ: Mapping[str, str] | None = None) -> None:
-        self._environ = os.environ if environ is None else environ
+    def __init__(
+        self,
+        environ: Mapping[str, str] | None = None,
+        *,
+        env_file: str | Path | None = None,
+    ) -> None:
+        from_file: dict[str, str] = {}
+        if env_file is not None and Path(env_file).is_file():
+            from_file = {
+                key: value for key, value in dotenv_values(env_file).items() if value is not None
+            }
+
+        ambient = os.environ if environ is None else environ
+        self._environ = {**from_file, **ambient}
 
     def get(self, name: str) -> SecretStr:
         value = self.try_get(name)
