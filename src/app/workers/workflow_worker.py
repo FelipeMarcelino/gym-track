@@ -123,7 +123,22 @@ class WorkflowWorker:
                 execution.status = WorkflowExecutionStatus.SUCCEEDED
                 execution.finished_at = datetime.now(UTC)
 
-            # The commit has happened. Only now may the message be acked.
+            # The commit has happened. Only now may the message be acked -- and
+            # only now may a log line claim the work is done: written inside the
+            # transaction, it would report a completion that a failing commit
+            # then rolls back, while the broker redelivers the message.
+            #
+            # The happy path has to be visible: a pipeline that only logs its
+            # failures cannot be traced through, and Q131's point is that one
+            # interaction is followable end to end.
+            logger.info(
+                "workflow execution completed",
+                extra={
+                    "message_batch_id": str(message_batch_id),
+                    "outbound_messages": len(result.messages),
+                    "task_type": result.task_type.value,
+                },
+            )
             return WorkflowOutcome(
                 workflow_execution_id=execution.id,
                 response_group_id=response_group_id,

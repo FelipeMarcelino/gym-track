@@ -1,4 +1,8 @@
-"""Ephemeral real infrastructure for the integration suite (Q158).
+"""Ephemeral real infrastructure for every suite that needs it (Q158).
+
+Kept at the root of `tests/` rather than under `integration/` so the end-to-end
+suite shares the same containers: one PostgreSQL, one RabbitMQ and one Redis
+per session, however many suites use them.
 
 Containers are session-scoped: the suite runs on every PR, so paying the
 startup cost once is the difference between a gate people keep and a gate
@@ -11,6 +15,7 @@ import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
@@ -21,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import ApplicationSettings, ServiceName, load_settings
 from app.infrastructure.postgres.engine import create_session_factory
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 ADMIN_USER = "gym_track"
 ADMIN_PASSWORD = "integration-test"
@@ -138,6 +143,21 @@ def redis_url() -> Iterator[str]:
         host = container.get_container_host_ip()
         port = container.get_exposed_port(6379)
         yield f"redis://{host}:{port}/0"
+
+
+async def redeclare_topology(channel: Any, topology: Any) -> None:
+    """Declare a topology from scratch, deleting whatever is there first.
+
+    Two suites declare overlapping queue names with different arguments -- the
+    retry tiers are milliseconds here and minutes there -- and RabbitMQ refuses
+    a redeclaration that does not match, closing the channel. Deleting first
+    keeps each suite's declaration authoritative for its own run.
+    """
+    from app.infrastructure.rabbitmq.connection import declare_topology
+
+    for queue in topology.queues:
+        await channel.queue_delete(queue.name)
+    await declare_topology(channel, topology)
 
 
 def alembic_config(settings: ApplicationSettings) -> Config:

@@ -22,7 +22,11 @@ from app.infrastructure.postgres.base import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers` defaults to True, which would silence every
+    # application logger already created in this process -- so a migration run
+    # in-process (a test fixture, an entrypoint that migrates before serving)
+    # would leave the app with no logs at all.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

@@ -74,7 +74,11 @@ class FlushTrigger:
 
 
 class FlushScheduler:
-    """Publishes a flush trigger to be delivered after a delay."""
+    """Publishes a flush trigger to be delivered after a delay.
+
+    The transport is injected so the aggregator can be driven by a test without
+    a broker; `RabbitMQFlushScheduler` is the real one.
+    """
 
     def __init__(self, publish: Any) -> None:
         self._publish = publish
