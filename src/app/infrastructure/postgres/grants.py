@@ -38,6 +38,15 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
     },
     ServiceName.WORKFLOW_WORKER: {
         "users": ("SELECT",),
+        # The catalog is read-only to every process except for learned aliases,
+        # which Sprint 3 writes when a user answers a clarification.
+        "exercises": ("SELECT",),
+        "exercise_aliases": ("SELECT", "INSERT"),
+        "muscles": ("SELECT",),
+        "exercise_muscles": ("SELECT",),
+        "equipment": ("SELECT",),
+        "exercise_equipment": ("SELECT",),
+        "exercise_relations": ("SELECT",),
         "conversations": ("SELECT",),
         "messages": ("SELECT",),
         "message_batches": ("SELECT", "UPDATE"),
@@ -66,6 +75,13 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
 
 ALL_TABLES: Final[tuple[str, ...]] = (
     "users",
+    "exercises",
+    "exercise_aliases",
+    "muscles",
+    "exercise_muscles",
+    "equipment",
+    "exercise_equipment",
+    "exercise_relations",
     "user_identifiers",
     "conversations",
     "messages",

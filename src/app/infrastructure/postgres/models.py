@@ -17,6 +17,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.domain.exercises.catalog import AliasSource, ExerciseRelationType, MuscleRole
+from app.domain.training.activities import ActivityType, LoadMode
 from app.infrastructure.postgres.base import Base, SoftDeleteMixin, enum_column
 
 
@@ -372,3 +374,151 @@ class OutboxEvent(Base):
     attempts: Mapped[int] = mapped_column(sa.Integer, default=0, nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Exercise catalog (§16, Q43, Q44) — Sprint 2, WS-1
+# ---------------------------------------------------------------------------
+
+
+class Exercise(Base, SoftDeleteMixin):
+    """One canonical movement. The catalog is global, not per user (§16)."""
+
+    __tablename__ = "exercises"
+    __table_args__ = (
+        sa.UniqueConstraint("canonical_name", name="uq_exercises_canonical_name"),
+        sa.UniqueConstraint("slug", name="uq_exercises_slug"),
+    )
+
+    canonical_name: Mapped[str] = mapped_column(sa.String(160), nullable=False)
+    #: Stable join key for the seed. Renaming a display name must not orphan
+    #: the muscles and aliases attached to it.
+    slug: Mapped[str] = mapped_column(sa.String(160), nullable=False)
+    activity_type: Mapped[ActivityType] = mapped_column(enum_column(ActivityType), nullable=False)
+    #: What a bare load means for this exercise (Q49). A dumbbell movement says
+    #: PER_IMPLEMENT here, so WS-8 reads the catalog instead of guessing from
+    #: the name.
+    default_load_mode: Mapped[LoadMode] = mapped_column(enum_column(LoadMode), nullable=False)
+    is_bodyweight: Mapped[bool] = mapped_column(sa.Boolean, default=False, nullable=False)
+    locale: Mapped[str] = mapped_column(sa.String(16), default="pt-BR", nullable=False)
+    description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+
+
+class ExerciseAlias(Base, SoftDeleteMixin):
+    """A name people actually use for an exercise (§16).
+
+    A null `user_id` is a global alias shipped with the catalog; a non-null one
+    is learned from a user's clarification in Sprint 3 and belongs only to them.
+    """
+
+    __tablename__ = "exercise_aliases"
+    __table_args__ = (
+        # Two partial indexes rather than one composite: PostgreSQL treats
+        # NULLs as distinct, so `UNIQUE(user_id, normalized_alias)` alone would
+        # accept two *global* aliases with the same text -- and stage 2 of the
+        # resolver would then have to choose between them.
+        sa.Index(
+            "uq_exercise_aliases_global",
+            "normalized_alias",
+            unique=True,
+            postgresql_where=sa.text("user_id IS NULL AND deleted_at IS NULL"),
+        ),
+        sa.Index(
+            "uq_exercise_aliases_user",
+            "user_id",
+            "normalized_alias",
+            unique=True,
+            postgresql_where=sa.text("user_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
+        sa.Index("ix_exercise_aliases_normalized", "normalized_alias"),
+    )
+
+    exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=True
+    )
+    alias: Mapped[str] = mapped_column(sa.String(160), nullable=False)
+    #: What the resolver matches on: casefolded, unaccented, whitespace
+    #: collapsed. Stored rather than computed so the match is an index seek.
+    normalized_alias: Mapped[str] = mapped_column(sa.String(160), nullable=False)
+    source: Mapped[AliasSource] = mapped_column(
+        enum_column(AliasSource), default=AliasSource.SEED, nullable=False
+    )
+
+
+class Muscle(Base):
+    __tablename__ = "muscles"
+    __table_args__ = (sa.UniqueConstraint("slug", name="uq_muscles_slug"),)
+
+    name: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    slug: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    muscle_group: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+
+
+class ExerciseMuscle(Base):
+    """Which muscles an exercise works, and how (Q43)."""
+
+    __tablename__ = "exercise_muscles"
+    __table_args__ = (
+        sa.UniqueConstraint("exercise_id", "muscle_id", name="uq_exercise_muscles_pair"),
+    )
+
+    exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    muscle_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("muscles.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[MuscleRole] = mapped_column(enum_column(MuscleRole), nullable=False)
+
+
+class Equipment(Base):
+    __tablename__ = "equipment"
+    __table_args__ = (sa.UniqueConstraint("slug", name="uq_equipment_slug"),)
+
+    name: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    slug: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    #: Held one per hand. This is what makes PER_IMPLEMENT mechanical (Q49)
+    #: instead of a pattern match on the word "dumbbell".
+    is_implement: Mapped[bool] = mapped_column(sa.Boolean, default=False, nullable=False)
+
+
+class ExerciseEquipment(Base):
+    __tablename__ = "exercise_equipment"
+    __table_args__ = (
+        sa.UniqueConstraint("exercise_id", "equipment_id", name="uq_exercise_equipment_pair"),
+    )
+
+    exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    equipment_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("equipment.id", ondelete="CASCADE"), nullable=False
+    )
+    is_primary: Mapped[bool] = mapped_column(sa.Boolean, default=True, nullable=False)
+
+
+class ExerciseRelation(Base):
+    """How two exercises relate (Q44). Directional: from -> to."""
+
+    __tablename__ = "exercise_relations"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "from_exercise_id", "to_exercise_id", "relation_type", name="uq_exercise_relations"
+        ),
+        sa.CheckConstraint(
+            "from_exercise_id <> to_exercise_id", name="ck_exercise_relations_not_self"
+        ),
+    )
+
+    from_exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    to_exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False
+    )
+    relation_type: Mapped[ExerciseRelationType] = mapped_column(
+        enum_column(ExerciseRelationType), nullable=False
+    )

@@ -192,6 +192,27 @@ async def session_factory(
     return create_session_factory(admin_engine)
 
 
+#: Deletes rather than one TRUNCATE ... CASCADE, because the catalog must
+#: survive. `exercise_aliases` references `users`, so a cascading truncate of
+#: `users` would take every seeded alias with it and leave the resolver with
+#: nothing to match — reference data seeded by migration 0005 is not test state.
+#: User-learned aliases *are* test state, so those go by predicate.
+CLEANUP_STATEMENTS: tuple[str, ...] = (
+    "DELETE FROM outbox_events",
+    "DELETE FROM domain_events",
+    "DELETE FROM outbound_messages",
+    "DELETE FROM processed_operations",
+    "DELETE FROM workflow_executions",
+    "DELETE FROM message_batch_items",
+    "DELETE FROM message_batches",
+    "DELETE FROM messages",
+    "DELETE FROM conversations",
+    "DELETE FROM user_identifiers",
+    "DELETE FROM exercise_aliases WHERE user_id IS NOT NULL",
+    "DELETE FROM users",
+)
+
+
 @pytest.fixture(autouse=True)
 async def clean_tables(request: pytest.FixtureRequest) -> None:
     """Each test starts from an empty schema, without paying for a new container."""
@@ -203,13 +224,7 @@ async def clean_tables(request: pytest.FixtureRequest) -> None:
     engine = create_async_engine(settings.postgres.admin_dsn())
     try:
         async with engine.begin() as connection:
-            await connection.execute(
-                sa.text(
-                    "TRUNCATE users, user_identifiers, conversations, messages, "
-                    "message_batches, message_batch_items, workflow_executions, "
-                    "processed_operations, outbound_messages, domain_events, "
-                    "outbox_events RESTART IDENTITY CASCADE"
-                )
-            )
+            for statement in CLEANUP_STATEMENTS:
+                await connection.execute(sa.text(statement))
     finally:
         await engine.dispose()

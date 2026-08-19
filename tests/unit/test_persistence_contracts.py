@@ -26,6 +26,13 @@ DOMAIN_ROOT = REPO_ROOT / "src" / "app" / "domain"
 EXPECTED_TABLES = frozenset(
     {
         "users",
+        "exercises",
+        "exercise_aliases",
+        "muscles",
+        "exercise_muscles",
+        "equipment",
+        "exercise_equipment",
+        "exercise_relations",
         "user_identifiers",
         "conversations",
         "messages",
@@ -83,7 +90,7 @@ def test_soft_delete_is_carried_only_by_entities_that_keep_history() -> None:
     soft_deletable = {
         name for name, table in Base.metadata.tables.items() if "deleted_at" in table.columns
     }
-    assert soft_deletable == {"users", "conversations"}
+    assert soft_deletable == {"users", "conversations", "exercises", "exercise_aliases"}
 
 
 def test_enums_are_checked_strings_rather_than_native_types() -> None:
