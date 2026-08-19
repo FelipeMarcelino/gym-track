@@ -97,6 +97,11 @@ class ActivityDraft:
     load_mode: LoadMode | None = None
     distance_m: Decimal | None = None
     duration_s: Decimal | None = None
+    #: Normalized effort on the RPE scale (§14.3). WS-4's EffortNormalizer
+    #: fills this; the raw phrase the user typed travels with the persisted row
+    #: rather than here, because the draft is what gets validated and an
+    #: unnormalized phrase has nothing to validate.
+    effort_rpe: Decimal | None = None
     set_type: SetType = SetType.WORKING
 
     def stated_fields(self) -> frozenset[ActivityField]:
@@ -112,6 +117,8 @@ class ActivityDraft:
             present.add(ActivityField.DISTANCE)
         if self.duration_s is not None:
             present.add(ActivityField.DURATION)
+        if self.effort_rpe is not None:
+            present.add(ActivityField.EFFORT)
         return frozenset(present)
 
     def value_of(self, field: ActivityField) -> Decimal | None:
@@ -125,5 +132,7 @@ class ActivityDraft:
                 return self.distance_m
             case ActivityField.DURATION:
                 return self.duration_s
+            case ActivityField.EFFORT:
+                return self.effort_rpe
             case _:
                 return None

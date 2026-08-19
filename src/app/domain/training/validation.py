@@ -53,6 +53,12 @@ class ValidationIssue:
     #: pt-BR and deterministic. `confirmations.py` (D8) turns these into what
     #: the user reads, so the text is part of the domain rather than of a
     #: presentation layer that does not exist yet.
+    #:
+    #: Phrased as "campo: problema" rather than as a sentence, because a
+    #: sentence has to agree in gender and number with the field it names --
+    #: "esforço negativa" and "faltou repetições" are both wrong, and a message
+    #: table that has to be re-read every time a field is added is a message
+    #: table that eventually is not.
     message: str
 
 
@@ -135,7 +141,7 @@ class ActivityValidator:
                     ValidationIssue(
                         field=activity_field,
                         code=IssueCode.NOT_FINITE,
-                        message=f"{field_name(activity_field)} não é um número utilizável",
+                        message=f"{field_name(activity_field)}: valor não utilizável",
                     )
                 )
                 continue
@@ -145,7 +151,7 @@ class ActivityValidator:
                     ValidationIssue(
                         field=activity_field,
                         code=IssueCode.NEGATIVE,
-                        message=f"{field_name(activity_field)} não pode ser negativa",
+                        message=f"{field_name(activity_field)}: valor negativo",
                     )
                 )
                 continue
@@ -157,7 +163,7 @@ class ActivityValidator:
                         field=activity_field,
                         code=IssueCode.OUT_OF_RANGE,
                         message=(
-                            f"{field_name(activity_field)} fora da faixa esperada "
+                            f"{field_name(activity_field)}: fora da faixa esperada "
                             f"({allowed.minimum} a {allowed.maximum})"
                         ),
                     )
@@ -172,7 +178,7 @@ class ActivityValidator:
             ValidationIssue(
                 field=activity_field,
                 code=IssueCode.MISSING,
-                message=f"faltou {field_name(activity_field)}",
+                message=f"informe {field_name(activity_field)}",
             )
             for activity_field in sorted(schema.essential - stated, key=lambda item: item.value)
         ]
@@ -212,10 +218,7 @@ class ActivityValidator:
             ValidationIssue(
                 field=activity_field,
                 code=IssueCode.UNEXPECTED,
-                message=(
-                    f"{field_name(activity_field)} não se aplica a "
-                    f"{schema.activity_type.value} e foi ignorada"
-                ),
+                message=(f"{field_name(activity_field)}: não se aplica a este tipo de atividade"),
             )
             for activity_field in sorted(stated, key=lambda item: item.value)
             if not schema.accepts(activity_field)

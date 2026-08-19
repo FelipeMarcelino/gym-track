@@ -369,3 +369,84 @@ def test_the_validator_never_raises_for_any_field_combination(
                 duration_s=value,
             )
             assert validator.validate(draft).status in tuple(ValidationStatus)
+
+
+# --------------------------------------------------------------------------
+# Effort (§14.3) — the vocabulary has to carry a value to mean anything
+# --------------------------------------------------------------------------
+
+
+def test_a_stated_effort_is_part_of_the_draft(validator: ActivityValidator) -> None:
+    """`ActivityField.EFFORT` appearing in schemas while no draft could carry
+    an effort made the entry dead: nothing upstream could ever provide one."""
+    draft = strength(repetitions=8, effort_rpe=Decimal("8.5"))
+
+    assert ActivityField.EFFORT in draft.stated_fields()
+    assert validator.validate(draft).status is ValidationStatus.VALID
+
+
+@pytest.mark.parametrize("rpe", [Decimal("0"), Decimal("5.5"), Decimal("10")])
+def test_the_rpe_scale_is_accepted_end_to_end(validator: ActivityValidator, rpe: Decimal) -> None:
+    assert validator.validate(strength(repetitions=5, effort_rpe=rpe)).status is (
+        ValidationStatus.VALID
+    )
+
+
+@pytest.mark.parametrize("rpe", [Decimal("15"), Decimal("-1"), Decimal("11")])
+def test_an_rpe_outside_the_scale_is_invalid(validator: ActivityValidator, rpe: Decimal) -> None:
+    """RPE is 0-10. A reported 15 is a broken value, not an exceptional set."""
+    outcome = validator.validate(strength(repetitions=5, effort_rpe=rpe))
+
+    assert outcome.status is ValidationStatus.INVALID
+    assert outcome.issues[0].field is ActivityField.EFFORT
+
+
+@pytest.mark.parametrize("activity_type", list(ActivityType))
+def test_every_activity_type_accepts_an_effort(activity_type: ActivityType) -> None:
+    """§14.3 makes effort universal: a run is hard the same way a set is."""
+    from app.domain.training.schema_registry import ActivitySchemaRegistry
+
+    schema = ActivitySchemaRegistry().schema_for(activity_type)
+
+    assert schema.accepts(ActivityField.EFFORT)
+
+
+# --------------------------------------------------------------------------
+# The messages are read by a person
+# --------------------------------------------------------------------------
+
+
+def test_messages_do_not_leak_internal_enum_values(validator: ActivityValidator) -> None:
+    """`activity_type.value` is an English identifier; a pt-BR sentence built
+    around it reads as a bug report rather than as help."""
+    internal = {activity_type.value for activity_type in ActivityType}
+    drafts = [
+        strength(repetitions=10, distance_m=Decimal(100)),
+        strength(),
+        strength(repetitions=-1),
+        ActivityDraft(activity_type=ActivityType.DISTANCE_ACTIVITY),
+    ]
+
+    for draft in drafts:
+        for issue in validator.validate(draft).issues:
+            assert not any(value in issue.message for value in internal)
+
+
+def test_messages_avoid_agreement_that_a_new_field_would_break(
+    validator: ActivityValidator,
+) -> None:
+    """ "esforço negativa" and "faltou repetições" are both wrong. The messages
+    name the field and then state the problem, so gender and number never have
+    to agree with anything."""
+    forbidden = ("negativa", "negativo ", "ignorada", "faltou")
+    drafts = [
+        strength(),
+        strength(repetitions=-1),
+        strength(repetitions=5, effort_rpe=Decimal(-1)),
+        strength(repetitions=10, distance_m=Decimal(100)),
+        ActivityDraft(activity_type=ActivityType.TIMED_ACTIVITY),
+    ]
+
+    for draft in drafts:
+        for issue in validator.validate(draft).issues:
+            assert not any(word in issue.message for word in forbidden), issue.message

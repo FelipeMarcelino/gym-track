@@ -62,14 +62,19 @@ _LOAD = ValueRange(Decimal(0), Decimal(1000))
 _DISTANCE = ValueRange(Decimal(1), Decimal(500_000))
 _DURATION = ValueRange(Decimal(1), Decimal(86_400))
 _MOBILITY_DURATION = ValueRange(Decimal(1), Decimal(7_200))
+#: RPE is a 0-10 scale (§14.3). A reported 15 is a broken value, not an
+#: exceptional set.
+_EFFORT = ValueRange(Decimal(0), Decimal(10))
 
 _STRENGTH_RANGES: Final[Mapping[ActivityField, ValueRange]] = {
     ActivityField.REPETITIONS: _REPS,
     ActivityField.LOAD: _LOAD,
+    ActivityField.EFFORT: _EFFORT,
 }
 _ENDURANCE_RANGES: Final[Mapping[ActivityField, ValueRange]] = {
     ActivityField.DISTANCE: _DISTANCE,
     ActivityField.DURATION: _DURATION,
+    ActivityField.EFFORT: _EFFORT,
 }
 
 
@@ -93,7 +98,11 @@ DEFAULT_ACTIVITY_SCHEMAS: Final[Mapping[ActivityType, ActivitySchema]] = {
         activity_type=ActivityType.TIMED_ACTIVITY,
         essential=frozenset({ActivityField.DURATION}),
         optional=frozenset({ActivityField.EFFORT, ActivityField.LOAD, ActivityField.LOAD_MODE}),
-        ranges={ActivityField.DURATION: _DURATION, ActivityField.LOAD: _LOAD},
+        ranges={
+            ActivityField.DURATION: _DURATION,
+            ActivityField.LOAD: _LOAD,
+            ActivityField.EFFORT: _EFFORT,
+        },
     ),
     ActivityType.MIXED_ACTIVITY: ActivitySchema(
         activity_type=ActivityType.MIXED_ACTIVITY,
@@ -110,6 +119,7 @@ DEFAULT_ACTIVITY_SCHEMAS: Final[Mapping[ActivityType, ActivitySchema]] = {
         ranges={
             ActivityField.DURATION: _MOBILITY_DURATION,
             ActivityField.REPETITIONS: _REPS,
+            ActivityField.EFFORT: _EFFORT,
         },
     ),
     ActivityType.OTHER: ActivitySchema(
