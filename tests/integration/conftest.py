@@ -125,6 +125,21 @@ def rabbitmq_url() -> Iterator[str]:
         yield f"amqp://gym_track:integration-test@{host}:{port}/"
 
 
+@pytest.fixture(scope="session")
+def redis_url() -> Iterator[str]:
+    """A Redis container, alive for the whole session (Q158)."""
+    if not _docker_is_available():
+        pytest.skip("no reachable Docker daemon")
+
+    from testcontainers.community.redis import RedisContainer
+
+    container = RedisContainer("redis:7-alpine")
+    with container:
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(6379)
+        yield f"redis://{host}:{port}/0"
+
+
 def alembic_config(settings: ApplicationSettings) -> Config:
     config = Config(str(REPO_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "migrations"))

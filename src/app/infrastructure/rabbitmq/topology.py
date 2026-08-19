@@ -38,6 +38,10 @@ class Exchanges:
     RETRY: Final = "retry"
     DEAD_LETTER: Final = "dead-letter"
 
+    #: Debounce flush triggers (DEC-010, ADR-011). Its own exchange because a
+    #: flush trigger is neither business traffic nor a retry.
+    DEBOUNCE: Final = "debounce"
+
 
 @dataclass(frozen=True, slots=True)
 class ExchangeSpec:
@@ -79,6 +83,10 @@ class Topology:
             if spec.name == name:
                 return spec
         raise KeyError(name)
+
+
+DEBOUNCE_FLUSH_QUEUE: Final = "debounce.flush"
+DEBOUNCE_DELAY_QUEUE: Final = "debounce.delay"
 
 
 def retry_queue_name(queue: str, tier: int) -> str:
@@ -127,6 +135,7 @@ def build_topology(
         ExchangeSpec(Exchanges.DOMAIN_EVENTS),
         ExchangeSpec(Exchanges.BACKGROUND),
         ExchangeSpec(Exchanges.WHATSAPP_OUTBOUND),
+        ExchangeSpec(Exchanges.DEBOUNCE, type="direct"),
         ExchangeSpec(Exchanges.RETRY, type="direct"),
         ExchangeSpec(Exchanges.DEAD_LETTER, type="direct"),
     ]
@@ -153,6 +162,7 @@ def build_topology(
     # One work queue per remaining consumer class.
     for name, exchange, routing_key in (
         ("message.received", Exchanges.WHATSAPP_INBOUND, "message.received"),
+        ("debounce.flush", Exchanges.DEBOUNCE, "debounce.flush"),
         ("outbound.dispatch", Exchanges.WHATSAPP_OUTBOUND, "outbound.#"),
         ("background.jobs", Exchanges.BACKGROUND, "#"),
     ):
@@ -166,5 +176,20 @@ def build_topology(
     # Every queue that carries business work gets retry tiers and a DLQ (Q117).
     for spec in list(queues):
         queues.extend(_retry_and_dlq_specs(spec.name, settings.retry_delays))
+
+    # The delay queue has no consumer and no queue-level TTL: each trigger
+    # carries its own expiration, because a debounce delay depends on how much
+    # of the absolute window is left. On expiry the trigger is dead-lettered to
+    # `debounce.flush`.
+    queues.append(
+        QueueSpec(
+            name=DEBOUNCE_DELAY_QUEUE,
+            bindings=(Binding(Exchanges.DEBOUNCE, DEBOUNCE_DELAY_QUEUE),),
+            arguments={
+                "x-dead-letter-exchange": Exchanges.DEBOUNCE,
+                "x-dead-letter-routing-key": DEBOUNCE_FLUSH_QUEUE,
+            },
+        )
+    )
 
     return Topology(exchanges=tuple(exchanges), queues=tuple(queues))
