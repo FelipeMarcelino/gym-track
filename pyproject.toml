@@ -8,6 +8,8 @@ dependencies = [
     "aio-pika>=9.5",
     "alembic>=1.14",
     "asyncpg>=0.30",
+    "cryptography>=44",
+    "fastapi>=0.115",
     "psycopg[binary]>=3.2",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
@@ -23,6 +25,7 @@ packages = ["src/app"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "mypy>=1.14",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
