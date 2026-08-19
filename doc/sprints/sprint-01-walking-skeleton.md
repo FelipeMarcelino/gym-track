@@ -223,6 +223,17 @@ Only what cannot belong to a single workstream.
 44. **Correlation:** the interaction `trace_id` minted by the aggregator appears in the workflow worker's and the dispatcher's log lines for the same interaction, and each contributing webhook request trace is reachable from it (Q131).
 45. Testcontainers fixtures for Postgres/RabbitMQ/Redis, session-scoped so the suite stays fast enough for every PR (Q158).
 
+### WS-13 — Process entrypoints (added during the sprint)
+51. One entrypoint per role under `app/entrypoints/`, one image that runs any of
+    them, and compose services for all five behind a one-shot migration service.
+52. `make demo`: post a fragmented message to the running stack and require the
+    reply it should produce.
+
+**Tests:** the dispatcher refuses to start in a deployed environment without a
+real provider client; one stop event is shared by every consumer in a process,
+because a handler per consumer means SIGTERM wakes only the last; the outbox
+loop drains a burst without pacing itself and still stops when asked.
+
 ### WS-12 — Decision records
 46. Write `doc/adr/` with a template that **requires** a traceability block: affected spec section, related DEC, originating Q numbers (§48).
 47. ADR-001 modular monolith with worker entrypoints (DEC-015, Q151-Q160).
@@ -237,7 +248,7 @@ Remaining ADRs from §43 are written when their decision is actually taken.
 Every item is mechanically verifiable — no "works on my machine". All verified
 on 2026-08-19 against `main`; 509 tests, green in CI with containers.
 
-- [x] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone. *Verified by cloning the repository to a fresh directory, copying `.env.example`, and running `make migrate` and the e2e suite there.*
+- [x] `docker compose up` yields a system that accepts a webhook and produces a reply, from a clean clone. *Verified against the running stack — five application containers behind a one-shot migration service — by posting three signed webhooks and reading back one batch, one workflow execution and one dispatched reply, with the interaction trace present in three separate containers' logs. `make demo` is that check in executable form, and it fails when the dispatcher is stopped.*
 - [x] `make test` passes: unit + integration + E2E, with containers, in CI.
 - [x] No workstream was merged without the tests listed under it (`CLAUDE.md` rule 2).
 - [x] Every workstream shipped on a correctly prefixed branch with its own PR — PRs #4-#16, plus hotfix #17.
@@ -269,6 +280,7 @@ a review rather than by planning:
 | Per-message transactions and a provider idempotency key in the dispatcher | A crash between "the provider accepted" and "the row says so" would otherwise resend, breaking Q120 exactly where it matters |
 | `disable_existing_loggers=False` in the Alembic environment | Running a migration in-process silently switched off every application logger |
 | Secrets read from the dotenv file the settings already use | `.env.example` documented secrets that the provider never read from a file, so a clean clone could not boot |
+| WS-13: process entrypoints, an application image and compose services for all five roles | The plan's workstreams built every component but no process to run them: compose started only infrastructure, and the e2e suite constructed the pipeline in-process. Review of this closeout caught the acceptance criterion being marked done on that basis |
 
 ## Decisions needed
 
