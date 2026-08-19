@@ -40,6 +40,10 @@ class IssueCode(StrEnum):
     OUT_OF_RANGE = "out_of_range"
     NEGATIVE = "negative"
     UNEXPECTED = "unexpected"
+    #: NaN or an infinity. Separate from OUT_OF_RANGE because it is not a
+    #: number the user typed: it is a value some upstream parser produced, and
+    #: the fix is there rather than in what they send next.
+    NOT_FINITE = "not_finite"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +124,20 @@ class ActivityValidator:
         for activity_field in sorted(draft.stated_fields(), key=lambda item: item.value):
             value = draft.value_of(activity_field)
             if value is None:
+                continue
+
+            if not value.is_finite():
+                # Checked before any ordering comparison: `Decimal("NaN") < 0`
+                # raises InvalidOperation, and a validator that can raise has
+                # no contract at all -- it would abort the whole batch instead
+                # of reporting one broken activity.
+                issues.append(
+                    ValidationIssue(
+                        field=activity_field,
+                        code=IssueCode.NOT_FINITE,
+                        message=f"{field_name(activity_field)} não é um número utilizável",
+                    )
+                )
                 continue
 
             if value < Decimal(0):

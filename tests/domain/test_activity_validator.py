@@ -311,3 +311,61 @@ def test_the_draft_reports_only_the_fields_that_were_stated() -> None:
 
     assert draft.stated_fields() == frozenset({ActivityField.REPETITIONS, ActivityField.LOAD})
     assert strength().stated_fields() == frozenset()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"), Decimal("sNaN")],
+    ids=["nan", "infinity", "negative infinity", "signalling nan"],
+)
+def test_non_finite_values_are_invalid_rather_than_an_exception(
+    validator: ActivityValidator, value: Decimal
+) -> None:
+    """`Decimal("NaN") < 0` raises InvalidOperation, and a validator that can
+    raise has no contract: it would abort the whole batch instead of reporting
+    one broken activity."""
+    outcome = validator.validate(strength(repetitions=10, load_kg=value))
+
+    assert outcome.status is ValidationStatus.INVALID
+    assert outcome.issues[0].code is IssueCode.NOT_FINITE
+    assert outcome.issues[0].field is ActivityField.LOAD
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        ActivityDraft(activity_type=ActivityType.DISTANCE_ACTIVITY, distance_m=Decimal("NaN")),
+        ActivityDraft(activity_type=ActivityType.TIMED_ACTIVITY, duration_s=Decimal("Infinity")),
+        ActivityDraft(activity_type=ActivityType.MIXED_ACTIVITY, distance_m=Decimal("NaN")),
+    ],
+    ids=["distance", "duration", "mixed"],
+)
+def test_no_activity_type_can_be_crashed_by_a_non_finite_value(
+    validator: ActivityValidator, draft: ActivityDraft
+) -> None:
+    assert validator.validate(draft).status is ValidationStatus.INVALID
+
+
+def test_the_validator_never_raises_for_any_field_combination(
+    validator: ActivityValidator,
+) -> None:
+    """The four outcomes are the whole interface. Anything that escapes them
+    reaches the worker as an exception and takes the batch with it."""
+    hostile = [
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-1E+30"),
+        Decimal("1E+30"),
+        Decimal(0),
+    ]
+
+    for activity_type in ActivityType:
+        for value in hostile:
+            draft = ActivityDraft(
+                activity_type=activity_type,
+                repetitions=5,
+                load_kg=value,
+                distance_m=value,
+                duration_s=value,
+            )
+            assert validator.validate(draft).status in tuple(ValidationStatus)
