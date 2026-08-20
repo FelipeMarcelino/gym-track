@@ -199,6 +199,25 @@ async def test_a_bodyweight_exercise_has_no_load_and_says_so(
     assert a_set.load_kg is None
 
 
+async def test_ten_push_ups_are_a_complete_set(builder: WorkoutCommandBuilder) -> None:
+    """Q48, named by the sprint's Definition of Done: "10 flexões" is a whole
+    fact about a set. Asking for a weight would be asking the user to invent
+    one, and refusing the set would lose training they did."""
+    outcome = await _build(
+        builder,
+        _input(
+            StructuredActivityInput(raw_name="flexão", sets=(StructuredSetInput(repetitions=10),))
+        ),
+    )
+
+    assert outcome.command is not None, outcome.deferred  # type: ignore[attr-defined]
+    a_set = outcome.command.activities[0].sets[0]  # type: ignore[attr-defined]
+    assert a_set.repetitions == 10
+    assert a_set.load_kg is None
+    assert a_set.load_mode is LoadMode.BODYWEIGHT
+    assert outcome.deferred == ()  # type: ignore[attr-defined]
+
+
 async def test_a_stated_mode_beats_the_catalogs_default(builder: WorkoutCommandBuilder) -> None:
     """The catalog is the fallback, not an override: a user who says "total"
     has said something the catalog cannot know."""

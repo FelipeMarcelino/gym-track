@@ -292,30 +292,31 @@ value the syntax did not contain.
 
 ## Definition of Done
 
-Every item is mechanically verifiable — no "works on my machine".
+Every item is mechanically verifiable — no "works on my machine". All 22 are
+met; each line names what checks it.
 
-- [ ] `make demo` logs a workout through the running stack and fails if the sets are not persisted.
-- [ ] `make check` passes: unit, domain, contract, integration and E2E, with containers, in CI.
-- [ ] No workstream merged without the tests listed under it, on a correctly prefixed branch with its own reviewed PR.
-- [ ] `supino 80kg 10 9 8` produces one session, one exercise block and three sets, with the load EXPLICIT on the first and INHERITED on the rest.
-- [ ] `supino 80kg` produces no sets and a clarification naming *repetitions* (Q46).
-- [ ] `10 flexões` produces a valid set with no load (Q48).
-- [ ] A dumbbell load of 20 kg is stored as PER_IMPLEMENT without being asked (Q49).
-- [ ] Returning to an exercise after another creates a second block, and the two blocks' indices preserve workout order (Q58).
-- [ ] A raw name matching a user alias resolves to that user's exercise even when a global alias says otherwise (§16 order).
-- [ ] A fuzzy match below the threshold resolves to nothing and asks, rather than to the closest exercise.
-- [ ] Every persisted set is reachable from the message that created it through `entity_sources` (§26.2).
-- [ ] A `#log` message routes to `LOG_WORKOUT` and an ordinary message to `CONVERSATION`, asserted through the worker — registering a handler is not the same as reaching it.
-- [ ] Two global aliases with the same normalized text are refused by the database, not by application code.
-- [ ] Every workout mutation writes an `audit_events` row in the same transaction, and no service role can update or delete one (§15, §26).
-- [ ] Redelivery of a workflow message creates no second set, asserted on row counts.
-- [ ] A session opens on the first log, is reused inside the timeout, and is closed by both the lazy path and the expiration worker.
-- [ ] A Redis expiry hint cannot close a session PostgreSQL considers active (§18).
-- [ ] An unrecognised effort phrase is stored raw and normalized to nothing — no invented RPE.
-- [ ] Every derived metric records the version of the code that produced it (Q52).
-- [ ] `StructuredWorkoutInput` is frozen by a golden fixture, so Sprint 3's extractor has a contract rather than an example.
-- [ ] `mypy --strict` clean; `ruff` clean; no module under `domain/` imports SQLAlchemy.
-- [ ] ADR-012, ADR-013 and ADR-014 committed, each with a §48 traceability block.
+- [x] `make demo` logs a workout through the running stack and fails if the sets are not persisted. — `scripts/demo.py::WORKOUT_QUERY`; verified by running it, and by stopping `workflow-worker` and watching it fail.
+- [x] `make check` passes: unit, domain, contract, integration and E2E, with containers, in CI. — 1266 tests, green on every WS PR.
+- [x] No workstream merged without the tests listed under it, on a correctly prefixed branch with its own reviewed PR. — PRs #22–#33, each reviewed by Codex and CI-green before merge.
+- [x] `supino 80kg 10 9 8` produces one session, one exercise block and three sets, with the load EXPLICIT on the first and INHERITED on the rest. — `tests/e2e/test_workout_logging.py::test_a_logged_workout_reaches_the_database_and_comes_back`.
+- [x] `supino 80kg` produces no sets and a clarification naming *repetitions* (Q46). — `tests/e2e/test_workout_logging.py::test_an_incomplete_workout_asks_instead_of_writing`.
+- [x] `10 flexões` produces a valid set with no load (Q48). — `tests/application/test_workout_command_builder.py::test_ten_push_ups_are_a_complete_set`.
+- [x] A dumbbell load of 20 kg is stored as PER_IMPLEMENT without being asked (Q49). — `test_a_dumbbell_exercise_is_per_implement_without_being_told`, read from `equipment.is_implement`.
+- [x] Returning to an exercise after another creates a second block, and the two blocks' indices preserve workout order (Q58). — `tests/integration/test_workout_schema.py::test_a_b_a_keeps_the_order_it_was_performed_in`.
+- [x] A raw name matching a user alias resolves to that user's exercise even when a global alias says otherwise (§16 order). — `test_a_users_own_alias_wins_over_the_global_one`.
+- [x] A fuzzy match below the threshold resolves to nothing and asks, rather than to the closest exercise. — `test_a_weak_match_resolves_to_nothing_rather_than_to_something`, plus five golden-fixture nulls (ADR-012).
+- [x] Every persisted set is reachable from the message that created it through `entity_sources` (§26.2). — asserted as a join in `test_every_row_is_reachable_from_the_message_that_caused_it` and again end to end.
+- [x] A `#log` message routes to `LOG_WORKOUT` and an ordinary message to `CONVERSATION`, asserted through the worker — `test_a_logged_workout_travels_the_whole_worker_path` and `test_an_ordinary_message_still_gets_the_acknowledgement`.
+- [x] Two global aliases with the same normalized text are refused by the database, not by application code. — `test_two_global_aliases_with_the_same_text_are_refused`, on the partial unique index.
+- [x] Every workout mutation writes an `audit_events` row in the same transaction, and no service role can update or delete one (§15, §26). — `test_the_session_itself_is_attributed_not_only_the_sets` and `test_no_role_can_rewrite_the_audit_trail`, the latter per role on a fresh connection.
+- [x] Redelivery of a workflow message creates no second set, asserted on row counts. — `test_a_redelivery_writes_nothing_the_second_time` and, over RabbitMQ, `test_a_redelivered_batch_does_not_double_the_workout`.
+- [x] A session opens on the first log, is reused inside the timeout, and is closed by both the lazy path and the expiration worker. — `tests/integration/test_training_sessions.py`, 17 cases.
+- [x] A Redis expiry hint cannot close a session PostgreSQL considers active (§18). — and, after review, a session with *no* hint is still closed: the hint is a priority, never a filter.
+- [x] An unrecognised effort phrase is stored raw and normalized to nothing — no invented RPE. — `test_an_unreadable_effort_is_kept_rather_than_dropped`.
+- [x] Every derived metric records the version of the code that produced it (Q52). — four paired CHECK constraints, each exercised (ADR-014).
+- [x] `StructuredWorkoutInput` is frozen by a golden fixture, so Sprint 3's extractor has a contract rather than an example. — round-trip byte-identical, unknown fields refused.
+- [x] `mypy --strict` clean; `ruff` clean; no module under `domain/` imports SQLAlchemy. — enforced in CI by `test_domain_layer_does_not_know_about_sqlalchemy`.
+- [x] ADR-012, ADR-013 and ADR-014 committed, each with a §48 traceability block. — `tests/unit/test_decision_records.py`, `EXPECTED_ADRS` now seven.
 
 ## Decisions needed
 
