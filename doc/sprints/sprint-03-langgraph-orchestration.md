@@ -133,8 +133,10 @@ a merge, one PR each, reviewed and CI-green before merging.
    and creates four unqualified tables (`checkpoints`, `checkpoint_blobs`,
    `checkpoint_writes`, `checkpoint_migrations`). Isolation therefore comes from
    the connection's `search_path`.
-3. `setup()` runs under the **admin** identity from `make migrate`, not from the
-   worker: the workflow-worker role gets DML on that schema and never DDL (Q145).
+3. `setup()` runs under the **admin** identity — from `make migrate` **and** from
+   the compose `migrate` service, which runs `alembic upgrade head` directly and
+   would otherwise leave a fresh `make up` with a schema and no tables. The
+   workflow-worker role gets DML there and never DDL (Q145).
 4. A `CheckpointerProvider` bound to the worker's lifecycle, so the psycopg pool
    opens once and closes on shutdown (§37.4).
 5. Tests: the four tables exist in `langgraph` and **none** of them exists in
@@ -204,17 +206,22 @@ a merge, one PR each, reviewed and CI-green before merging.
    bounded and cannot spin on an unschedulable plan.
 
 ### WS-6 — Result collection, the response boundary and the guard
-1. `collect_results` merges USER_VISIBLE results in plan order into a single
+1. **First, produce the facts.** Sprint 2's `WorkoutLoggedResult` carries
+   exercise names and set counts and nothing else — no load, no repetitions, no
+   effort. A guard over facts that do not exist reports success, which is worse
+   than no guard, so this workstream begins by making the result and
+   `DomainResult.facts` carry the values as *persisted*.
+2. `collect_results` merges USER_VISIBLE results in plan order into a single
    response group; INTERNAL results contribute facts and no prose (§25).
-2. `response_normalizer` is the deterministic pass-through this sprint — the
+3. `response_normalizer` is the deterministic pass-through this sprint — the
    templates Sprint 2 already writes — behind a `ResponseNormalizerPort`.
-3. `response_guard` compares every verifiable fact in the `DomainResult`
+4. `response_guard` compares every verifiable fact in the `DomainResult`
    (exercise names, loads, repetitions, RPE, counts) against the text about to
    be sent. A missing or altered fact fails the guard, and the §25 deterministic
    fallback is what the user receives (Q62, Q136, DEC-004).
-4. The workflow ends `PARTIAL_SUCCESS` when at least one task committed and at
+5. The workflow ends `PARTIAL_SUCCESS` when at least one task committed and at
    least one failed or is skipped — no global rollback of unrelated work (Q28).
-5. Tests: a normalizer that drops the load fails the guard and the user gets the
+6. Tests: a normalizer that drops the load fails the guard and the user gets the
    fallback rather than a wrong number; a normalizer that reorders words but
    keeps every fact passes; the guard is proven to fail by a deliberately lying
    fake, not only asserted to pass; ordering of a two-message group is preserved.
@@ -273,8 +280,12 @@ a merge, one PR each, reviewed and CI-green before merging.
    answer is not needed. §11.1's `resolve_pending_workflow` stays a node and
    records the decision; it does not compute it. The deviation is recorded in
    ADR-016.
-3. An ANSWER resumes the original thread with `Command(resume=…)`, the deferred
-   activity completes, and the confirmation names what was written.
+3. An ANSWER resumes the paused run — same thread, the paused execution's
+   namespace — with `Command(resume=…)`, the deferred activity completes, and
+   the confirmation names what was written. The sets it creates are attributed
+   to **both** messages: the one that named the exercise and the one that gave
+   the repetitions (§26.2), so the answer carries its own message ids rather
+   than only the checkpointed originals.
 4. A NEW_INTENT starts its own workflow and **leaves the pending clarification
    open** — Q29 says a pending question must not block unrelated work.
 5. An answered *exercise* clarification writes a **user-scoped alias** into
@@ -335,6 +346,10 @@ that checks each line, not by agreement that it feels done.
 - [ ] `#log supino 80kg` writes zero `exercise_sets`, one WAITING `pending_clarifications` row, and one outbound question naming *repetições*.
 - [ ] Answering `8 8 8` resumes that workflow and writes three sets attributed to both messages through `entity_sources`.
 - [ ] A `#log` for a different exercise sent while a clarification is pending starts its own workflow and leaves the WAITING row untouched (Q29).
+- [ ] After an unrelated `#log` runs in between, the original question is still answerable — the intervening workflow does not become the checkpoint the answer resumes.
+- [ ] The sets written on resume are attributed to both the asking and the answering message through `entity_sources` (§26.2).
+- [ ] Every persisted set's load, repetitions and effort reach `DomainResult.facts`, so the guard has something to check.
+- [ ] A fresh `make down && make up` produces a stack whose worker can write a checkpoint.
 - [ ] The clarification question and its `pending_clarifications` row commit together, or neither exists.
 - [ ] Every `workflow_executions` row records the `graph_version` that produced it, in SQL rather than only in a checkpoint (Q132).
 - [ ] A terminal execution cannot have a NULL `finished_at`, and a `WAITING_FOR_USER` one must.
@@ -368,7 +383,7 @@ measured**, not a commitment.
 | D1 | Orchestration library | **LangGraph 1.x**, pinned `>=1.2,<2`. The spec mandates it by name (§11, DEC-002); the cost is `langchain-core` in the dependency tree for a sprint with no LLM |
 | D2 | Checkpoint isolation | **A dedicated `langgraph` schema**, selected by `search_path` on the checkpointer's connection. Measured: version 3.1.2 exposes no schema parameter. A separate database is the fallback if `search_path` proves unreliable |
 | D3 | Who creates the checkpoint tables | **The admin identity, from `make migrate`.** The worker role gets DML only; a service role with DDL is a least-privilege hole (Q145) |
-| D4 | `thread_id` | **`conversation_id`**, per Q123. Not `training_session_id`: sessions expire on their own clock and a clarification must survive that |
+| D4 | `thread_id` | **`conversation_id`**, per Q123 — not `training_session_id`, which expires on its own clock while a clarification must survive that. Paired with `checkpoint_ns = workflow_execution_id`, because Q29 allows a paused workflow and a new one in the same conversation, and one namespace between them means the new run becomes the checkpoint the answer would resume |
 | D5 | Intent routing this sprint | **Sprint 2's `route()` behind `IntentRouterPort`.** The port is the Sprint 4 seam; nothing else changes |
 | D6 | Planner this sprint | **Deterministic, single-task plans for real traffic.** The DAG engine is verified by plan-level tests over synthetic plans, and that gap is stated in Scope rather than papered over |
 | D7 | Clarification transport | **LangGraph `interrupt()` + `Command(resume=…)`**, with `pending_clarifications` as the searchable mirror the checkpoint cannot be (Q125) |

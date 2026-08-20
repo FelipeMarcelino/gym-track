@@ -23,6 +23,8 @@ Consequences, applied throughout this plan: isolation comes from `search_path` o
 Two more items are named but **not yet measured**; measure them before writing the code they belong to, and record the result in the PR:
 
 - **`interrupt()` semantics under a resumed thread with a modified input.** The plan assumes `Command(resume=value)` re-enters the interrupted node and that nodes before it do not re-run. Verify against the pinned version before WS-8 hardens around it.
+- **What `ainvoke` returns for a suspended graph.** WS-8 reads the pending interrupt out of it through a single accessor; confirm the shape in WS-4.
+- **`checkpoint_ns` as a top-level isolation key.** D4 uses it to keep two runs in one conversation apart. It is documented as the subgraph namespace, and using it this way must be verified before WS-9 depends on it. **Fallback:** a composite `thread_id` of `f"{conversation_id}:{execution_id}"`, which works but reads Q123 loosely and would need an ADR amendment saying so. Decide in WS-4, not in WS-9.
 - **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
 
 ## Decisions applied
@@ -32,7 +34,7 @@ Two more items are named but **not yet measured**; measure them before writing t
 | D1 | `langgraph>=1.2,<2` and `langgraph-checkpoint-postgres>=3.1,<4` in `[project].dependencies` (WS-1) |
 | D2 | `CHECKPOINT_SCHEMA = "langgraph"` in `app/infrastructure/langgraph/checkpointer.py`; the psycopg DSN carries `options=-c%20search_path%3Dlanggraph` |
 | D3 | `scripts/checkpointer_setup.py`, invoked by `make migrate` after `alembic upgrade head`, connecting as the admin role |
-| D4 | `thread_id=str(conversation_id)` built by one function, `thread_for(conversation_id)`, so no call site can invent its own |
+| D4 | `thread_id=str(conversation_id)` **and** `checkpoint_ns=str(workflow_execution_id)`, built by one function, `thread_for(...)`, so no call site can invent its own. Q123 is satisfied by the thread; the namespace is what keeps two runs in one conversation from overwriting each other |
 | D5 | `IntentRouterPort` in `app/application/ports/routing.py`; `DeterministicIntentRouter` wraps Sprint 2's `route()` |
 | D6 | `DeterministicExecutionPlanner` in `app/application/services/execution_planner.py`; one task per routed intent |
 | D7 | `app/graphs/main/interrupts.py` owns every `interrupt()` call; no other module imports it from `langgraph` |
@@ -91,6 +93,7 @@ Adding a value to an enum column is **not** free either: `enum_column` renders a
 ~ src/app/infrastructure/postgres/grants.py
 ~ src/app/config/settings.py              # PostgresSettings.checkpointer_dsn()
 ~ Makefile                                # migrate runs checkpointer_setup
+~ docker/compose.yaml                     # the migrate service runs it too
 ~ tests/unit/test_project_layout.py       # the import-boundary assertion
 ```
 
@@ -138,6 +141,21 @@ async def main() -> None:
     the checkpointer keeps its own `checkpoint_migrations` ledger."""
 ```
 
+**It must run in two places, and forgetting the second is a broken `make up`.**
+`docker/compose.yaml`'s `migrate` service runs `alembic upgrade head` directly —
+it does not go through the Makefile. Migration `0010` creates only the schema;
+the four tables come from this script. A fresh volume would therefore start
+`workflow-worker` against an empty schema it has no privilege to populate:
+
+```yaml
+migrate:
+  command: ["sh", "-c", "alembic upgrade head && python -m scripts.checkpointer_setup"]
+```
+
+Every application service already waits on `migrate` completing, so the ordering
+is free. Verify by destroying the volumes (`make down`) and running `make up`
+from nothing — the only test that actually covers this path.
+
 ## Tests
 
 `tests/integration/test_checkpointer.py`
@@ -147,6 +165,7 @@ async def main() -> None:
 - `test_the_worker_role_can_write_a_checkpoint` — as `gym_workflow_worker`, insert and read.
 - `test_the_worker_role_cannot_create_a_table_there` — as `gym_workflow_worker`, `CREATE TABLE langgraph.x(...)` raises. On its own connection: an aborted transaction makes every later statement fail for the wrong reason (Sprint 2, WS-6).
 - `test_a_table_created_later_is_writable_without_a_migration` — create one as admin, then write to it as the worker. This is what `ALTER DEFAULT PRIVILEGES` buys.
+- `test_the_compose_migration_creates_the_checkpoint_tables` — parse `docker/compose.yaml` and assert the `migrate` service's command runs the setup script. A cheap unit-level guard against the failure that only shows up on a fresh volume.
 
 `tests/unit/test_project_layout.py`
 
@@ -154,7 +173,7 @@ async def main() -> None:
 
 ## Done when
 
-`make migrate` creates the schema and the tables, `make check` is green, and the four checkpoint tables are provably absent from `public`.
+`make down && make up` from empty volumes produces a stack whose worker can write a checkpoint, `make check` is green, and the four checkpoint tables are provably absent from `public`.
 
 ---
 
@@ -453,6 +472,19 @@ Q27 is a constraint on this type and the review question for every field added l
 ```python
 # graphs/main/graph.py
 
+@dataclass(frozen=True, slots=True)
+class WorkerContext:
+    """What the nodes need and the state must not carry.
+
+    The session is here rather than in `MainGraphState` because state is
+    checkpointed, and a serialized session is a crash at resume time. It is
+    passed per invocation, so every node writes inside the worker's one
+    transaction.
+    """
+    session: AsyncSession
+    execution_id: UUID
+    settings: ApplicationSettings
+
 def build_main_graph(
     *,
     router: IntentRouterPort,
@@ -460,11 +492,21 @@ def build_main_graph(
     handlers: Mapping[TaskType, TaskHandler],
     normalizer: ResponseNormalizerPort,
     checkpointer: BaseCheckpointSaver,
+    context_schema: type = WorkerContext,
 ) -> CompiledStateGraph:
     """Compiled once, at process start (Q121)."""
 
-def thread_for(conversation_id: UUID) -> dict[str, Any]:
-    """`{"configurable": {"thread_id": str(conversation_id)}}` (Q123, D4)."""
+def thread_for(conversation_id: UUID, execution_id: UUID) -> dict[str, Any]:
+    """`{"configurable": {"thread_id": ..., "checkpoint_ns": ...}}` (Q123, D4).
+
+    The thread is the conversation, as Q123 requires. The namespace is the
+    execution, and it is not decoration: a conversation can have a paused
+    workflow *and* an unrelated new one at the same time (Q29 requires exactly
+    that). Sharing one namespace would make the new run the thread's latest
+    checkpoint, and the later `Command(resume=...)` would resume the wrong
+    thing while the pending row stayed open forever -- a question the database
+    says is answerable and the graph cannot answer.
+    """
 ```
 
 ```python
@@ -493,7 +535,7 @@ async def response_guard(state, runtime) -> dict: ...         # WS-6
 async def persist_outbound(state, runtime) -> dict: ...       # WS-7
 ```
 
-The database session is **not** in graph state. It reaches the nodes through the runtime context the worker supplies, because a session in a checkpointed state object would be serialized, and a serialized session is a crash at resume time.
+The database session is **not** in graph state. It reaches the nodes through `WorkerContext`, supplied per invocation — `await graph.ainvoke(state, config=thread_for(...), context=WorkerContext(session=..., ...))` — on the resume call as much as on the first one. A node that cannot reach the session cannot keep `execution_tasks` and the outbound rows inside the worker's transaction, which is the property every other guarantee in this system is built on, so **both** invocation forms in WS-7 and WS-9 pass it.
 
 ## Tests
 
@@ -600,8 +642,46 @@ A multi-task plan runs, its outcome is right, and the table can answer what happ
 + src/app/application/services/response_normalizer.py
 + tests/domain/test_response_guard.py
 + tests/graph/test_response_boundary.py
+~ src/app/domain/training/workout_log.py        # LoggedSet: the facts to guard
+~ src/app/application/services/workout_logging.py  # populate them
+~ src/app/graphs/main/handlers.py               # carry them into DomainResult.facts
 ~ src/app/graphs/main/nodes.py
 ```
+
+## First, produce the facts
+
+**Sprint 2 does not already emit what this guard is supposed to check**, and a
+guard with nothing to compare against is worse than no guard: it reports
+success. Today `WorkoutLoggedResult` carries a session id, exercise names and
+per-exercise set counts, and `make_log_workout_handler` puts exactly those into
+`DomainResult.facts`. Load, repetitions and effort — the three values §25 and
+Q136 most care about a normalizer not inventing — are nowhere in it.
+
+So WS-6 starts in the domain, not in the guard:
+
+```python
+# domain/training/workout_log.py
+@dataclass(frozen=True, slots=True)
+class LoggedSet:
+    position: int
+    repetitions: int | None
+    load_kg: Decimal | None
+    effort_rpe: Decimal | None
+
+@dataclass(frozen=True, slots=True)
+class LoggedExercise:
+    ...                       # unchanged fields
+    sets: tuple[LoggedSet, ...] = ()   # new; set_count stays, derived from it
+```
+
+`WorkoutApplicationService` populates it from the rows it just wrote — the
+values as **persisted**, never as parsed, because the guard's job is to protect
+what the database says. The handler flattens them into `facts` under stable
+keys (`supino_reto.set_1.load_kg`), and `verifiable_facts()` reads them.
+
+This is a scope addition to WS-6 discovered in review, and it is the load-bearing
+half: without it, `test_a_dropped_load_is_a_violation` passes against a guard
+that was never given a load.
 
 ## Signatures
 
@@ -616,8 +696,8 @@ class GuardViolation:
 
 def verifiable_facts(results: Sequence[DomainResult]) -> Mapping[str, str]:
     """The facts a normalizer is forbidden to change: exercise names, loads,
-    repetition counts, RPE, set counts. Taken from `DomainResult.facts`, which
-    Sprint 2 already populates -- this is why that field exists."""
+    repetition counts, RPE, set counts. Read from `DomainResult.facts`, which
+    this workstream first has to make carry them (see above)."""
 
 def check(text: str, facts: Mapping[str, str]) -> tuple[GuardViolation, ...]:
     """Every fact must appear in the text, unaltered. Numbers are compared as
@@ -647,6 +727,8 @@ Fallback behaviour (§25): when `check()` returns violations, the guard logs the
 - `test_a_reworded_sentence_with_every_fact_intact_passes` — the guard must not become a template-equality check, or Sprint 4's normalizer can never pass it.
 - `test_numbers_are_compared_as_numbers` — `sets=3` against "3 séries" passes, against "4 séries" fails.
 - `test_an_internal_result_contributes_facts_and_no_prose`.
+- `test_every_persisted_set_reaches_the_facts` — a three-set workout yields three loads and three repetition counts in `verifiable_facts()`. The test that stops the guard from being decorative.
+- `test_the_facts_are_what_was_persisted` — built from the committed rows, not from the parsed input, so a domain bug shows up as a guard violation instead of being confirmed to the user.
 
 `tests/graph/test_response_boundary.py`
 
@@ -691,8 +773,17 @@ class WorkflowWorker:
         the provider's delivery (Q130); a redelivered batch that already
         SUCCEEDED returns without effects.
 
-        Changed: the routing and handler call become `await graph.ainvoke(
-        initial_state, config=thread_for(batch.conversation_id))`.
+        Changed: the routing and handler call become
+
+            await graph.ainvoke(
+                initial_state,
+                config=thread_for(batch.conversation_id, execution.id),
+                context=WorkerContext(session=session, execution_id=execution.id,
+                                      settings=self._settings),
+            )
+
+        The context is not optional and not a default: it carries the session
+        the nodes write through.
         """
 ```
 
@@ -908,7 +999,7 @@ Two further rules that the tests exist to pin down:
 
 class AnswerParseError(ValueError): ...
 
-def parse_answer(texts: Sequence[str], expected: ExpectedResponse) -> ClarificationAnswer:
+def parse_answer(texts: Sequence[str], expected: ExpectedResponse) -> AnswerValue:
     """Read the batch as an answer to this question, or raise.
 
     Raising is the useful outcome: a batch that does not parse is not an
@@ -929,9 +1020,25 @@ class PendingDecision:
     clarification: PendingClarification | None = None
     answer: ClarificationAnswer | None = None
 
+@dataclass(frozen=True, slots=True)
+class ClarificationAnswer:
+    """The parsed answer *and where it came from*.
+
+    The provenance half is not incidental. The checkpoint holds the original
+    question's batch and message ids; the sets written on resume were caused by
+    **both** messages, and §26.2 means both must appear in `entity_sources`.
+    An answer that arrives without its own identifiers can only ever be
+    attributed to the message that asked the question, which is the opposite of
+    what happened.
+    """
+    value: AnswerValue
+    message_batch_id: UUID
+    message_ids: tuple[UUID, ...]
+
 class PendingWorkflowResolver:
     async def classify(self, session, *, conversation_id: UUID,
-                       texts: Sequence[str]) -> PendingDecision: ...
+                       texts: Sequence[str], message_batch_id: UUID,
+                       message_ids: Sequence[UUID]) -> PendingDecision: ...
 ```
 
 The order of the checks is the design, and it is deliberately not "try to parse first":
@@ -959,10 +1066,20 @@ So the classification runs in the **worker**, before it chooses how to invoke:
 ```text
 decision = await resolver.classify(session, conversation_id=..., texts=...)
 
-ANSWER        -> await graph.ainvoke(Command(resume=decision.answer),
-                                     config=thread_for(conversation_id))
-NEW_INTENT    -> await graph.ainvoke(initial_state | {"pending_decision": decision},
-                                     config=thread_for(conversation_id))
+ANSWER        -> await graph.ainvoke(
+                     Command(resume=decision.answer),
+                     config=thread_for(conversation_id, decision.clarification.workflow_execution_id),
+                     context=WorkerContext(session=session, ...))
+                 # the paused execution's id IS the namespace: same thread,
+                 # the run that is actually waiting
+
+NEW_INTENT    -> await graph.ainvoke(
+                     initial_state | {"pending_decision": decision},
+                     config=thread_for(conversation_id, new_execution.id),
+                     context=WorkerContext(session=session, ...))
+                 # its own namespace, so it cannot become the pending run's
+                 # latest checkpoint (Q29)
+
 CANCELLATION  -> close the row CANCELLED, confirm, do not touch the graph
 ```
 
@@ -995,8 +1112,9 @@ An ANSWER to an `AMBIGUOUS_ENTITY` question writes a **user-scoped row** into `e
 
 `tests/integration/test_resume.py`
 
-- `test_the_round_trip_persists_on_the_second_message` — three sets after the answer, zero before, both messages present in `entity_sources`.
+- `test_the_round_trip_persists_on_the_second_message` — three sets after the answer, zero before, **both** messages present in `entity_sources`: the one that named the exercise and the one that gave the repetitions. The resumed command's `source_message_ids` is the union of the checkpointed originals and the answer's own, which is why `ClarificationAnswer` carries them.
 - `test_a_new_log_during_a_pending_question_does_not_answer_it` — the WAITING row is untouched and a second workflow runs. **The Q29 test; also the one that fails if the classifier's step order is changed.**
+- `test_the_original_question_is_still_answerable_afterwards` — the continuation of the test above, and the one that proves D4's namespace: `#log supino 80kg`, then an unrelated `#log agachamento 100kg 5 5 5`, *then* `8 8 8`. The answer must resume the first workflow, not the second. Without the per-execution namespace the intervening run becomes the thread's latest checkpoint and this test fails with a pending row nobody can ever close.
 - `test_an_answer_after_expiry_starts_a_new_workflow` — the row is EXPIRED, nothing is resumed.
 - `test_a_cancel_phrase_closes_the_question` — status CANCELLED and a confirmation the user can understand.
 - `test_a_redelivered_answer_resumes_once` — one set, not two; the second delivery finds the claim taken.
@@ -1144,6 +1262,13 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | DoD line | WS |
 | --- | --- |
 | `make demo` completes the round trip | WS-11 |
+| A fresh `make down && make up` yields a writable checkpointer | WS-1 |
+| The original question survives an intervening `#log` | WS-9 |
+| Resumed sets are attributed to both messages | WS-9 |
+| Every set's load, reps and effort reach `DomainResult.facts` | WS-6 |
+| The question and its row commit together | WS-8 |
+| `graph_version` is a column, not only checkpoint state | WS-2, WS-7 |
+| A terminal execution cannot have a NULL `finished_at` | WS-2 |
 | `make check` green with containers in CI | all |
 | Every workstream on its own reviewed PR | all |
 | `#log supino 80kg` writes nothing and asks | WS-8 |
