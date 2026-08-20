@@ -644,6 +644,30 @@ class SessionExercise(Base, SoftDeleteMixin):
         sa.UniqueConstraint(
             "training_session_id", "exercise_block_index", name="uq_session_exercises_block"
         ),
+        # The group is referenced together with the session it belongs to. A
+        # group carries the type, the rounds and the ordering, so borrowing one
+        # from another workout -- possibly another user's -- would give this
+        # exercise a structure nobody performed. A plain foreign key on the id
+        # alone accepts that; this one cannot. `exercise_group_id` is nullable,
+        # and a partly-NULL composite key is simply not enforced, which is
+        # exactly right for an exercise that belongs to no group.
+        sa.ForeignKeyConstraint(
+            ["exercise_group_id", "training_session_id"],
+            ["exercise_groups.id", "exercise_groups.training_session_id"],
+            name="fk_session_exercises_group_in_same_session",
+            ondelete="RESTRICT",
+        ),
+        # The position is how a group's execution order is reconstructed, so
+        # two exercises claiming the same one leaves it undecidable. Partial,
+        # because "no group, no position" is the common case and NULLs must not
+        # collide with each other.
+        sa.Index(
+            "uq_session_exercises_group_position",
+            "exercise_group_id",
+            "position_in_group",
+            unique=True,
+            postgresql_where=sa.text("exercise_group_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
         sa.Index("ix_session_exercises_block", "training_session_id", "exercise_block_index"),
     )
 
@@ -655,9 +679,9 @@ class SessionExercise(Base, SoftDeleteMixin):
     exercise_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("exercises.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    exercise_group_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("exercise_groups.id", ondelete="SET NULL"), nullable=True
-    )
+    #: The foreign key is the composite one in `__table_args__`: the group has
+    #: to belong to this same session.
+    exercise_group_id: Mapped[UUID | None] = mapped_column(sa.Uuid, nullable=True)
     position_in_group: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
     exercise_block_index: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     #: Denormalized from the catalog at write time so a later catalog edit
@@ -781,6 +805,10 @@ class ExerciseGroup(Base, SoftDeleteMixin):
     __tablename__ = "exercise_groups"
     __table_args__ = (
         sa.UniqueConstraint("training_session_id", "block_index", name="uq_exercise_groups_block"),
+        # Redundant given the primary key, and required: it is what lets
+        # `session_exercises` reference (group, session) as a pair, which is
+        # how a group is kept from being borrowed by another workout.
+        sa.UniqueConstraint("id", "training_session_id", name="uq_exercise_groups_id_session"),
     )
 
     training_session_id: Mapped[UUID] = mapped_column(
@@ -815,7 +843,7 @@ class EntitySource(Base):
     entity_type: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     entity_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     message_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=True
+        sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=True, index=True
     )
     message_batch_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("message_batches.id", ondelete="CASCADE"), nullable=True

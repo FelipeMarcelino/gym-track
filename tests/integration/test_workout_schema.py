@@ -300,6 +300,79 @@ async def test_a_superset_links_its_exercises_by_position(
     assert len({row.exercise_group_id for row in stored}) == 1
 
 
+async def test_a_block_cannot_join_a_group_from_another_session(
+    session_factory: async_sessionmaker[AsyncSession], workout: _Workout
+) -> None:
+    """A group carries the type, the rounds and the ordering. Borrowing one
+    from a different workout — possibly a different user's — would give this
+    exercise a structure nobody performed, so the reference is scoped to the
+    session rather than to the group id alone."""
+    bench = await _exercise_id(session_factory, "supino-reto")
+
+    async with unit_of_work(session_factory) as session:
+        other_user = User()
+        session.add(other_user)
+        await session.flush()
+        other_session = TrainingSession(user_id=other_user.id)
+        session.add(other_session)
+        await session.flush()
+        foreign_group = ExerciseGroup(
+            training_session_id=other_session.id,
+            group_type=ExerciseGroupType.SUPERSET,
+            block_index=0,
+        )
+        session.add(foreign_group)
+        await session.flush()
+        foreign_group_id = foreign_group.id
+
+    with pytest.raises(IntegrityError):
+        async with unit_of_work(session_factory) as session:
+            block = await _block(session, workout, bench, 0)
+            block.exercise_group_id = foreign_group_id
+            block.position_in_group = 0
+
+
+async def test_two_exercises_cannot_hold_the_same_place_in_a_group(
+    session_factory: async_sessionmaker[AsyncSession], workout: _Workout
+) -> None:
+    """The position is how the group's execution order is reconstructed, and
+    two exercises claiming the same one leaves it undecidable."""
+    bench = await _exercise_id(session_factory, "supino-reto")
+    row_exercise = await _exercise_id(session_factory, "remada-curvada")
+
+    with pytest.raises(IntegrityError):
+        async with unit_of_work(session_factory) as session:
+            group = ExerciseGroup(
+                training_session_id=workout.session_id,
+                group_type=ExerciseGroupType.SUPERSET,
+                block_index=0,
+            )
+            session.add(group)
+            await session.flush()
+            for block_index, exercise_id in enumerate((bench, row_exercise)):
+                block = await _block(session, workout, exercise_id, block_index)
+                block.exercise_group_id = group.id
+                block.position_in_group = 0
+
+
+async def test_ungrouped_blocks_do_not_collide_with_each_other(
+    session_factory: async_sessionmaker[AsyncSession], workout: _Workout
+) -> None:
+    """Most exercises belong to no group. The position uniqueness must not turn
+    "no group, no position" into a value two rows can conflict over."""
+    bench = await _exercise_id(session_factory, "supino-reto")
+    squat = await _exercise_id(session_factory, "agachamento-livre")
+
+    async with unit_of_work(session_factory) as session:
+        await _block(session, workout, bench, 0)
+        await _block(session, workout, squat, 1)
+
+    async with session_factory() as session:
+        blocks = (await session.scalars(sa.select(SessionExercise))).all()
+
+    assert len(blocks) == 2
+
+
 # --------------------------------------------------------------------------
 # Provenance to the message (§26.2)
 # --------------------------------------------------------------------------
