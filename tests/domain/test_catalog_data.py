@@ -20,8 +20,8 @@ from app.domain.exercises.catalog_data import (
     SEED_RELATIONS,
     SEEDED_ACTIVITY_TYPES,
 )
+from app.domain.exercises.normalization import normalize_for_match
 from app.domain.training.activities import ActivityType
-from app.infrastructure.postgres.seeding import normalize_for_match
 
 MUSCLE_SLUGS = {muscle.slug for muscle in SEED_MUSCLES}
 EQUIPMENT_SLUGS = {item.slug for item in SEED_EQUIPMENT}

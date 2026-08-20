@@ -21,8 +21,6 @@ already logged sets against is retired, never deleted.
 from __future__ import annotations
 
 import logging
-import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -38,6 +36,7 @@ from app.domain.exercises.catalog_data import (
     SEED_MUSCLES,
     SEED_RELATIONS,
 )
+from app.domain.exercises.normalization import normalize_for_match
 from app.domain.identifiers import new_uuid7
 from app.infrastructure.postgres.models import (
     Equipment,
@@ -50,23 +49,6 @@ from app.infrastructure.postgres.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-_WHITESPACE = re.compile(r"\s+")
-_PUNCTUATION = re.compile(r"[^\w\s]")
-
-
-def normalize_for_match(text: str) -> str:
-    """Casefold, strip accents, drop punctuation, collapse whitespace.
-
-    The resolver matches on this form, so it is stored rather than computed at
-    query time: `supino` typed with or without an accent, in any case, has to
-    reach the same index entry. WS-7 reuses this exact function, which is why
-    it lives with the loader rather than inside it.
-    """
-    decomposed = unicodedata.normalize("NFKD", text)
-    without_accents = "".join(char for char in decomposed if not unicodedata.combining(char))
-    without_punctuation = _PUNCTUATION.sub(" ", without_accents)
-    return _WHITESPACE.sub(" ", without_punctuation).strip().casefold()
 
 
 @dataclass(frozen=True, slots=True)
