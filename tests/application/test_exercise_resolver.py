@@ -214,6 +214,22 @@ async def test_only_the_stages_before_the_hit_are_consulted(catalog: FakeCatalog
     assert counting.calls == ["by_user_alias", "by_global_alias"]
 
 
+async def test_an_exact_hit_does_not_load_the_whole_catalog_for_its_entry(
+    catalog: FakeCatalog,
+) -> None:
+    """`resolve_entry` exists so a caller can read Q49's flags off the row. It
+    must not undo the reason the stages are ordered: an alias hit already has
+    the row in hand, and scanning every exercise to find it again costs the
+    whole catalog on the common path."""
+    counting = _CountingCatalog(catalog)
+
+    resolution, entry = await ExerciseResolver(counting).resolve_entry("supino", user_id=USER)
+
+    assert entry is not None
+    assert entry.exercise_id == resolution.exercise_id
+    assert "all_searchable" not in counting.calls
+
+
 async def test_the_canonical_name_resolves_when_no_alias_covers_it(
     catalog: FakeCatalog, resolver: ExerciseResolver
 ) -> None:
