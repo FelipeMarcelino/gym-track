@@ -12,12 +12,12 @@ to hold **one interaction across several messages** — still without a single
 LLM call:
 
 ```text
-#log supino 80kg   ->  "Faltou repetições em "supino". Quanto foi?"
+#log supino 80kg   ->  Faltou repetições em "supino". Quanto foi?
                        workflow_executions.status = WAITING_FOR_USER
                        pending_clarifications: 1 row, WAITING
                        exercise_sets: 0 rows
 
-8 8 8              ->  "Registrei Supino reto (3 séries)."
+8 8 8              ->  Registrei Supino reto (3 séries).
                        the same workflow, resumed from its checkpoint
 ```
 
