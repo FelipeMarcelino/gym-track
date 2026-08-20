@@ -151,7 +151,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         secondary_muscles=("triceps", "deltoide-anterior"),
         stabilizer_muscles=("core",),
         equipment=("peso-corporal",),
-        aliases_pt_br=("flexão", "flexao", "flexão de braço", "apoio"),
+        aliases_pt_br=("flexão", "flexao", "flexões", "flexão de braço", "apoio"),
         aliases_en=("push-up", "push up", "pushup"),
     ),
     # ----------------------------------------------------------------- legs
@@ -165,7 +165,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         secondary_muscles=("gluteo", "isquiotibiais"),
         stabilizer_muscles=("core", "lombar"),
         equipment=("barra",),
-        aliases_pt_br=("agachamento", "agachamento livre", "agacho"),
+        aliases_pt_br=("agachamento", "agachamentos", "agachamento livre", "agacho"),
         aliases_en=("squat", "back squat"),
     ),
     SeedExercise(
@@ -225,7 +225,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         secondary_muscles=("gluteo",),
         stabilizer_muscles=("core",),
         equipment=("halteres",),
-        aliases_pt_br=("afundo", "avanço"),
+        aliases_pt_br=("afundo", "afundos", "avanço"),
         aliases_en=("lunge", "walking lunge"),
     ),
     SeedExercise(
@@ -349,7 +349,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         # "barra" alone is deliberately absent: in a Brazilian gym it means the
         # barbell, not the pull-up bar, and an alias that resolves the wrong
         # exercise silently is the worst failure this catalog can have.
-        aliases_pt_br=("barra fixa",),
+        aliases_pt_br=("barra fixa", "barras"),
         aliases_en=("pull-up", "pull up", "pullup", "chin-up"),
     ),
     SeedExercise(
@@ -502,7 +502,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         primary_muscles=("triceps",),
         secondary_muscles=("peitoral", "deltoide-anterior"),
         equipment=("paralelas", "peso-corporal"),
-        aliases_pt_br=("mergulho", "paralelas", "mergulho nas paralelas"),
+        aliases_pt_br=("mergulho", "mergulhos", "paralelas", "mergulho nas paralelas"),
         aliases_en=("dip", "dips", "parallel bar dip"),
     ),
     # ------------------------------------------------------------------ core
@@ -514,7 +514,7 @@ CATALOG_SEED: Final[tuple[SeedExercise, ...]] = (
         is_bodyweight=True,
         primary_muscles=("abdomen",),
         equipment=("peso-corporal",),
-        aliases_pt_br=("abdominal", "abdominal supra"),
+        aliases_pt_br=("abdominal", "abdominais", "abdominal supra"),
         aliases_en=("crunch", "sit-up"),
     ),
     SeedExercise(
