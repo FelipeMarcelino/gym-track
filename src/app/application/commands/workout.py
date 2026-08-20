@@ -8,18 +8,21 @@ They are separate on purpose. Q57 says an activity nobody could understand must
 not cost the user the ones we did understand, so a partial success is the
 normal outcome rather than an error: the bench press commits, and the sentence
 about "aquele exercício do peito" becomes a question.
+
+`DeferralReason` and `DeferredItem` are re-exported from the domain: they are
+facts about the user's input rather than plumbing, and D8's pt-BR messages are
+pure functions of them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from enum import StrEnum
 from typing import Final
 from uuid import UUID
 
-from app.domain.exercises.resolution import ResolutionCandidate
-from app.domain.training.activities import ActivityField, ActivityType, LoadMode, SetType
+from app.domain.training.activities import ActivityType, LoadMode, SetType
+from app.domain.training.deferrals import DeferralReason, DeferredItem
 from app.domain.training.effort import NormalizedEffort
 from app.domain.training.metrics import DerivedMetric
 from app.domain.training.provenance import ExerciseGroupType, Provenance
@@ -45,25 +48,6 @@ class EmptyCommandError(ValueError):
     Writing one anyway would open a session, an audit row and a domain event
     describing work that does not exist.
     """
-
-
-class DeferralReason(StrEnum):
-    UNRESOLVED_EXERCISE = "unresolved_exercise"
-    AMBIGUOUS_EXERCISE = "ambiguous_exercise"
-    MISSING_ESSENTIAL_DATA = "missing_essential_data"
-    INVALID_VALUE = "invalid_value"
-
-
-@dataclass(frozen=True, slots=True)
-class DeferredItem:
-    raw_name: str
-    reason: DeferralReason
-    #: What to ask for, when the answer is a missing measurement (Q46). Carried
-    #: rather than re-derived, so whoever writes the reply is not re-running
-    #: the validator to find out what it already knew.
-    missing_field: ActivityField | None = None
-    #: What to offer, when the answer is a choice between exercises (Q56).
-    candidates: tuple[ResolutionCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,3 +127,17 @@ class BuildOutcome:
     @property
     def has_work(self) -> bool:
         return self.command is not None
+
+
+__all__ = [
+    "OPERATION_PREFIX",
+    "ActivityCommand",
+    "BuildOutcome",
+    "DeferralReason",
+    "DeferredItem",
+    "EmptyCommandError",
+    "GroupCommand",
+    "LogWorkoutCommand",
+    "SetCommand",
+    "operation_id_for",
+]

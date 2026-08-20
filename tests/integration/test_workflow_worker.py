@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.events import DomainEventEnvelope
+from app.domain.results import TaskType
 from app.graphs.main.handlers import ACKNOWLEDGEMENT
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
@@ -170,12 +171,10 @@ async def test_domain_rows_outbound_and_outbox_commit_together(
 
 async def test_nothing_is_written_when_the_handler_fails(
     session_factory: async_sessionmaker[AsyncSession],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Atomicity in the direction that matters: a failed handler must not leave
     an execution row claiming the batch was processed."""
     payload = await _seed_batch(session_factory, "oi")
-    worker = WorkflowWorker(session_factory=session_factory)
 
     class HandlerFailureError(RuntimeError):
         pass
@@ -183,7 +182,12 @@ async def test_nothing_is_written_when_the_handler_fails(
     async def exploding_handler(task: Any) -> Any:
         raise HandlerFailureError
 
-    monkeypatch.setattr("app.workers.workflow_worker.resolve_handler", lambda _: exploding_handler)
+    # Injected rather than patched: the worker takes its registry now, so the
+    # seam a caller would use is the seam the test uses.
+    worker = WorkflowWorker(
+        session_factory=session_factory,
+        handlers={TaskType.CONVERSATION: exploding_handler},
+    )
 
     with pytest.raises(HandlerFailureError):
         await worker.handle(payload)
@@ -257,3 +261,77 @@ async def test_the_batch_fragments_reach_the_handler_in_order(
         ).one()
 
     assert event.payload["fragments"] == "3"
+
+
+async def test_a_logged_workout_travels_the_whole_worker_path(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """WS-9 end to end: a `#log` batch is routed to the workout handler, the
+    domain commits, and the user is told what was recorded.
+
+    Everything below this line has been tested in isolation; this asserts that
+    the pieces were wired to each other rather than each to a fake.
+    """
+    from app.application.services.training_sessions import TrainingSessionManager
+    from app.application.services.workout_command_builder import SessionScopedCommandBuilder
+    from app.application.services.workout_logging import WorkoutApplicationService
+    from app.graphs.main.handlers import build_task_handlers
+    from app.infrastructure.postgres.models import ExerciseSet, SessionExercise, TrainingSession
+
+    payload = await _seed_batch(session_factory, "#log supino 80kg 10 9 8")
+    worker = WorkflowWorker(
+        session_factory=session_factory,
+        handlers=build_task_handlers(
+            workout=WorkoutApplicationService(
+                session_factory=session_factory,
+                sessions=TrainingSessionManager(timeout=timedelta(hours=3)),
+            ),
+            builder=SessionScopedCommandBuilder(session_factory),
+        ),
+    )
+
+    outcome = await worker.handle(payload)
+
+    assert outcome.executed is True
+    assert outcome.outbound_messages == 1
+    assert await _count(session_factory, TrainingSession) == 1
+    assert await _count(session_factory, SessionExercise) == 1
+    assert await _count(session_factory, ExerciseSet) == 3
+
+    async with session_factory() as session:
+        reply = (await session.scalars(sa.select(OutboundMessage.text))).one()
+
+    assert "Supino reto" in reply
+    assert ACKNOWLEDGEMENT not in reply
+
+
+async def test_an_ordinary_message_still_gets_the_acknowledgement(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Routing must not swallow everything else: a greeting is not a workout,
+    and the Sprint 1 path has to keep working unchanged."""
+    from app.application.services.training_sessions import TrainingSessionManager
+    from app.application.services.workout_command_builder import SessionScopedCommandBuilder
+    from app.application.services.workout_logging import WorkoutApplicationService
+    from app.graphs.main.handlers import build_task_handlers
+    from app.infrastructure.postgres.models import TrainingSession
+
+    payload = await _seed_batch(session_factory, "bom dia")
+    worker = WorkflowWorker(
+        session_factory=session_factory,
+        handlers=build_task_handlers(
+            workout=WorkoutApplicationService(
+                session_factory=session_factory,
+                sessions=TrainingSessionManager(timeout=timedelta(hours=3)),
+            ),
+            builder=SessionScopedCommandBuilder(session_factory),
+        ),
+    )
+
+    await worker.handle(payload)
+
+    async with session_factory() as session:
+        reply = (await session.scalars(sa.select(OutboundMessage.text))).one()
+
+    assert reply == ACKNOWLEDGEMENT
+    assert await _count(session_factory, TrainingSession) == 0

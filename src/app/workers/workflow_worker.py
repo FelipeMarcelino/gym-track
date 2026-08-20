@@ -14,6 +14,7 @@ the outbound rows are already durable when the ACK is sent.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -24,7 +25,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.events import DomainEventEnvelope
 from app.domain.results import DomainResult, ResultVisibility, TaskType
-from app.graphs.main.handlers import TaskInput, resolve_handler
+from app.graphs.main.handlers import (
+    TaskHandler,
+    TaskInput,
+    UnknownTaskTypeError,
+    build_task_handlers,
+)
+from app.graphs.main.routing import route
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
     DeliveryState,
@@ -60,12 +67,16 @@ class WorkflowWorker:
         self,
         *,
         session_factory: async_sessionmaker[AsyncSession],
-        task_type: TaskType = TaskType.CONVERSATION,
+        handlers: Mapping[TaskType, TaskHandler] | None = None,
+        router: Callable[[Sequence[str]], TaskType] = route,
     ) -> None:
         self._session_factory = session_factory
-        # Sprint 3 replaces this with a planner deciding the task type per
-        # batch; until then every batch is one conversation task.
-        self._task_type = task_type
+        #: Composed by the entrypoint, so a worker without the workout domain
+        #: simply does not offer LOG_WORKOUT rather than acknowledging one.
+        self._handlers = dict(handlers) if handlers is not None else build_task_handlers()
+        #: Sprint 3 replaces this with the IntentRouter. The signature is what
+        #: makes that a substitution rather than a rewrite.
+        self._router = router
 
     async def handle(self, body: dict[str, Any]) -> WorkflowOutcome:
         """Process one InputBatchReady. Safe to call twice with the same batch.
@@ -106,15 +117,18 @@ class WorkflowWorker:
                     )
 
                 execution.attempts += 1
-                texts = await self._batch_texts(session, message_batch_id)
+                messages = await self._batch_messages(session, message_batch_id)
+                texts = tuple(text for _, text in messages)
+                task_type = self._router(texts)
 
-                result = await resolve_handler(self._task_type)(
+                result = await self._handler_for(task_type)(
                     TaskInput(
-                        task_type=self._task_type,
+                        task_type=task_type,
                         message_batch_id=message_batch_id,
                         user_id=batch.user_id,
                         conversation_id=batch.conversation_id,
                         texts=texts,
+                        message_ids=tuple(message_id for message_id, _ in messages),
                     )
                 )
 
@@ -174,14 +188,29 @@ class WorkflowWorker:
         await session.flush()
         return execution, False
 
-    async def _batch_texts(self, session: AsyncSession, batch_id: UUID) -> tuple[str, ...]:
-        rows = await session.scalars(
-            sa.select(Message.text)
+    def _handler_for(self, task_type: TaskType) -> TaskHandler:
+        """The registry's handler, or a loud failure.
+
+        Falling back to the acknowledgement would turn a misconfigured worker
+        into one that tells users their training was received and writes
+        nothing -- the failure mode hardest to notice in production.
+        """
+        handler = self._handlers.get(task_type)
+        if handler is None:
+            raise UnknownTaskTypeError(task_type.value)
+        return handler
+
+    async def _batch_messages(
+        self, session: AsyncSession, batch_id: UUID
+    ) -> tuple[tuple[UUID, str], ...]:
+        """The batch's fragments with the messages they came from (§26.2)."""
+        rows = await session.execute(
+            sa.select(Message.id, Message.text)
             .join(MessageBatchItem, MessageBatchItem.message_id == Message.id)
             .where(MessageBatchItem.message_batch_id == batch_id)
             .order_by(MessageBatchItem.position)
         )
-        return tuple(text for text in rows.all() if text is not None)
+        return tuple((message_id, text) for message_id, text in rows.all() if text is not None)
 
     async def _persist_result(
         self,

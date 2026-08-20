@@ -18,6 +18,8 @@ from collections.abc import Callable, Sequence
 from decimal import Decimal
 from uuid import UUID
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from app.application.commands.workout import (
     ActivityCommand,
     BuildOutcome,
@@ -46,6 +48,7 @@ from app.domain.training.units import (
     to_seconds,
 )
 from app.domain.training.validation import ActivityValidator, IssueCode, ValidationOutcome
+from app.infrastructure.postgres.exercise_catalog import PostgresExerciseCatalog
 
 logger = logging.getLogger(__name__)
 
@@ -307,3 +310,40 @@ class WorkoutCommandBuilder:
             for group in structured.groups
             if group.ref in referenced
         )
+
+
+class SessionScopedCommandBuilder:
+    """A builder that gets a fresh catalog per call.
+
+    `PostgresExerciseCatalog` caches its searchable listing for the life of the
+    session it was given, which is right for one request and wrong for a
+    process: an alias a user teaches us in Sprint 3 has to be visible on their
+    next message, not after the next deploy. Opening a short session here is
+    what keeps that true without pushing session management into the handler.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def build(
+        self,
+        structured: StructuredWorkoutInput,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        message_batch_id: UUID,
+        source_message_ids: Sequence[UUID],
+    ) -> BuildOutcome:
+        async with self._session_factory() as session:
+            builder = WorkoutCommandBuilder(
+                resolver=ExerciseResolver(PostgresExerciseCatalog(session)),
+                validator=ActivityValidator(),
+                effort=EffortNormalizer(),
+            )
+            return await builder.build(
+                structured,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message_batch_id=message_batch_id,
+                source_message_ids=source_message_ids,
+            )
