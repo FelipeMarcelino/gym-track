@@ -22,6 +22,7 @@ from app.domain.training.activities import ActivityType, LoadMode, SetType
 from app.domain.training.input_contract import (
     SCHEMA_VERSION,
     StructuredActivityInput,
+    StructuredGroupInput,
     StructuredSetInput,
     StructuredWorkoutInput,
 )
@@ -69,6 +70,19 @@ def test_a_schema_version_this_code_does_not_know_is_refused() -> None:
 def test_an_activity_needs_a_name_to_be_worth_anything() -> None:
     with pytest.raises(ValidationError):
         StructuredActivityInput.model_validate({"raw_name": ""})
+
+
+@pytest.mark.parametrize("payload", [{"raw_name": "supino", "group_ref": ""}])
+def test_an_empty_group_reference_is_refused(payload: dict[str, str]) -> None:
+    """An empty string is falsey everywhere downstream, so it would read as "no
+    group" while the producer believed it had named one."""
+    with pytest.raises(ValidationError):
+        StructuredActivityInput.model_validate(payload)
+
+
+def test_a_group_needs_a_reference_something_can_point_at() -> None:
+    with pytest.raises(ValidationError):
+        StructuredGroupInput.model_validate({"ref": "", "group_type": "superset"})
 
 
 def test_the_contract_is_immutable_once_parsed() -> None:

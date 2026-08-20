@@ -20,6 +20,7 @@ from app.application.commands.workout import (
     DeferralReason,
     EmptyCommandError,
     LogWorkoutCommand,
+    operation_id_for,
 )
 from app.application.services.exercise_resolver import ExerciseResolver
 from app.application.services.workout_command_builder import WorkoutCommandBuilder
@@ -67,7 +68,6 @@ async def _build(builder: WorkoutCommandBuilder, structured: StructuredWorkoutIn
         conversation_id=CONVERSATION,
         message_batch_id=BATCH,
         source_message_ids=MESSAGES,
-        operation_id=f"log_workout:{BATCH}",
     )
 
 
@@ -380,7 +380,7 @@ def test_a_command_with_nothing_in_it_cannot_be_constructed() -> None:
     describing work that does not exist."""
     with pytest.raises(EmptyCommandError):
         LogWorkoutCommand(
-            operation_id="log_workout:x",
+            operation_id=operation_id_for(BATCH),
             user_id=USER,
             conversation_id=CONVERSATION,
             message_batch_id=BATCH,
@@ -392,6 +392,23 @@ def test_a_command_with_nothing_in_it_cannot_be_constructed() -> None:
 # --------------------------------------------------------------------------
 # Groups (Q51)
 # --------------------------------------------------------------------------
+
+
+async def test_an_activity_with_no_sets_is_deferred_rather_than_written(
+    builder: WorkoutCommandBuilder,
+) -> None:
+    """ "Fiz supino hoje" is a real thing to say and not a workout yet. A block
+    with no sets records that an exercise happened and nothing about it, which
+    is worse than asking."""
+    outcome = await _build(builder, _input(StructuredActivityInput(raw_name="supino")))
+
+    assert outcome.command is None  # type: ignore[attr-defined]
+    assert outcome.deferred[0].reason is DeferralReason.MISSING_ESSENTIAL_DATA  # type: ignore[attr-defined]
+
+
+async def test_a_command_only_ever_carries_the_key_the_batch_implies() -> None:
+    """The invariant WS-9 leans on, asserted at the type rather than trusted."""
+    assert operation_id_for(BATCH) == f"log_workout:{BATCH}"
 
 
 async def test_a_superset_reaches_the_command_with_its_members(
@@ -452,7 +469,10 @@ async def test_the_operation_id_is_derived_from_the_batch(
     builder: WorkoutCommandBuilder,
 ) -> None:
     """A redelivery has to compute the same key without carrying state, or
-    at-least-once delivery writes the workout twice (DEC-005)."""
+    at-least-once delivery writes the workout twice (DEC-005). The builder
+    computes it rather than accepting one: a caller that passed a fresh value
+    for the same batch would bypass `processed_operations` entirely, and
+    nothing downstream could tell."""
     structured = _input(
         StructuredActivityInput(
             raw_name="supino", sets=(StructuredSetInput(repetitions=10, load="80kg"),)

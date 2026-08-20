@@ -26,10 +26,11 @@ from app.application.commands.workout import (
     GroupCommand,
     LogWorkoutCommand,
     SetCommand,
+    operation_id_for,
 )
 from app.application.ports.exercise_catalog import CatalogEntry
 from app.application.services.exercise_resolver import ExerciseResolver
-from app.domain.training.activities import ActivityDraft, ActivityType, LoadMode
+from app.domain.training.activities import ActivityDraft, ActivityField, ActivityType, LoadMode
 from app.domain.training.effort import EffortNormalizer
 from app.domain.training.inheritance import InheritedSet, inherit_within_block
 from app.domain.training.input_contract import StructuredActivityInput, StructuredWorkoutInput
@@ -83,7 +84,6 @@ class WorkoutCommandBuilder:
         conversation_id: UUID,
         message_batch_id: UUID,
         source_message_ids: Sequence[UUID],
-        operation_id: str,
     ) -> BuildOutcome:
         """Resolve, inherit, convert, validate, and keep only what commits."""
         activities: list[ActivityCommand] = []
@@ -102,7 +102,7 @@ class WorkoutCommandBuilder:
 
         return BuildOutcome(
             command=LogWorkoutCommand(
-                operation_id=operation_id,
+                operation_id=operation_id_for(message_batch_id),
                 user_id=user_id,
                 conversation_id=conversation_id,
                 message_batch_id=message_batch_id,
@@ -129,6 +129,18 @@ class WorkoutCommandBuilder:
                         else DeferralReason.UNRESOLVED_EXERCISE
                     ),
                     candidates=resolution.candidates,
+                )
+            )
+
+        if not structured.sets:
+            # "Fiz supino hoje" is a real thing to say and not a workout yet.
+            # A block with no sets records that an exercise happened and
+            # nothing about it, which is worse than asking (Q46).
+            raise _ActivityDeferred(
+                DeferredItem(
+                    raw_name=structured.raw_name,
+                    reason=DeferralReason.MISSING_ESSENTIAL_DATA,
+                    missing_field=ActivityField.REPETITIONS,
                 )
             )
 

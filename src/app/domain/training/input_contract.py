@@ -58,13 +58,15 @@ class StructuredActivityInput(BaseModel):
     sets: tuple[StructuredSetInput, ...] = ()
     #: Effort reported for the exercise as a whole (§14.3).
     effort: str | None = None
-    group_ref: str | None = None
+    #: An empty string is falsey everywhere downstream, so it would read as "no
+    #: group" while the producer believed it had named one.
+    group_ref: str | None = Field(default=None, min_length=1)
 
 
 class StructuredGroupInput(BaseModel):
     model_config = _CONTRACT
 
-    ref: str
+    ref: str = Field(min_length=1)
     group_type: ExerciseGroupType
     rounds: int | None = None
 

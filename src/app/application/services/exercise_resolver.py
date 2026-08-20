@@ -56,26 +56,18 @@ class ExerciseResolver:
 
         Callers that go on to build something need the row's `is_bodyweight`
         and `uses_implements` (Q49), and the resolution itself cannot carry
-        them: it is a domain type, and `CatalogEntry` belongs to the port. The
-        entry is None exactly when nothing resolved.
+        them: it is a domain type, and `CatalogEntry` belongs to the port.
+
+        Every stage already holds the row when it hits, so the entry costs
+        nothing here. Looking it up afterwards would have loaded the whole
+        catalog on the path the stage order exists to keep cheap.
         """
-        resolution = await self.resolve(raw_name, user_id=user_id)
-        if resolution.exercise_id is None:
-            return resolution, None
-
-        for searchable in await self._catalog.all_searchable():
-            if searchable.entry.exercise_id == resolution.exercise_id:
-                return resolution, searchable.entry
-        return resolution, None  # pragma: no cover - a resolved id is in the catalog
-
-    async def resolve(self, raw_name: str, *, user_id: UUID) -> ExerciseResolution:
-        """Stages 1-4 in the normative order, first hit wins."""
         normalized = normalize_for_match(raw_name)
         if not normalized:
             # Nothing to match. Fuzzy scoring an empty string against every
             # term produces noise, and the honest answer is that we did not
             # understand rather than a candidate list built from nothing.
-            return ExerciseResolution(raw_name=raw_name, requires_clarification=True)
+            return ExerciseResolution(raw_name=raw_name, requires_clarification=True), None
 
         # Awaited one at a time, and only when the stage before it came back
         # empty. Building this as a tuple ran all three every time: each is a
@@ -83,17 +75,22 @@ class ExerciseResolver:
         # in a stage nobody needed would discard a hit that already succeeded.
         entry = await self._catalog.by_user_alias(normalized, user_id)
         if entry is not None:
-            return self._exact(raw_name, entry, ResolutionMethod.USER_ALIAS)
+            return self._exact(raw_name, entry, ResolutionMethod.USER_ALIAS), entry
 
         entry = await self._catalog.by_global_alias(normalized)
         if entry is not None:
-            return self._exact(raw_name, entry, ResolutionMethod.GLOBAL_ALIAS)
+            return self._exact(raw_name, entry, ResolutionMethod.GLOBAL_ALIAS), entry
 
         entry = await self._catalog.by_canonical_name(normalized)
         if entry is not None:
-            return self._exact(raw_name, entry, ResolutionMethod.CANONICAL)
+            return self._exact(raw_name, entry, ResolutionMethod.CANONICAL), entry
 
         return await self._fuzzy(raw_name, normalized)
+
+    async def resolve(self, raw_name: str, *, user_id: UUID) -> ExerciseResolution:
+        """Stages 1-4 in the normative order, first hit wins."""
+        resolution, _ = await self.resolve_entry(raw_name, user_id=user_id)
+        return resolution
 
     def _exact(
         self, raw_name: str, entry: CatalogEntry, method: ResolutionMethod
@@ -106,26 +103,32 @@ class ExerciseResolver:
             confidence=1.0,
         )
 
-    async def _fuzzy(self, raw_name: str, normalized: str) -> ExerciseResolution:
-        ranked = await self._ranked_candidates(normalized)
+    async def _fuzzy(
+        self, raw_name: str, normalized: str
+    ) -> tuple[ExerciseResolution, CatalogEntry | None]:
+        scored = await self._ranked_candidates(normalized)
+        ranked = [candidate for candidate, _ in scored]
 
         if not ranked or ranked[0].score < self._medium_confidence:
             # Nothing close enough to be worth showing. Offering the best of a
             # bad list invites the user to confirm something we invented.
-            return ExerciseResolution(raw_name=raw_name, requires_clarification=True)
+            return ExerciseResolution(raw_name=raw_name, requires_clarification=True), None
 
         best = ranked[0]
         runner_up = ranked[1] if len(ranked) > 1 else None
         too_close = runner_up is not None and best.score - runner_up.score <= self._ambiguity_margin
 
         if best.score >= self._high_confidence and not too_close:
-            return ExerciseResolution(
-                raw_name=raw_name,
-                exercise_id=best.exercise_id,
-                canonical_name=best.canonical_name,
-                method=ResolutionMethod.FUZZY,
-                confidence=best.score,
-                candidates=tuple(ranked),
+            return (
+                ExerciseResolution(
+                    raw_name=raw_name,
+                    exercise_id=best.exercise_id,
+                    canonical_name=best.canonical_name,
+                    method=ResolutionMethod.FUZZY,
+                    confidence=best.score,
+                    candidates=tuple(ranked),
+                ),
+                scored[0][1],
             )
 
         if best.score >= self._high_confidence:
@@ -135,30 +138,38 @@ class ExerciseResolver:
                 "exercise resolution is ambiguous",
                 extra={"raw_name": raw_name, "candidates": len(ranked)},
             )
-            return ExerciseResolution(
-                raw_name=raw_name,
-                candidates=tuple(ranked),
-                confidence=best.score,
-                requires_clarification=True,
+            return (
+                ExerciseResolution(
+                    raw_name=raw_name,
+                    candidates=tuple(ranked),
+                    confidence=best.score,
+                    requires_clarification=True,
+                ),
+                None,
             )
 
         # The middle band: probably this, not sure enough to write it. The
         # caller may ask; Sprint 3's LLM stage takes this case.
-        return ExerciseResolution(
-            raw_name=raw_name,
-            candidates=tuple(ranked),
-            confidence=best.score,
-            requires_clarification=False,
+        return (
+            ExerciseResolution(
+                raw_name=raw_name,
+                candidates=tuple(ranked),
+                confidence=best.score,
+                requires_clarification=False,
+            ),
+            None,
         )
 
-    async def _ranked_candidates(self, normalized: str) -> list[ResolutionCandidate]:
+    async def _ranked_candidates(
+        self, normalized: str
+    ) -> list[tuple[ResolutionCandidate, CatalogEntry]]:
         """Best score per exercise, best first.
 
         Scored against every term rather than the canonical name alone: "rdl"
         and "levantamento terra romeno" are the same exercise reached by very
         different strings, and only one of them looks like the row.
         """
-        candidates: list[ResolutionCandidate] = []
+        candidates: list[tuple[ResolutionCandidate, CatalogEntry]] = []
         for searchable in await self._catalog.all_searchable():
             # `token_sort_ratio` rather than `WRatio`, which the plan named.
             # WRatio falls back to a partial ratio when the lengths differ, so
@@ -174,16 +185,19 @@ class ExerciseResolver:
                 default=0.0,
             )
             candidates.append(
-                ResolutionCandidate(
-                    exercise_id=searchable.entry.exercise_id,
-                    canonical_name=searchable.entry.canonical_name,
-                    score=best_term / 100.0,
+                (
+                    ResolutionCandidate(
+                        exercise_id=searchable.entry.exercise_id,
+                        canonical_name=searchable.entry.canonical_name,
+                        score=best_term / 100.0,
+                    ),
+                    searchable.entry,
                 )
             )
 
-        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        candidates.sort(key=lambda scored: scored[0].score, reverse=True)
         return [
-            candidate
-            for candidate in candidates[: self._max_candidates]
-            if candidate.score >= self._medium_confidence
+            scored
+            for scored in candidates[: self._max_candidates]
+            if scored[0].score >= self._medium_confidence
         ]

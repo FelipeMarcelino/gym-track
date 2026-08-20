@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from typing import Final
 from uuid import UUID
 
 from app.domain.exercises.resolution import ResolutionCandidate
@@ -22,6 +23,20 @@ from app.domain.training.activities import ActivityField, ActivityType, LoadMode
 from app.domain.training.effort import NormalizedEffort
 from app.domain.training.metrics import DerivedMetric
 from app.domain.training.provenance import ExerciseGroupType, Provenance
+
+#: Prefix of every log-workout idempotency key.
+OPERATION_PREFIX: Final = "log_workout"
+
+
+def operation_id_for(message_batch_id: UUID) -> str:
+    """The idempotency key a batch implies (DEC-005).
+
+    A function rather than a convention, because two places have to agree on it
+    exactly -- the builder that stamps the command and WS-9's handler that
+    checks `processed_operations` -- and a redelivery has to reach the same
+    string with no state carried between attempts.
+    """
+    return f"{OPERATION_PREFIX}:{message_batch_id}"
 
 
 class EmptyCommandError(ValueError):
@@ -101,6 +116,16 @@ class LogWorkoutCommand:
     groups: tuple[GroupCommand, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.operation_id != operation_id_for(self.message_batch_id):
+            # Documented invariants that nothing checks are invariants until
+            # the first caller who did not read the comment. A mismatched key
+            # silently disables deduplication, and the second copy of the
+            # workout is what tells you.
+            raise ValueError(
+                f"operation_id must be {operation_id_for(self.message_batch_id)!r} for this "
+                f"batch, got {self.operation_id!r}; a key that does not follow from the batch "
+                "cannot deduplicate a redelivery"
+            )
         if not self.activities:
             raise EmptyCommandError(
                 "a log-workout command must carry at least one activity; committing an empty "
