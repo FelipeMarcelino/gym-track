@@ -215,14 +215,19 @@ a merge, one PR each, reviewed and CI-green before merging.
    response group; INTERNAL results contribute facts and no prose (§25).
 3. `response_normalizer` is the deterministic pass-through this sprint — the
    templates Sprint 2 already writes — behind a `ResponseNormalizerPort`.
-4. `response_guard` compares every verifiable fact against the segment of the
-   reply that describes **that entity** — not against the whole text. "Supino
-   100 kg; agachamento 80 kg" contains every expected name and number, unaltered,
-   with the two loads swapped; a does-it-appear-anywhere check passes it and
-   tells the user they lifted weights they did not lift. So the normalizer port
-   returns segments keyed by entity and prose is rendered after the check. A
-   missing or misattributed fact fails the guard, and the §25 deterministic
-   fallback is what the user receives (Q62, Q136, DEC-004).
+4. `response_guard` reads the rule the other way round from the obvious one:
+   **every number in a segment must be a fact of that segment's entity.**
+   Omitting is allowed — "Registrei Supino reto (3 séries)" states no loads and
+   is a good confirmation, and Q136 forbids *changing* facts, not summarising
+   them. Inventing and misattributing are not. "Supino 100 kg; agachamento
+   80 kg" contains every expected name and number, unaltered, with the loads
+   swapped; checking that each fact appears *somewhere* passes it and tells the
+   user they lifted weights they did not. So the normalizer returns segments
+   keyed by entity, a segment may not state values more specific than its key —
+   which forces per-set numbers into per-set segments, where the same swap
+   between two sets of one exercise is caught too — and prose is rendered after
+   the check. A violation means the §25 deterministic fallback (Q62, Q136,
+   DEC-004).
 5. The workflow ends `PARTIAL_SUCCESS` when at least one task committed and at
    least one failed or is skipped — no global rollback of unrelated work (Q28).
 6. Tests: a normalizer that drops the load fails the guard and the user gets the
@@ -239,10 +244,14 @@ a merge, one PR each, reviewed and CI-green before merging.
    provider delivery (Q130), redelivery of a completed batch producing nothing.
 3. **The seam that matters:** the checkpointer writes on its own connection, in
    its own transaction. A domain transaction that rolls back after a checkpoint
-   was written leaves a checkpoint describing work that does not exist. The
-   answer is the one DEC-005 already gives — business effects are idempotent and
-   `processed_operations` is authoritative, never the checkpoint — and this
-   workstream proves it with failure injection rather than asserting it.
+   was written leaves a checkpoint describing work that does not exist — and the
+   failure that causes is not a duplicate but an **absence**: the redelivery
+   resumes a thread that believes the work is done, so the handler never re-runs
+   and the workout is simply missing. Idempotency does not rewind a checkpoint.
+   The reconciliation is therefore explicit: a retry runs in a fresh namespace
+   (`execution:attempt`), a resume forks from the `checkpoint_id` stored in
+   `pending_clarifications`, and the database decides what happened while the
+   checkpoint only decides where to continue from.
 4. Tests: the existing worker, integration and E2E suites pass **unchanged** in
    observable behaviour; a batch redelivered after a checkpoint write but before
    the domain commit produces exactly one set; a workflow whose graph raises
@@ -264,14 +273,19 @@ a merge, one PR each, reviewed and CI-green before merging.
    the pending item would write. The committed part carries the operation id it
    already had; the resumed part gets its own, derived from `clarification_id`,
    so resuming cannot rewrite what is already there.
-4. **The pause is completed by the worker, not by the suspended graph.**
+4. **The pause carries what already committed**, not only the question. A mixed
+   batch writes one exercise and then interrupts on another; a reply built from
+   the question alone would never mention the workout that was recorded, and Q12
+   requires every successful registration to be confirmed. One message says all
+   three things: what was written, what is being asked, what was dropped.
+5. **The pause is completed by the worker, not by the suspended graph.**
    `interrupt()` stops everything downstream of it, so the nodes that would
    normally write the reply never run. The worker reads the pending interrupt
    out of the returned state and writes the `pending_clarifications` row, the
    outbound question and the `WAITING_FOR_USER` status in the one transaction it
    already owns (Q125, Q130). A row without a question, or a question without a
    row, are both worse than neither — so they commit together.
-5. Tests: `#log supino 80kg` writes zero sets, one WAITING row and one outbound
+6. Tests: `#log supino 80kg` writes zero sets, one WAITING row and one outbound
    question; a mixed batch writes the valid exercise and still asks about the
    other; the interrupt is proven to happen before the deferred item's write by
    asserting the row count, not by reading the code.
@@ -288,26 +302,32 @@ a merge, one PR each, reviewed and CI-green before merging.
    answer is not needed. §11.1's `resolve_pending_workflow` stays a node and
    records the decision; it does not compute it. The deviation is recorded in
    ADR-016.
-3. An ANSWER resumes the paused run — same thread, the paused execution's
+3. An ANSWER closes its row in the same transaction as the effects it produced —
+   status ANSWERED, `resolved_at`, the answering batch. Leaving it WAITING makes
+   the partial unique index refuse every future clarification in that
+   conversation: one missing write turns the feature off for that user.
+4. An ANSWER resumes the paused run — same thread, the paused execution's
    namespace — with `Command(resume=…)`, the deferred activity completes, and
    the confirmation names what was written. Two consequences the plan spells
    out: the sets are attributed to **both** messages, each paired with **its
    own** batch (§26.2 — a union of message ids would file the answer under the
    question's batch); and the paused execution reaches a terminal state instead
    of waiting forever, while the answer's own execution row points back to it.
-4. An answer that names an exercise is only an answer if it **resolves against
+5. An answer that names an exercise is only an answer if it **resolves against
    the catalog**. A free-text question that accepts any string would let "bom
    dia" close a pending workout.
-5. A NEW_INTENT starts its own workflow and **leaves the pending clarification
+6. A NEW_INTENT starts its own workflow and **leaves the pending clarification
    open** — Q29 says a pending question must not block unrelated work.
-6. An answered *exercise* clarification writes a **user-scoped alias** into
+7. An answered *exercise* clarification writes a **user-scoped alias** into
    `exercise_aliases` — the resolver's stage 1 exists to be taught, the grant
    for it was already written in Sprint 2, and a user who explains a word once
    should not be asked about it again.
-7. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
-   `session-expiration-worker`. An expired question is closed, never answered
-   later by an unrelated message.
-8. Tests: the two-message round trip persists the sets on the second message and
+8. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
+   `session-expiration-worker`. Closing the question is not enough — nothing can
+   resume its checkpoint afterwards, so the sweep also terminates the execution
+   and the interrupted task, in one transaction, or they wait forever and every
+   "what is waiting on a user" query is wrong from then on.
+9. Tests: the two-message round trip persists the sets on the second message and
    not the first; an answer arriving after expiry starts a new workflow instead
    of resuming a dead one; a `#log` during a pending clarification leaves the
    WAITING row untouched; a redelivered answer resumes once and writes one set;
@@ -358,6 +378,11 @@ that checks each line, not by agreement that it feels done.
 - [ ] `#log supino 80kg` writes zero `exercise_sets`, one WAITING `pending_clarifications` row, and one outbound question naming *repetições*.
 - [ ] Answering `8 8 8` resumes that workflow and writes three sets attributed to both messages through `entity_sources`.
 - [ ] A `#log` for a different exercise sent while a clarification is pending starts its own workflow and leaves the WAITING row untouched (Q29).
+- [ ] A reply that swaps two *sets* of one exercise fails the guard too, and a summary that omits loads passes.
+- [ ] A mixed batch's confirmation is not lost to the interrupt: one reply names what was written and what is being asked.
+- [ ] An answered clarification is closed, and a second question can be asked in that conversation afterwards.
+- [ ] An expired clarification leaves no execution and no task in `WAITING_FOR_USER`.
+- [ ] A resume whose transaction rolls back still writes the workout on redelivery — absence, not duplication, is what that proves against.
 - [ ] A reply that swaps two exercises' loads fails the guard, even though every name and number in it is unaltered.
 - [ ] No execution is left `WAITING_FOR_USER` after its question is answered, and the answer's row names the execution it resumed.
 - [ ] "bom dia" does not answer "como esse exercício se chama?" — the question stays open.

@@ -24,7 +24,8 @@ Two more items are named but **not yet measured**; measure them before writing t
 
 - **`interrupt()` semantics under a resumed thread with a modified input.** The plan assumes `Command(resume=value)` re-enters the interrupted node and that nodes before it do not re-run. Verify against the pinned version before WS-8 hardens around it.
 - **What `ainvoke` returns for a suspended graph.** WS-8 reads the pending interrupt out of it through a single accessor; confirm the shape in WS-4.
-- **`checkpoint_ns` as a top-level isolation key.** D4 uses it to keep two runs in one conversation apart. It is documented as the subgraph namespace, and using it this way must be verified before WS-9 depends on it. **Fallback:** a composite `thread_id` of `f"{conversation_id}:{execution_id}"`, which works but reads Q123 loosely and would need an ADR amendment saying so. Decide in WS-4, not in WS-9.
+- **`checkpoint_ns` as a top-level isolation key.** D4 uses it to keep two runs in one conversation apart. It is documented as the subgraph namespace, and using it this way must be verified before WS-9 depends on it. **Fallback:** a composite `thread_id` of `f"{conversation_id}:{execution_id}:{attempt}"`, which works but reads Q123 loosely and would need an ADR amendment saying so. Decide in WS-4, not in WS-9.
+- **Forking from an explicit `checkpoint_id`.** WS-7's reconciliation depends on a resume re-entering the interrupt point rather than the latest checkpoint of that namespace. **Fallback** if it will not: re-run the whole batch in a fresh namespace and let `processed_operations` absorb the already-committed half.
 - **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
 
 ## Decisions applied
@@ -251,6 +252,8 @@ pending_clarifications
   status                   varchar(64) not null check
   spec                     jsonb not null           -- the frozen ClarificationSpec
   expires_at               timestamptz not null
+  checkpoint_ns            text not null            -- where the pause lives
+  checkpoint_id            text not null            -- the exact point to fork from
   created_at               timestamptz not null default now()
   updated_at               timestamptz not null default now()
   resolved_at              timestamptz null
@@ -314,7 +317,7 @@ discards a user's open question is worse than one that refuses.
 
 ## Grants
 
-`ServiceName.WORKFLOW_WORKER`: `execution_tasks` `(SELECT, INSERT, UPDATE)`, `pending_clarifications` `(SELECT, INSERT, UPDATE)`. `ServiceName.SESSION_EXPIRATION_WORKER`: `pending_clarifications` `(SELECT, UPDATE)` — it closes expired questions and writes nothing else. No role gets DELETE: a clarification is resolved, never erased, because "what was the system waiting for when this went wrong" is the question these rows exist to answer.
+`ServiceName.WORKFLOW_WORKER`: `execution_tasks` `(SELECT, INSERT, UPDATE)`, `pending_clarifications` `(SELECT, INSERT, UPDATE)`. `ServiceName.SESSION_EXPIRATION_WORKER`: `pending_clarifications` `(SELECT, UPDATE)`, plus `workflow_executions` `(SELECT, UPDATE)` and `execution_tasks` `(SELECT, UPDATE)` — expiring a question has to terminate the execution and the task that were waiting on it, or they wait forever (WS-9). No role gets DELETE: a clarification is resolved, never erased, because "what was the system waiting for when this went wrong" is the question these rows exist to answer.
 
 ## Tests
 
@@ -503,16 +506,25 @@ def build_main_graph(
 ) -> CompiledStateGraph:
     """Compiled once, at process start (Q121)."""
 
-def thread_for(conversation_id: UUID, execution_id: UUID) -> dict[str, Any]:
+def thread_for(conversation_id: UUID, execution_id: UUID, attempt: int = 1,
+               *, checkpoint_id: str | None = None) -> dict[str, Any]:
     """`{"configurable": {"thread_id": ..., "checkpoint_ns": ...}}` (Q123, D4).
 
     The thread is the conversation, as Q123 requires. The namespace is the
-    execution, and it is not decoration: a conversation can have a paused
-    workflow *and* an unrelated new one at the same time (Q29 requires exactly
-    that). Sharing one namespace would make the new run the thread's latest
-    checkpoint, and the later `Command(resume=...)` would resume the wrong
-    thing while the pending row stayed open forever -- a question the database
-    says is answerable and the graph cannot answer.
+    execution *and its attempt*, and neither half is decoration:
+
+    * the execution, because a conversation can have a paused workflow **and**
+      an unrelated new one at the same time (Q29 requires exactly that), and
+      one shared namespace would make the new run the thread's latest
+      checkpoint -- the later `Command(resume=...)` would resume the wrong
+      thing while the pending row stayed open forever;
+    * the attempt, because a retry after a rolled-back transaction must not
+      inherit a checkpoint describing work the database never kept.
+
+    `checkpoint_id` is passed only on a resume, and it is read from
+    `pending_clarifications` rather than remembered: forking from the exact
+    point of the interrupt is what makes a redelivered answer re-run the
+    handler instead of resuming a half-finished attempt.
     """
 ```
 
@@ -588,7 +600,22 @@ The graph compiles at import of the entrypoint, runs end to end against fakes, a
 MAX_SCHEDULING_PASSES: Final = 64
 
 async def task_scheduler(state, runtime) -> Command:
-    """Send every READY task, then reduce results, until the plan is terminal.
+    """Run every READY task, then reduce results, until the plan is terminal.
+
+    **Sequentially within a pass, deliberately.** `ready()` returning several
+    tasks is a statement about dependencies, not an instruction to run them at
+    once: they all write through the worker's single `AsyncSession`, and a
+    SQLAlchemy session cannot serve concurrent operations -- two database-backed
+    tasks awaited together fail with session-state errors rather than finishing
+    faster. Giving each task its own session would give each its own
+    transaction, and losing "one interaction, one transaction" to parallelise
+    plans that are single-task this sprint (D6) is a bad trade.
+
+    So parallelism stays *derived and expressed* in the plan and *not yet
+    exercised* by the runtime. Sprint 4, which is when multi-task plans first
+    arrive from real traffic, decides between a session per task with an
+    explicit outer transaction and accepting per-task transactions. ADR-005
+    records that the choice was deferred on purpose rather than missed.
 
     The bound is not decoration: a plan whose `ready()` returns nothing while
     tasks remain PENDING is a bug in WS-3, and without a bound it presents as a
@@ -617,12 +644,12 @@ async def record_transition(session, *, execution_id: UUID, task: PlannedTask,
 
 `tests/graph/test_task_scheduler.py`
 
-- `test_two_independent_tasks_run_from_one_pass`.
+- `test_two_independent_tasks_both_run_from_one_pass` — both reach COMPLETED from a single scheduling pass. It asserts *that* they run, not that they overlap; a test asserting concurrency would be asserting the bug above.
 - `test_a_dependant_runs_only_after_its_dependency_completed`.
 - `test_a_failing_handler_marks_its_task_failed_and_keeps_going` — the independent sibling still COMPLETED, the plan's outcome `PARTIAL_SUCCESS`.
 - `test_a_failing_handler_does_not_kill_the_workflow` — no exception escapes the scheduler; the error is recorded.
 - `test_the_scheduler_is_bounded` — a plan rigged to never progress raises rather than spinning.
-- `test_concurrent_results_do_not_clobber_each_other` — two tasks resolving at once, both present in `task_results` (the reducer).
+- `test_results_from_one_pass_do_not_clobber_each_other` — both tasks of a pass are present in `task_results`. The reducer is written for the day the runtime does overlap them, and is cheap to have correct early.
 
 `tests/integration/test_execution_tasks.py`
 
@@ -712,14 +739,23 @@ def verifiable_facts(results: Sequence[DomainResult]) -> Mapping[str, str]:
 
 def check(segments: Sequence[NormalizedSegment],
           facts: Mapping[str, str]) -> tuple[GuardViolation, ...]:
-    """Every fact must appear **in its own entity's segment**, unaltered.
+    """**Every number in a segment must be a fact of that segment's entity.**
 
-    Two rules, and the second is the one that matters:
+    Stated that way round on purpose, after two rounds of getting it wrong:
 
-    * a fact missing from its segment is a `missing` violation;
-    * a value that belongs to another entity appearing in this one is an
-      `altered` violation -- which is what catches a swap that a
-      does-it-appear-anywhere check waves through.
+    * A normalizer may *omit*. "Registrei Supino reto (3 séries)" states no
+      loads and is a perfectly good confirmation -- Q136 forbids *changing*
+      verifiable facts, not summarising them. A guard that demanded every fact
+      appear would reject the deterministic template this sprint ships.
+    * A normalizer may not *invent or misattribute*. A number in a segment that
+      is not a fact of that segment's entity is an `altered` violation, whether
+      it came from another exercise, another set, or nowhere.
+    * A segment may not state a value more specific than its key. Per-set
+      numbers in an exercise-level segment are a violation by definition, which
+      is what forces set-level swaps into set-level segments where the rule
+      above catches them. Without this clause, one exercise whose set 1 was
+      80 kg and set 2 was 100 kg can have the two swapped inside a single
+      exercise segment and pass -- the cross-exercise bug, one level down.
 
     Numbers are compared as numbers: "3 séries" satisfies `sets=3`,
     "três séries" does not, and "4 séries" is a violation rather than a
@@ -739,8 +775,14 @@ class NormalizedSegment:
     and has swapped the two loads -- a substring check passes it and the user
     is told they lifted weights they did not lift. Segments make each value
     checkable against the entity it belongs to; rendering is a join afterwards.
+
+    `entity_key` matches the fact keys: `""` for prose owning no entity,
+    `"supino_reto.block_0"` for an exercise, `"supino_reto.block_0.set_1"` for
+    one set. **A segment must be as specific as the values it states** -- see
+    the rule below, which is what stops the same swap from reappearing one
+    level down, between two sets of the same exercise.
     """
-    entity_key: str          # "" for prose that belongs to no single entity
+    entity_key: str
     text: str
 
 class ResponseNormalizerPort(Protocol):
@@ -764,9 +806,13 @@ Fallback behaviour (§25): when `check()` returns violations, the guard logs the
 
 `tests/domain/test_response_guard.py`
 
-- `test_a_dropped_load_is_a_violation` / `test_an_altered_repetition_count_is_a_violation`.
+- `test_an_altered_load_is_a_violation` / `test_an_altered_repetition_count_is_a_violation`.
+- `test_a_summary_that_omits_the_loads_passes` — the template this sprint ships states no loads, and a guard that rejected it would be a guard nothing can satisfy.
+- `test_an_invented_number_is_a_violation` — a load nobody recorded is refused even though it contradicts no fact directly.
 - `test_a_reworded_sentence_with_every_fact_intact_passes` — the guard must not become a template-equality check, or Sprint 4's normalizer can never pass it.
 - `test_swapped_loads_between_two_exercises_are_caught` — "Supino 100 kg; agachamento 80 kg" when the database says the opposite. Every name and every number is present and unaltered; the association is wrong. **The test a substring guard fails and this design exists for.**
+- `test_swapped_loads_between_two_sets_are_caught` — the same swap one level down, inside one exercise. Caught because per-set values force per-set segments.
+- `test_per_set_values_in_an_exercise_segment_are_refused` — the clause that makes the test above possible, asserted directly.
 - `test_the_same_exercise_in_two_blocks_keeps_both` — an A-B-A workout produces facts for both blocks and the guard checks both (Q58).
 - `test_numbers_are_compared_as_numbers` — `sets=3` against "3 séries" passes, against "4 séries" fails.
 - `test_an_internal_result_contributes_facts_and_no_prose`.
@@ -777,6 +823,7 @@ Fallback behaviour (§25): when `check()` returns violations, the guard logs the
 
 - `test_a_lying_normalizer_is_overruled` — a fake normalizer that halves the load; the user receives the deterministic fallback and the violation is logged. **The guard is proven to fail, not only asserted to pass.**
 - `test_a_normalizer_that_swaps_two_exercises_facts_is_overruled` — the same, for the association case.
+- `test_this_sprints_normalizer_passes_its_own_guard` — the template and the guard shipped together, so neither is written to a shape the other cannot meet.
 - `test_the_confirmation_still_arrives_when_the_guard_fires` — Q12.
 - `test_two_visible_results_keep_their_plan_order` — sequences 0 and 1, in plan order.
 - `test_partial_success_says_both_things` — one committed task and one failed task produce a reply naming what was recorded and what was not.
@@ -835,12 +882,48 @@ class WorkflowWorker:
 
 ## The seam, stated plainly
 
-The checkpointer commits on a psycopg connection; the domain commits on ours. There is a window in which a checkpoint exists for a domain transaction that then rolled back. This is **not** fixed by ordering, and the plan does not pretend otherwise. It is survivable because of what Sprint 2 already built:
+The checkpointer commits on a psycopg connection; the domain commits on ours.
+There is a window in which a checkpoint exists for a domain transaction that
+then rolled back. This is **not** fixed by ordering.
 
-- `processed_operations` is the authority on whether a business effect happened. A resumed graph that re-runs a command finds the claim taken and writes nothing.
-- The checkpoint is coordination state. Being ahead of the domain costs a redundant node execution, never a duplicate row.
+The first two rounds of this plan said "`processed_operations` is authoritative,
+so a redelivery is safe" and stopped there. That is only half of it, and the
+missing half fails in the *opposite* direction to a duplicate:
 
-WS-7 does not argue this. It injects the failure and counts rows.
+> Nothing was committed, so nothing claimed an operation id — but the checkpoint
+> advanced. The redelivery resumes a thread that believes the work is done, the
+> handler never runs again, and the user's workout is **absent** while every
+> record says the run finished. Idempotency does not rewind a checkpoint.
+
+So the reconciliation is explicit, and it is built out of the only thing that is
+authoritative: SQL.
+
+**A fresh run gets a namespace nobody has used.**
+`checkpoint_ns = f"{execution_id}:{attempt}"`, and `attempts` is a column
+`workflow_executions` has carried since Sprint 1. A retry after a rolled-back
+attempt therefore starts from an empty namespace and re-executes honestly,
+rather than inheriting a checkpoint that describes work the database never kept.
+
+**A resume forks from the checkpoint the interrupt was taken at, every time.**
+`pending_clarifications` stores `checkpoint_ns` and `checkpoint_id` at the moment
+of suspension — durable, in the same transaction as the WAITING row — and the
+resume config carries both. A redelivered answer forks from the same point again
+instead of resuming wherever the last attempt died, and the double-commit that
+this could cause is precisely what `processed_operations` *is* good at.
+
+**The direction of authority, stated once:** the database decides what happened;
+the checkpoint only decides where to continue from, and only when the database
+says something is still waiting. A checkpoint that disagrees is discarded by
+choosing a different namespace, never trusted.
+
+Forking from an explicit `checkpoint_id` is on the **unmeasured** list at the top
+of this file. If the pinned version will not fork, the fallback is to re-run the
+whole workflow for that batch in a fresh namespace and let idempotency absorb the
+committed half — worse for a redundant model call in Sprint 4, identical for
+correctness. Decide in WS-4.
+
+WS-7 does not argue any of this. It injects failures on both sides and counts
+rows.
 
 ## Tests
 
@@ -853,7 +936,8 @@ WS-7 does not argue this. It injects the failure and counts rows.
 
 `tests/e2e/test_checkpoint_failure_injection.py`
 
-- `test_a_checkpoint_ahead_of_a_rollback_still_yields_one_set` — inject a failure after the checkpoint write and before the domain commit; redeliver; assert exactly one set, one audit row, one outbound message.
+- `test_a_checkpoint_ahead_of_a_rollback_still_yields_one_set` — inject a failure after the checkpoint write and before the domain commit; redeliver; assert exactly one set, one audit row, one outbound message. **Not zero:** the retry must run in a fresh namespace, so this test fails if the attempt is left out of the namespace.
+- `test_a_rolled_back_resume_still_writes_the_workout` — the same injection on the resume path, which is where the absent-workout failure actually bites: the answer is redelivered, forks from the stored checkpoint again, and the sets exist afterwards.
 - `test_a_crash_between_commit_and_ack_does_not_double_the_reply` — Sprint 1's guarantee, re-proven through the graph.
 
 ## Done when
@@ -947,7 +1031,23 @@ exactly what D11's one-open-question-per-conversation invariant already implies.
 ```python
 # graphs/main/interrupts.py  -- the only module in the repo that imports interrupt()
 
-def ask(spec: ClarificationSpec) -> ClarificationAnswer:
+@dataclass(frozen=True, slots=True)
+class Suspension:
+    """Everything the worker needs to speak for a workflow that stopped.
+
+    The spec alone is not enough. A mixed batch commits one exercise and then
+    interrupts on another: a reply built from the question only would ask about
+    the ambiguous item and never mention the workout that *was* recorded, and
+    Q12 requires every successful registration to be confirmed. The committed
+    result and the deferrals that are not resumable travel with the pause so
+    the worker can say all three things in one message -- which is exactly what
+    Sprint 2's `partial_confirmation` already composes.
+    """
+    spec: ClarificationSpec
+    committed: WorkoutLoggedResult | None
+    dropped: tuple[DeferredItem, ...]
+
+def ask(suspension: Suspension) -> ClarificationAnswer:
     """Suspend this workflow until the user answers. Returns the parsed answer
     when the graph is resumed with Command(resume=...)."""
 ```
@@ -959,7 +1059,8 @@ build the command from the batch
   -> if there are valid activities:
          commit them          # operation_id_for(message_batch_id), unchanged
   -> if there are deferrals that are answerable:
-         ask(spec)            # <- the interrupt; nothing after this line runs now
+         ask(Suspension(spec, committed=result, dropped=the rest))
+                              # <- the interrupt; nothing after this line runs now
   -> confirmation naming what was written and what is still open
 ```
 
@@ -975,19 +1076,22 @@ transaction it already owns (WS-7):
 ```text
 state = await graph.ainvoke(initial_state, config=thread_for(conversation_id))
 
-if interrupt_of(state) is not None:          # LangGraph reports the pending interrupt
-    spec = interrupt_of(state)
-    write pending_clarifications(spec)       # WAITING, expires_at = now + D10
-    write outbound_messages(question_for(spec))   # the same response-group path
+if interrupt_of(state) is not None:              # LangGraph reports the pending interrupt
+    pause = interrupt_of(state)                  # a Suspension
+    write pending_clarifications(pause.spec)     # WAITING, expires_at = now + D10,
+                                                 # checkpoint_ns and checkpoint_id stored
+    write outbound_messages(reply_for(pause))    # confirmation + question + dropped items
     execution.status = WAITING_FOR_USER
     # commit, then ACK -- unchanged from Q130
 ```
 
 Three consequences worth stating, because each is a test below:
 
-- The question text is built by `question_for(spec)` in
-  `domain/clarification/questions.py` — a pure function, reusing Sprint 2's
-  `clarification_request()` phrasing so the user sees the same sentences as today.
+- The reply is built by `reply_for(suspension)` in
+  `domain/clarification/questions.py` — a pure function that composes what was
+  recorded, what is being asked, and what was dropped, reusing Sprint 2's
+  `partial_confirmation()` and `clarification_request()` so the user sees the
+  same sentences as today.
 - It goes through `outbound_messages` and the outbox like every other reply, so
   the dispatcher, the retry tiers and the ordering guarantee all still apply.
   Nothing about the outbound path is special-cased for clarifications.
@@ -1004,6 +1108,17 @@ Two further rules that the tests exist to pin down:
 
 - **Commit before interrupting, never after.** Q56 requires the valid activities to be persisted, and Q126 requires the interrupt to precede the *dependent* side effect — the deferred item's rows, which is exactly what is not written yet. The clarification row and the question are not dependent side effects; they are how the pause becomes visible.
 - **The resumed write uses a different idempotency key.** `operation_id_for(batch)` is already claimed by the commit above. The resumed command uses `operation_id_for_clarification(clarification_id)`, so resuming cannot collide with, or be swallowed by, the claim the first delivery took.
+
+  This is **not** free: Sprint 2's `LogWorkoutCommand.__post_init__` raises
+  unless `operation_id == operation_id_for(self.message_batch_id)` — an
+  invariant added deliberately, after a test was caught passing its own key in
+  and asserting it came back out. Adding the helper alone makes every resumed
+  workout fail at construction. So the command gains
+  `clarification_id: str | None = None` and the check becomes: with a
+  clarification id, the key must equal `operation_id_for_clarification(...)`;
+  without one, it must equal `operation_id_for(batch)`. Neither branch may be
+  satisfied by a caller-supplied key, which is the property that invariant
+  exists to protect.
 
 `ClarificationReason` is mapped from `DeferralReason` explicitly:
 
@@ -1024,7 +1139,7 @@ Two further rules that the tests exist to pin down:
 `tests/integration/test_clarification_interrupt.py`
 
 - `test_an_incomplete_workout_writes_nothing_and_asks` — zero `exercise_sets`, one WAITING row, one outbound question, execution `WAITING_FOR_USER`.
-- `test_a_mixed_batch_keeps_what_it_understood` — the valid exercise is persisted, the ambiguous one is not, and the reply says both (Q56, Q57).
+- `test_a_mixed_batch_keeps_what_it_understood` — the valid exercise is persisted, the ambiguous one is not, and **one** reply says both: the confirmation for what was written and the question for what was not (Q12, Q56, Q57). The confirmation cannot be lost to the interrupt.
 - `test_two_unanswerable_activities_ask_about_one` — the reply names both problems, one clarification row exists, and the second item is deferred exactly as Sprint 2 defers it today.
 - `test_the_interrupt_precedes_the_deferred_write` — asserted on row counts at the moment of suspension, not by reading the code.
 - `test_the_clarification_row_and_the_checkpoint_agree` — the WAITING row's `clarification_id` is the one inside the checkpointed spec.
@@ -1179,6 +1294,23 @@ and its existing tests must keep passing unchanged.
 
 An ANSWER to an `AMBIGUOUS_ENTITY` question writes a **user-scoped row** into `exercise_aliases` — the resolver's stage 1 exists to be taught, and Sprint 2 granted the INSERT for exactly this. Written in the same transaction as the resumed workout, `ON CONFLICT DO NOTHING` on the per-user partial unique index, and never for a global alias: teaching one user's vocabulary must not edit everyone else's.
 
+## Closing the row the answer consumed
+
+The resume path must, in the **same transaction** as the resumed effects:
+
+```text
+clarification.status = ANSWERED
+clarification.resolved_at = now
+clarification.answer_message_batch_id = <the answer's batch>
+```
+
+Skipping it is not a cosmetic omission. The row stays WAITING, so the next
+message is classified against a question that has already been answered, and
+`uq_pending_clarifications_open_per_conversation` refuses every future
+clarification in that conversation — one unanswered write turns the feature off
+for that user permanently. `test_the_row_is_closed_by_the_answer` and
+`test_a_second_question_can_be_asked_afterwards` are the two tests.
+
 ## Two executions, one interrupted task
 
 An answer is a new `MessageBatch`, and `workflow_executions` has
@@ -1212,7 +1344,30 @@ listed there.
 
 ## Expiry
 
-`session-expiration-worker` gains a second sweep: `pending_clarifications` where `status = 'waiting' AND expires_at < now()` become EXPIRED with `resolved_at` set. The checkpoint is left alone — it is garbage that costs storage, not correctness, and a retention pass is Sprint 10's business.
+`session-expiration-worker` gains a second sweep: `pending_clarifications` where
+`status = 'waiting' AND expires_at < now()`. Closing that row alone is **not
+enough** — nothing can resume the checkpoint afterwards, so its execution and
+its interrupted task would sit in `WAITING_FOR_USER` forever and every
+operational query about "what is waiting on a user" would be wrong from then on.
+
+One transaction, three rows:
+
+```text
+clarification -> EXPIRED, resolved_at set
+execution_task -> SKIPPED, error = "clarification expired"
+workflow_execution -> PARTIAL_SUCCESS if any task COMPLETED, else FAILED
+                      finished_at stamped, error naming the expiry
+```
+
+That needs grants the sweeper does not have: `workflow_executions`
+`(SELECT, UPDATE)` and `execution_tasks` `(SELECT, UPDATE)` for
+`ServiceName.SESSION_EXPIRATION_WORKER`, added in WS-2's grant table and listed
+there. The checkpoint is left alone — it is garbage that costs storage, not
+correctness, and a retention pass is Sprint 10's business.
+
+`test_an_expired_question_leaves_nothing_waiting` asserts all three rows, and it
+is the test that fails if the sweep is written against the clarification table
+alone.
 
 ## Tests
 
@@ -1390,6 +1545,11 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | No execution is left WAITING after its answer | WS-9 |
 | "bom dia" does not answer a free-text question | WS-9 |
 | Provenance pairs each message with its own batch | WS-9 |
+| A swapped-set reply fails the guard; a summary passes | WS-6 |
+| The mixed-batch confirmation survives the interrupt | WS-8 |
+| An answered clarification is closed and unblocks the next | WS-9 |
+| An expired clarification leaves nothing waiting | WS-9 |
+| A rolled-back resume still writes the workout | WS-7 |
 | `make check` green with containers in CI | all |
 | Every workstream on its own reviewed PR | all |
 | `#log supino 80kg` writes nothing and asks | WS-8 |
