@@ -22,6 +22,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.ports.session_hints import SessionHintStore
 from app.domain.events import DomainEventEnvelope
 from app.domain.identifiers import new_uuid7
 from app.domain.training.sessions import SessionCloseReason, is_expired
@@ -48,8 +49,17 @@ def utc_now() -> datetime:
 
 
 class TrainingSessionManager:
-    def __init__(self, *, timeout: timedelta, clock: Clock = utc_now) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: timedelta,
+        clock: Clock = utc_now,
+        hints: SessionHintStore | None = None,
+    ) -> None:
         self._timeout = timeout
+        #: Written wherever activity is observed. The sweep reads it to decide
+        #: where to look first; nothing reads it to decide anything else.
+        self._hints = hints
         #: Injectable so a test can move time without sleeping, and so the
         #: worker and the lazy path can be shown to agree at the same instant.
         self._clock = clock
@@ -132,6 +142,7 @@ class TrainingSessionManager:
         if training_session is None:  # pragma: no cover - it was just inserted
             raise RuntimeError(f"training session {inserted_id} vanished after insert")
 
+        await self._note_activity(user_id)
         await self._audit(
             session,
             action=SESSION_STARTED,
@@ -142,8 +153,23 @@ class TrainingSessionManager:
         return training_session, True
 
     async def touch(self, session: AsyncSession, training_session: TrainingSession) -> None:
-        """Refresh the column §18 makes authoritative."""
+        """Refresh the column §18 makes authoritative, and hint at it."""
         training_session.last_activity_at = self._clock()
+        await self._note_activity(training_session.user_id)
+
+    async def _note_activity(self, user_id: UUID) -> None:
+        """Tell the hint store, and never fail the workout over it.
+
+        Redis is non-authoritative here (§10): losing a hint costs the sweep a
+        wider scan. Losing the user's log because a performance hint could not
+        be stored would trade the record for the index.
+        """
+        if self._hints is None:
+            return
+        try:
+            await self._hints.note_activity(user_id)
+        except Exception:
+            logger.warning("could not write the expiry hint", exc_info=True)
 
     async def close(
         self,
@@ -216,7 +242,10 @@ class TrainingSessionManager:
             .limit(limit)
             .with_for_update(skip_locked=True)
         )
-        if candidates:
+        # `is not None` rather than truthiness: an empty sequence means "these
+        # users, of which there are none", and reading it as "no filter" would
+        # turn an empty hint scan into a full sweep nobody asked for.
+        if candidates is not None:
             statement = statement.where(TrainingSession.user_id.in_(list(candidates)))
 
         closed: list[UUID] = []

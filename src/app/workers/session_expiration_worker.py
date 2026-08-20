@@ -19,9 +19,9 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.ports.session_hints import SessionHintStore
 from app.application.services.training_sessions import TrainingSessionManager
 from app.infrastructure.postgres.engine import unit_of_work
-from app.infrastructure.redis.session_hints import RedisSessionHintStore
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class SessionExpirationWorker:
         *,
         session_factory: async_sessionmaker[AsyncSession],
         manager: TrainingSessionManager,
-        hints: RedisSessionHintStore | None = None,
+        hints: SessionHintStore | None = None,
         interval: timedelta = timedelta(minutes=1),
         batch: int = 100,
     ) -> None:
@@ -74,6 +74,8 @@ class SessionExpirationWorker:
             return []
 
     async def _sweep(self, *, candidates: list[UUID] | None) -> list[UUID]:
+        # `close_expired([])` correctly closes nothing; skipping the round trip
+        # only avoids asking the database a question with a known answer.
         if candidates is not None and not candidates:
             return []
         async with unit_of_work(self._session_factory) as session:

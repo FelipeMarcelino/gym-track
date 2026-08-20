@@ -360,16 +360,81 @@ async def _open_and_age(
 
 
 class _StubHints:
-    """Stands in for Redis: returns what it is told, or raises."""
+    """Stands in for Redis: records what it is told, returns what it is given,
+    or raises if the test is about an outage."""
 
     def __init__(self, *, candidates: list[UUID] | None = None, error: Exception | None = None):
         self._candidates = candidates or []
         self._error = error
+        self.noted: list[UUID] = []
+
+    async def note_activity(self, user_id: UUID) -> None:
+        if self._error is not None:
+            raise self._error
+        self.noted.append(user_id)
 
     async def expiry_candidates(self, *, limit: int = 100) -> list[UUID]:
         if self._error is not None:
             raise self._error
         return self._candidates
+
+
+async def test_an_empty_candidate_list_closes_nothing(
+    manager: TrainingSessionManager,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`[]` means "these users", and there are none. Reading it as "no filter"
+    would make an empty hint scan silently become a full sweep, so the caller
+    could never ask for a narrowed pass without guessing at the behaviour."""
+    await _open_and_age(manager, session_factory, by=TIMEOUT + timedelta(hours=1))
+
+    async with unit_of_work(session_factory) as session:
+        closed = await manager.close_expired(session, candidates=[])
+
+    assert closed == []
+
+
+async def test_activity_is_noted_so_the_sweep_has_somewhere_to_look(
+    session_factory: async_sessionmaker[AsyncSession],
+    user_and_conversation: tuple[UUID, UUID],
+) -> None:
+    """The hints the worker reads have to be written by the path that observes
+    the activity, or the store is empty and the narrowing is theatre."""
+    user_id, conversation_id = user_and_conversation
+    hints = _StubHints()
+    manager = TrainingSessionManager(timeout=TIMEOUT, hints=hints)
+
+    async with unit_of_work(session_factory) as session:
+        opened, _ = await manager.start_or_resume(
+            session, user_id=user_id, conversation_id=conversation_id
+        )
+        await manager.touch(session, opened)
+
+    assert hints.noted == [user_id, user_id]
+
+
+async def test_a_hint_that_cannot_be_written_does_not_lose_the_workout(
+    session_factory: async_sessionmaker[AsyncSession],
+    user_and_conversation: tuple[UUID, UUID],
+) -> None:
+    """Redis is non-authoritative (§10). Failing the user's log because a
+    performance hint could not be stored trades the record for the index."""
+    user_id, conversation_id = user_and_conversation
+    manager = TrainingSessionManager(
+        timeout=TIMEOUT, hints=_StubHints(error=ConnectionError("redis is down"))
+    )
+
+    async with unit_of_work(session_factory) as session:
+        opened, was_opened = await manager.start_or_resume(
+            session, user_id=user_id, conversation_id=conversation_id
+        )
+        await manager.touch(session, opened)
+
+    assert was_opened is True
+
+    async with session_factory() as session:
+        stored = await session.get(TrainingSession, opened.id)
+    assert stored is not None
 
 
 async def test_a_session_with_no_hint_is_still_closed(
@@ -389,7 +454,7 @@ async def test_a_session_with_no_hint_is_still_closed(
     worker = SessionExpirationWorker(
         session_factory=session_factory,
         manager=manager,
-        hints=_StubHints(candidates=[hinted_user]),  # type: ignore[arg-type]
+        hints=_StubHints(candidates=[hinted_user]),
     )
     closed = await worker.run_once()
 
@@ -412,7 +477,7 @@ async def test_a_redis_outage_does_not_stop_the_sweep(
     worker = SessionExpirationWorker(
         session_factory=session_factory,
         manager=manager,
-        hints=_StubHints(error=ConnectionError("redis is down")),  # type: ignore[arg-type]
+        hints=_StubHints(error=ConnectionError("redis is down")),
     )
     closed = await worker.run_once()
 
