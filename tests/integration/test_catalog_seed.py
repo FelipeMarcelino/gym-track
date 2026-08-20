@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import ApplicationSettings
 from app.domain.exercises.catalog import AliasSource, MuscleRole
 from app.domain.exercises.catalog_data import CATALOG_SEED, SEED_RELATIONS
+from app.domain.exercises.normalization import normalize_for_match
 from app.domain.training.activities import ActivityType, LoadMode
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
@@ -25,7 +26,7 @@ from app.infrastructure.postgres.models import (
     Muscle,
     User,
 )
-from app.infrastructure.postgres.seeding import normalize_for_match, seed_catalog_sync
+from app.infrastructure.postgres.seeding import seed_catalog_sync
 from tests.conftest import alembic_config
 
 pytestmark = [pytest.mark.integration]
