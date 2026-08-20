@@ -1,9 +1,14 @@
 """Send a fragmented message to a running stack and report what came back.
 
 `make demo` runs this against `make up`. It is the sprint's acceptance check in
-executable form: three webhook requests go in, and one batch, one workflow
-execution and one dispatched reply must come out — with the same interaction
-trace on all of them (Q131).
+executable form, in two scenarios:
+
+1. Sprint 1's — three fragments go in, and one batch, one workflow execution
+   and one dispatched reply come out, with the same interaction trace on all of
+   them (Q131).
+2. Sprint 2's — one `#log` message goes in, and a training session, an
+   exercise block and three sets come out, with the load stated once and
+   carried to the other two, reachable from the message that caused them.
 
 It talks to the stack from outside, over HTTP and SQL, so it proves the
 processes are wired to each other rather than that the code composes in a test.
@@ -26,6 +31,7 @@ API = "http://localhost:8000"
 APP_SECRET = SecretStr("local-dev-only")
 BSUID = "5511987654321"
 FRAGMENTS = ("fiz supino", "3x10", "80kg")
+WORKOUT_MESSAGE = "#log supino 80kg 10 9 8"
 #: The debounce window is 3s sliding with a 10s cap; give the pipeline room.
 SETTLE_SECONDS = 45
 
@@ -51,6 +57,38 @@ JOIN outbound_messages o ON o.workflow_execution_id = w.id
 WHERE m.external_message_id = ANY(%s)
   AND o.delivery_state IN ('dispatched', 'delivered')
 GROUP BY b.id, w.id, o.delivery_state, o.text, b.trace_id
+"""
+
+
+#: One row, only if the workout actually landed: the sets exist, they are
+#: reachable from the message through `entity_sources`, and the provenance
+#: distinguishes what the user stated from what we carried. A demo that passes
+#: while the domain silently persisted nothing is worse than no demo.
+#:
+#: The HAVING is part of that: without it, a second confirmation dispatched for
+#: the same workout would still return a row, and the demo would pass while
+#: the user had been told twice.
+WORKOUT_QUERY = """
+SELECT ts.id,
+       se.exercise_block_index,
+       e.canonical_name,
+       count(DISTINCT es.id),
+       bool_or(es.load_provenance = 'explicit'),
+       bool_or(es.load_provenance = 'inherited'),
+       max(o.text)
+FROM training_sessions ts
+JOIN session_exercises se ON se.training_session_id = ts.id
+JOIN exercises e ON e.id = se.exercise_id
+JOIN exercise_sets es ON es.session_exercise_id = se.id
+JOIN entity_sources src ON src.entity_id = es.id AND src.entity_type = 'exercise_set'
+JOIN messages m ON m.id = src.message_id
+JOIN message_batch_items i ON i.message_id = m.id
+JOIN workflow_executions w ON w.message_batch_id = i.message_batch_id
+JOIN outbound_messages o ON o.workflow_execution_id = w.id
+WHERE m.external_message_id = %s
+  AND o.delivery_state IN ('dispatched', 'delivered')
+GROUP BY ts.id, se.exercise_block_index, e.canonical_name
+HAVING count(DISTINCT o.id) = 1
 """
 
 
@@ -129,7 +167,65 @@ def main() -> int:
         "\nFollow that interaction across the processes with:\n"
         f"  docker compose -f docker/compose.yaml logs | grep {outcome['trace_id']}\n"
     )
+
+    return _workout_scenario(run_id)
+
+
+def _workout_scenario(run_id: int) -> int:
+    """Sprint 2's check: a workout that reaches the database and comes back."""
+    external_id = f"wamid.demo.{run_id}.workout"
+    sys.stdout.write(f"\n  logging a workout: {WORKOUT_MESSAGE}\n")
+    accepted = post(webhook_body(external_id, WORKOUT_MESSAGE))
+    sys.stdout.write(f"  accepted {external_id}: {accepted}\n")
+
+    workout = _await_workout(external_id)
+    if workout is None:
+        sys.stderr.write(
+            "\nThe workout was accepted but never landed. The API took the message, so\n"
+            "the break is in the workflow worker or the domain — check `make logs`.\n"
+            "This query returns nothing unless the sets exist, are reachable from the\n"
+            "message, and carry their provenance.\n"
+        )
+        return 1
+
+    sys.stdout.write(
+        f"\n  session        {workout['training_session_id']}\n"
+        f"  exercise       {workout['exercise']} (block {workout['block_index']})\n"
+        f"  sets           {workout['sets']}\n"
+        f"  provenance     stated once: {workout['explicit']}, "
+        f"carried forward: {workout['inherited']}\n"
+        f"  reply          {workout['reply']}\n"
+    )
+
+    if workout["sets"] != 3 or not workout["explicit"] or not workout["inherited"]:
+        sys.stderr.write(
+            "\nThe workout landed but not as described: three sets were expected, with\n"
+            "the load stated on the first and carried to the other two (§14.4).\n"
+        )
+        return 1
+
     return 0
+
+
+def _await_workout(external_id: str) -> dict[str, Any] | None:
+    import psycopg
+
+    deadline = time.monotonic() + SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        with psycopg.connect(POSTGRES_DSN) as connection:
+            row = connection.execute(WORKOUT_QUERY, (external_id,)).fetchone()
+        if row is not None:
+            return {
+                "training_session_id": row[0],
+                "block_index": row[1],
+                "exercise": row[2],
+                "sets": row[3],
+                "explicit": row[4],
+                "inherited": row[5],
+                "reply": row[6],
+            }
+        time.sleep(1)
+    return None
 
 
 def _await_reply(external_ids: list[str]) -> dict[str, Any] | None:

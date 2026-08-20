@@ -35,11 +35,23 @@ devshell would shadow it and lose the Desktop context.
 ## Running the walking skeleton
 
 ```bash
-make up      # postgres, rabbitmq, redis, migrations, api and four workers
-make demo    # three fragments in; one batch, one workflow, one reply out
+make up      # postgres, rabbitmq, redis, migrations, api and five workers
+make demo    # two scenarios: a fragmented message, and a logged workout
 make logs    # follow the processes
 make down    # stop everything and drop the volumes
 ```
+
+`make demo` proves two things against the running stack, from outside it:
+
+1. Three fragments become one batch, one workflow execution and one dispatched
+   reply, with the same interaction trace on all of them (Q131).
+2. `#log supino 80kg 10 9 8` becomes a training session, an exercise block and
+   three sets — with the load stated on the first and carried to the other two,
+   reachable from the message that caused them, and confirmed back as
+   *"Registrei Supino reto (3 séries)."*
+
+Both queries return nothing unless the whole path completed, so a stack whose
+domain silently persisted nothing fails the demo rather than passing it.
 
 `make up` builds one image and runs it as five roles (ADR-001). Migrations run
 as a one-shot service that every process waits for, so a fresh volume produces
