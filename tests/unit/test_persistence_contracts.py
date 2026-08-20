@@ -27,6 +27,10 @@ EXPECTED_TABLES = frozenset(
     {
         "users",
         "training_sessions",
+        "session_exercises",
+        "exercise_sets",
+        "exercise_groups",
+        "entity_sources",
         "audit_events",
         "exercises",
         "exercise_aliases",
@@ -49,7 +53,7 @@ EXPECTED_TABLES = frozenset(
 )
 
 #: Append-only by §26: nothing may rewrite history after the fact.
-APPEND_ONLY_TABLES = frozenset({"domain_events", "audit_events"})
+APPEND_ONLY_TABLES = frozenset({"domain_events", "audit_events", "entity_sources"})
 
 
 def test_migration_0001_covers_exactly_the_sprint_tables() -> None:
@@ -80,6 +84,24 @@ def test_idempotency_keys_are_unique_constraints(table: str, columns: tuple[str,
     assert columns in constraints, f"{table} is missing UNIQUE{columns}"
 
 
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        # §26.2 asks "given this message, what did we write because of it".
+        # PostgreSQL does not index a foreign key on its own, so without these
+        # the answer is a sequential scan that grows with the whole history.
+        ("entity_sources", "message_id"),
+        ("entity_sources", "message_batch_id"),
+    ],
+)
+def test_provenance_lookups_are_indexed(table: str, column: str) -> None:
+    indexed = {
+        next(indexed_column.name for indexed_column in index.columns)
+        for index in Base.metadata.tables[table].indexes
+    }
+    assert column in indexed, f"{table}.{column} has no index leading with it"
+
+
 def test_every_table_has_a_uuid_primary_key_and_timestamps() -> None:
     for name, table in Base.metadata.tables.items():
         primary_key = list(table.primary_key.columns)
@@ -98,6 +120,9 @@ def test_soft_delete_is_carried_only_by_entities_that_keep_history() -> None:
         "exercises",
         "exercise_aliases",
         "training_sessions",
+        "session_exercises",
+        "exercise_sets",
+        "exercise_groups",
     }
 
 
