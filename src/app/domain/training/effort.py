@@ -71,7 +71,10 @@ PT_BR_EFFORT_PHRASES: Final[Mapping[str, Decimal]] = {
 }
 
 _RPE_PATTERN = re.compile(r"^(?:rpe\s*(?P<a>-?\d+(?:[.,]\d+)?)|(?P<b>-?\d+(?:[.,]\d+)?)\s*rpe)$")
-_RIR_PATTERN = re.compile(r"^(?:rir\s*(?P<a>-?\d+)|(?P<b>-?\d+)\s*rir)$")
+#: No sign: reps in reserve are never negative, and `int("-0")` is zero -- a
+#: signed zero would otherwise map to RPE 10, promoting a typo to a maximal
+#: effort measurement.
+_RIR_PATTERN = re.compile(r"^(?:rir\s*(?P<a>\d+)|(?P<b>\d+)\s*rir)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +91,13 @@ class NormalizedEffort:
 
 class EffortNormalizer:
     def __init__(self, phrases: Mapping[str, Decimal] | None = None) -> None:
-        self._phrases = dict(PT_BR_EFFORT_PHRASES if phrases is None else phrases)
+        # Keys are normalized on the way in, so an injected table can be
+        # written the way a person writes -- "Até a Falha" -- and still match.
+        # Requiring callers to pre-normalize would make the extension point
+        # work only for whoever knew the rule, and fail silently for everyone
+        # else.
+        source = PT_BR_EFFORT_PHRASES if phrases is None else phrases
+        self._phrases = {normalize_for_match(phrase): rpe for phrase, rpe in source.items()}
 
     def normalize(self, raw: str | None) -> NormalizedEffort | None:
         """Read an effort, or record that it could not be read.

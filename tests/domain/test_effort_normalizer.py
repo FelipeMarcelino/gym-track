@@ -11,6 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+
 from app.domain.training.effort import (
     EFFORT_VERSION,
     PT_BR_EFFORT_PHRASES,
@@ -235,3 +236,28 @@ def test_a_set_effort_survives_when_the_activity_stated_nothing(
 
     assert kept is not None
     assert kept.rpe == Decimal(10)
+
+
+@pytest.mark.parametrize("raw", ["RIR -0", "-0 rir", "rir -2"])
+def test_a_signed_rir_is_not_a_reading(normalizer: EffortNormalizer, raw: str) -> None:
+    """`int("-0")` is zero, so a signed zero would map to RPE 10 — a typo
+    silently promoted to a maximal-effort measurement. Reps in reserve are
+    never negative, so the sign is refused rather than dropped."""
+    effort = normalizer.normalize(raw)
+
+    assert effort is not None
+    assert effort.rpe is None
+    assert effort.method is EffortMethod.UNNORMALIZED
+
+
+def test_an_injected_phrase_table_is_normalized_like_the_default() -> None:
+    """The table is injectable so a later sprint can extend the vocabulary. If
+    callers had to pre-normalize their keys, an entry written the way a person
+    would write it — accents and capitals — would silently never match, and the
+    extension point would work only for whoever knew the rule."""
+    normalizer = EffortNormalizer(phrases={"Até a Falha": Decimal("10"), "OSSO": Decimal("9")})
+
+    for raw in ("ate a falha", "até a falha", "osso", "Osso"):
+        effort = normalizer.normalize(raw)
+        assert effort is not None, raw
+        assert effort.method is EffortMethod.PHRASE_TABLE, raw
