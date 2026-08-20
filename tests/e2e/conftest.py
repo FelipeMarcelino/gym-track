@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
+import sqlalchemy as sa
 from aio_pika.abc import AbstractChannel, AbstractIncomingMessage
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -21,7 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.api.app import create_app
 from app.api.dependencies import ApiContext
 from app.application.ports.event_publisher import EventPublisher
+from app.application.services.training_sessions import TrainingSessionManager
+from app.application.services.workout_command_builder import SessionScopedCommandBuilder
+from app.application.services.workout_logging import WorkoutApplicationService
 from app.config import ApplicationSettings
+from app.graphs.main.handlers import build_task_handlers
 from app.infrastructure.rabbitmq.connection import RabbitMQEventPublisher, connect
 from app.infrastructure.rabbitmq.scheduling import RabbitMQFlushScheduler
 from app.infrastructure.rabbitmq.topology import (
@@ -62,6 +67,20 @@ class Skeleton:
     dispatcher: WhatsAppDispatcher
     whatsapp: FakeWhatsAppClient
     partitions: int
+    #: The workout domain, wired the way the worker entrypoint wires it, so the
+    #: e2e path exercises the real registry rather than a test-only one.
+    workout: WorkoutApplicationService
+    session_factory: async_sessionmaker[AsyncSession]
+
+    async def rows(self, statement: str, **params: Any) -> list[Any]:
+        """Read the database from outside the components that wrote it.
+
+        The point of an end-to-end test is what is *there* afterwards, and a
+        component reporting on its own work can be wrong in exactly the way the
+        test exists to catch.
+        """
+        async with self.session_factory() as session:
+            return list((await session.execute(sa.text(statement), params)).all())
 
     async def send_webhook(self, external_id: str, text: str) -> httpx.Response:
         body = json.dumps(
@@ -138,6 +157,13 @@ async def skeleton(
     redis = Redis.from_url(redis_url)
     await redis.flushall()
 
+    workout = WorkoutApplicationService(
+        session_factory=session_factory,
+        sessions=TrainingSessionManager(
+            timeout=migrated_database.workflow.training_session_timeout
+        ),
+    )
+
     connection = await connect(rabbitmq_url)
     channel = await connection.channel(publisher_confirms=True)
     await redeclare_topology(
@@ -165,7 +191,12 @@ async def skeleton(
                 scheduler=FlushScheduler(RabbitMQFlushScheduler(channel)),
                 settings=migrated_database,
             ),
-            worker=WorkflowWorker(session_factory=session_factory),
+            worker=WorkflowWorker(
+                session_factory=session_factory,
+                handlers=build_task_handlers(
+                    workout=workout, builder=SessionScopedCommandBuilder(session_factory)
+                ),
+            ),
             dispatcher=WhatsAppDispatcher(
                 session_factory=session_factory,
                 client=whatsapp,
@@ -173,6 +204,8 @@ async def skeleton(
             ),
             whatsapp=whatsapp,
             partitions=partitions,
+            workout=workout,
+            session_factory=session_factory,
         )
 
     await redis.aclose()
