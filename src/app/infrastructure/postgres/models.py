@@ -522,3 +522,106 @@ class ExerciseRelation(Base):
     relation_type: Mapped[ExerciseRelationType] = mapped_column(
         enum_column(ExerciseRelationType), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Training sessions and the audit trail (§18, §15, §26) — Sprint 2, WS-5
+# ---------------------------------------------------------------------------
+
+
+class TrainingSessionStatus(StrEnum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+
+
+class ActorType(StrEnum):
+    """Who caused a mutation.
+
+    SYSTEM is not decoration: a session closed by the background sweep has no
+    user behind it, and recording one would attribute an action to somebody who
+    was not there.
+    """
+
+    USER = "user"
+    SYSTEM = "system"
+    OPERATOR = "operator"
+
+
+class TrainingSession(Base, SoftDeleteMixin):
+    """A workout, started by logging and closed by inactivity (§18).
+
+    Distinct from a conversation: a conversation is a window of talking, this
+    is a window of training, and §7.2 keeps their timeouts independent.
+    """
+
+    __tablename__ = "training_sessions"
+    __table_args__ = (
+        # One open session per user, enforced by the database. Two concurrent
+        # logs would otherwise each open one, and the user's sets would land in
+        # two workouts -- the Sprint 1 lesson from conversations, applied here
+        # before it can happen rather than after.
+        sa.Index(
+            "uq_training_sessions_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=sa.text("status = 'active' AND deleted_at IS NULL"),
+        ),
+        sa.Index("ix_training_sessions_expiry", "status", "last_activity_at"),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[TrainingSessionStatus] = mapped_column(
+        enum_column(TrainingSessionStatus),
+        default=TrainingSessionStatus.ACTIVE,
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+    #: §18 makes this the authority. A Redis hint may suggest a session looks
+    #: stale; only this column decides.
+    last_activity_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(sa.String(16), nullable=True)
+    #: Optimistic concurrency for Sprint 4's corrections (§17). Nothing writes
+    #: it yet; the column ships now so the correction sprint is additive.
+    expected_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
+
+
+class AuditEvent(Base):
+    """Who caused a change (§15, §26). Append-only.
+
+    Not a second copy of `domain_events`. An event says what happened so
+    consumers can react; an audit row says who caused it. They answer different
+    questions when somebody asks why a set exists.
+    """
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        sa.Index("ix_audit_events_entity", "entity_type", "entity_id"),
+        sa.Index("ix_audit_events_actor", "actor_user_id", "occurred_at"),
+    )
+
+    actor_type: Mapped[ActorType] = mapped_column(enum_column(ActorType), nullable=False)
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    entity_type: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    entity_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    workflow_execution_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("workflow_executions.id", ondelete="SET NULL"), nullable=True
+    )
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, default=dict, nullable=False
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )

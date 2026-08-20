@@ -198,6 +198,7 @@ async def session_factory(
 #: nothing to match — reference data seeded by migration 0005 is not test state.
 #: User-learned aliases *are* test state, so those go by predicate.
 CLEANUP_STATEMENTS: tuple[str, ...] = (
+    "DELETE FROM audit_events",
     "DELETE FROM outbox_events",
     "DELETE FROM domain_events",
     "DELETE FROM outbound_messages",
@@ -206,6 +207,7 @@ CLEANUP_STATEMENTS: tuple[str, ...] = (
     "DELETE FROM message_batch_items",
     "DELETE FROM message_batches",
     "DELETE FROM messages",
+    "DELETE FROM training_sessions",
     "DELETE FROM conversations",
     "DELETE FROM user_identifiers",
     "DELETE FROM exercise_aliases WHERE user_id IS NOT NULL",

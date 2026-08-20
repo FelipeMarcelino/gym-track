@@ -49,6 +49,7 @@ class ServiceName(StrEnum):
     WORKFLOW_WORKER = "workflow-worker"
     OUTBOX_PUBLISHER = "outbox-publisher"
     DISPATCHER = "dispatcher"
+    SESSION_EXPIRATION_WORKER = "session-expiration-worker"
 
 
 class PostgresRole(BaseModel):
