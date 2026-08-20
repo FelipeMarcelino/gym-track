@@ -288,6 +288,13 @@ op.create_check_constraint(
 # 3. Q132: the version of the graph that produced this execution
 op.add_column("workflow_executions",
               sa.Column("graph_version", sa.String(32), nullable=True))
+
+# 4. WS-9: an answer is its own batch, so it is its own execution -- this is
+#    the link back to the paused one it resumed
+op.add_column("workflow_executions",
+              sa.Column("resumed_execution_id", sa.Uuid,
+                        sa.ForeignKey("workflow_executions.id", ondelete="SET NULL"),
+                        nullable=True))
 ```
 
 `waiting_for_user` is deliberately **not** terminal: the execution is paused,
@@ -676,8 +683,12 @@ class LoggedExercise:
 
 `WorkoutApplicationService` populates it from the rows it just wrote — the
 values as **persisted**, never as parsed, because the guard's job is to protect
-what the database says. The handler flattens them into `facts` under stable
-keys (`supino_reto.set_1.load_kg`), and `verifiable_facts()` reads them.
+what the database says. The handler flattens them into `facts` under keys that
+include the **block**: `supino_reto.block_0.set_1.load_kg`. Q58 explicitly
+supports returning to an exercise later in the workout, so a key of exercise
+plus set position collides on an A-B-A workout and the second block silently
+overwrites the first in the mapping — the guard would then be missing exactly
+the sets it advertises covering.
 
 This is a scope addition to WS-6 discovered in review, and it is the load-bearing
 half: without it, `test_a_dropped_load_is_a_violation` passes against a guard
@@ -699,22 +710,52 @@ def verifiable_facts(results: Sequence[DomainResult]) -> Mapping[str, str]:
     repetition counts, RPE, set counts. Read from `DomainResult.facts`, which
     this workstream first has to make carry them (see above)."""
 
-def check(text: str, facts: Mapping[str, str]) -> tuple[GuardViolation, ...]:
-    """Every fact must appear in the text, unaltered. Numbers are compared as
-    numbers: "3 séries" satisfies `sets=3`, "três séries" does not, and
-    "4 séries" is a violation rather than a stylistic choice."""
+def check(segments: Sequence[NormalizedSegment],
+          facts: Mapping[str, str]) -> tuple[GuardViolation, ...]:
+    """Every fact must appear **in its own entity's segment**, unaltered.
+
+    Two rules, and the second is the one that matters:
+
+    * a fact missing from its segment is a `missing` violation;
+    * a value that belongs to another entity appearing in this one is an
+      `altered` violation -- which is what catches a swap that a
+      does-it-appear-anywhere check waves through.
+
+    Numbers are compared as numbers: "3 séries" satisfies `sets=3`,
+    "três séries" does not, and "4 séries" is a violation rather than a
+    stylistic choice.
+    """
 ```
 
 ```python
 # application/ports/response.py
+@dataclass(frozen=True, slots=True)
+class NormalizedSegment:
+    """One entity's prose, still attached to the entity it describes.
+
+    The port returns segments rather than finished text because a guard over
+    finished text cannot check *associations*. "Supino 100 kg; agachamento
+    80 kg" contains every expected name and every expected number, unaltered,
+    and has swapped the two loads -- a substring check passes it and the user
+    is told they lifted weights they did not lift. Segments make each value
+    checkable against the entity it belongs to; rendering is a join afterwards.
+    """
+    entity_key: str          # "" for prose that belongs to no single entity
+    text: str
+
 class ResponseNormalizerPort(Protocol):
-    async def normalize(self, results: Sequence[DomainResult]) -> tuple[OutboundText, ...]: ...
+    async def normalize(self, results: Sequence[DomainResult]) -> tuple[NormalizedSegment, ...]: ...
 
 # application/services/response_normalizer.py
 class TemplateResponseNormalizer:
-    """This sprint's implementation: the pt-BR templates Sprint 2 wrote,
-    ordered. It cannot lie, which is exactly why the guard's tests must use a
-    fake that can."""
+    """This sprint's implementation: the pt-BR templates Sprint 2 wrote, one
+    segment per exercise. It cannot lie, which is exactly why the guard's tests
+    must use a fake that can."""
+
+def render(segments: Sequence[NormalizedSegment]) -> tuple[OutboundText, ...]:
+    """Segments to messages, after the guard has passed. Splitting into
+    several WhatsApp messages stays §25's concern and Sprint 4's decision;
+    this joins."""
 ```
 
 Fallback behaviour (§25): when `check()` returns violations, the guard logs them at WARNING with the fact names, discards the normalizer's text, and emits the deterministic template built straight from the `DomainResult`. **A guard violation never silences the confirmation** — Q12 requires every successful registration to be confirmed, so failing closed here would trade a wrong number for a lost acknowledgement.
@@ -725,6 +766,8 @@ Fallback behaviour (§25): when `check()` returns violations, the guard logs the
 
 - `test_a_dropped_load_is_a_violation` / `test_an_altered_repetition_count_is_a_violation`.
 - `test_a_reworded_sentence_with_every_fact_intact_passes` — the guard must not become a template-equality check, or Sprint 4's normalizer can never pass it.
+- `test_swapped_loads_between_two_exercises_are_caught` — "Supino 100 kg; agachamento 80 kg" when the database says the opposite. Every name and every number is present and unaltered; the association is wrong. **The test a substring guard fails and this design exists for.**
+- `test_the_same_exercise_in_two_blocks_keeps_both` — an A-B-A workout produces facts for both blocks and the guard checks both (Q58).
 - `test_numbers_are_compared_as_numbers` — `sets=3` against "3 séries" passes, against "4 séries" fails.
 - `test_an_internal_result_contributes_facts_and_no_prose`.
 - `test_every_persisted_set_reaches_the_facts` — a three-set workout yields three loads and three repetition counts in `verifiable_facts()`. The test that stops the guard from being decorative.
@@ -733,6 +776,7 @@ Fallback behaviour (§25): when `check()` returns violations, the guard logs the
 `tests/graph/test_response_boundary.py`
 
 - `test_a_lying_normalizer_is_overruled` — a fake normalizer that halves the load; the user receives the deterministic fallback and the violation is logged. **The guard is proven to fail, not only asserted to pass.**
+- `test_a_normalizer_that_swaps_two_exercises_facts_is_overruled` — the same, for the association case.
 - `test_the_confirmation_still_arrives_when_the_guard_fires` — Q12.
 - `test_two_visible_results_keep_their_plan_order` — sequences 0 and 1, in plan order.
 - `test_partial_success_says_both_things` — one committed task and one failed task produce a reply naming what was recorded and what was not.
@@ -869,7 +913,7 @@ class ClarificationSpec(BaseModel, frozen=True, extra="forbid"):
 
 ```python
 class ExpectedResponse(BaseModel, frozen=True, extra="forbid"):
-    kind: Literal["integer_list", "decimal", "choice"]
+    kind: Literal["integer_list", "decimal", "choice", "exercise_name"]
     #: For "choice": the candidate names an answer may select, in the order
     #: they were offered, so "o primeiro" and the name itself both resolve.
     options: tuple[str, ...] = ()
@@ -878,6 +922,25 @@ class ExpectedResponse(BaseModel, frozen=True, extra="forbid"):
 ```
 
 A question the system cannot recognise the answer to is a question it should not ask. `kind` is what turns "8 8 8" into an answer rather than an unparseable message, and it is chosen at the moment the question is asked, by the code that knows what it was asking for.
+
+`"exercise_name"` is separate from `"choice"` for a reason worth stating: a
+`choice` with no options accepts any string, which would make "bom dia" resume
+and close a pending workout. An `exercise_name` answer is instead **resolved
+against the catalog** — the same deterministic resolver Sprint 2 built — and it
+is an answer only if it resolves at high confidence. Anything else is not an
+answer, so the question stays open and the message is treated as a new intent.
+That is the only way "como esse exercício se chama?" can be both answerable and
+not a trap.
+
+**One item per question.** §40.2's `missing_fields[]` and `ambiguous_entities[]`
+are arrays and stay arrays, but a Sprint 3 spec carries **exactly one item in
+total**, refused in `__post_init__` otherwise. One scalar `ExpectedResponse`
+cannot say which of two incomplete exercises an answer belongs to, and inventing
+a mapping language to fix that is a Sprint 4 problem with an LLM behind it. So a
+batch with two unanswerable activities asks about the first and defers the
+second the way Sprint 2 already does — the user is told about both, and only one
+is resumable. This is a deliberate deviation from a literal §40.2, and it is
+exactly what D11's one-open-question-per-conversation invariant already implies.
 
 ## Where the interrupt goes
 
@@ -948,7 +1011,7 @@ Two further rules that the tests exist to pin down:
 | --- | --- |
 | `MISSING_ESSENTIAL_DATA` | `ClarificationReason.MISSING_ESSENTIAL_DATA`, `kind="integer_list"` or `"decimal"` by field |
 | `AMBIGUOUS_EXERCISE` | `ClarificationReason.AMBIGUOUS_ENTITY`, `kind="choice"` with the candidates |
-| `UNRESOLVED_EXERCISE` | `ClarificationReason.AMBIGUOUS_ENTITY`, `kind="choice"` with no options — a free-text name is accepted |
+| `UNRESOLVED_EXERCISE` | `ClarificationReason.AMBIGUOUS_ENTITY`, `kind="exercise_name"` — the free-text name is resolved against the catalog, and only a high-confidence resolution counts as an answer |
 | `INVALID_VALUE` | **No interrupt.** Asked and answered in one message, as Sprint 2 does today |
 
 ## Tests
@@ -956,11 +1019,13 @@ Two further rules that the tests exist to pin down:
 `tests/contract/test_clarification_spec.py`
 
 - `test_the_golden_spec_round_trips` — byte-identical, unknown fields refused, `schema_version` pinned. Sprint 4 gets a contract, not an example.
+- `test_a_spec_asks_about_exactly_one_thing` — two missing fields, or one missing field and one ambiguous entity, are refused at construction.
 
 `tests/integration/test_clarification_interrupt.py`
 
 - `test_an_incomplete_workout_writes_nothing_and_asks` — zero `exercise_sets`, one WAITING row, one outbound question, execution `WAITING_FOR_USER`.
 - `test_a_mixed_batch_keeps_what_it_understood` — the valid exercise is persisted, the ambiguous one is not, and the reply says both (Q56, Q57).
+- `test_two_unanswerable_activities_ask_about_one` — the reply names both problems, one clarification row exists, and the second item is deferred exactly as Sprint 2 defers it today.
 - `test_the_interrupt_precedes_the_deferred_write` — asserted on row counts at the moment of suspension, not by reading the code.
 - `test_the_clarification_row_and_the_checkpoint_agree` — the WAITING row's `clarification_id` is the one inside the checkpointed spec.
 - `test_the_question_and_its_row_commit_together` — inject a failure between the two writes; assert neither survives. A question with nothing to answer against is the worst outcome available here.
@@ -988,6 +1053,8 @@ Two further rules that the tests exist to pin down:
 + tests/integration/test_resume.py
 + tests/integration/test_learned_aliases.py
 ~ src/app/graphs/main/nodes.py                  # resolve_pending_workflow reads the decision
+~ src/app/application/commands/workout.py       # sources: (batch, message) pairs
+~ src/app/application/services/workout_logging.py  # _source writes the pair it is given
 ~ src/app/workers/session_expiration_worker.py  # the expiry sweep
 ~ src/app/workers/workflow_worker.py            # classify, then invoke or resume
 ```
@@ -1032,8 +1099,7 @@ class ClarificationAnswer:
     what happened.
     """
     value: AnswerValue
-    message_batch_id: UUID
-    message_ids: tuple[UUID, ...]
+    sources: tuple[MessageSource, ...]   # (message_batch_id, message_id) pairs
 
 class PendingWorkflowResolver:
     async def classify(self, session, *, conversation_id: UUID,
@@ -1093,9 +1159,56 @@ the reason above — the node exists, its input is computed one layer out, and
 Sprint 4's harder classification (Q29's open cases) lands in the resolver
 service, not in the node.
 
+## Provenance across two batches
+
+`LogWorkoutCommand` today carries one `message_batch_id` and a tuple of
+`source_message_ids`, and `WorkoutApplicationService._source` pairs *every*
+message with *that* batch. A resumed workout has messages from two batches, so
+the union of ids is not enough — it would file the answer's message under the
+question's batch.
+
+`LogWorkoutCommand` therefore gains `sources: tuple[MessageSource, ...]` where
+`MessageSource` is a `(message_batch_id, message_id)` pair, and `_source` writes
+each pair as it is given. `message_batch_id` stays on the command as the
+*originating* batch — it is what `operation_id_for` derives from and what the
+replay read-back groups by — but it stops being the batch every provenance row
+inherits. Modifying `_source` is a WS-9 change to a Sprint 2 file, listed above,
+and its existing tests must keep passing unchanged.
+
 ## Learned aliases
 
 An ANSWER to an `AMBIGUOUS_ENTITY` question writes a **user-scoped row** into `exercise_aliases` — the resolver's stage 1 exists to be taught, and Sprint 2 granted the INSERT for exactly this. Written in the same transaction as the resumed workout, `ON CONFLICT DO NOTHING` on the per-user partial unique index, and never for a global alias: teaching one user's vocabulary must not edit everyone else's.
+
+## Two executions, one interrupted task
+
+An answer is a new `MessageBatch`, and `workflow_executions` has
+`UNIQUE(message_batch_id)` — so the answer gets its **own** execution row while
+the graph resumes the **original** execution's namespace and its
+`execution_tasks`. Left undefined, the original stays `WAITING_FOR_USER` forever
+and its task rows can never reach a terminal status.
+
+Defined:
+
+```text
+answer batch -> new workflow_executions row
+                  resumed_execution_id = <the paused execution>
+                  status = SUCCEEDED (this delivery worked)
+                  owns the outbound confirmation
+
+paused execution -> status moves to its real terminal outcome
+                    (SUCCEEDED or PARTIAL_SUCCESS), finished_at stamped
+                    its execution_tasks reach terminal status, because the
+                    resumed graph runs with WorkerContext.execution_id set to
+                    the *original* id -- that is where its tasks live
+```
+
+`WorkerContext.execution_id` is therefore the **paused** execution on a resume
+and the new one otherwise. Getting this backwards writes the resumed task
+transitions under an execution that has no such tasks, and the composite FK from
+`pending_clarifications` refuses it — loudly, which is the point.
+
+`resumed_execution_id` is a nullable self-FK added in migration `0011` (WS-2),
+listed there.
 
 ## Expiry
 
@@ -1109,16 +1222,20 @@ An ANSWER to an `AMBIGUOUS_ENTITY` question writes a **user-scoped row** into `e
 - `test_prose_does_not_answer_anything` — "bom dia" raises.
 - `test_a_choice_resolves_by_name_and_by_position` — "supino reto" and "o primeiro".
 - `test_a_number_outside_the_bounds_is_refused` — 900 repetitions is not an answer, it is a typo.
+- `test_an_exercise_name_answer_must_resolve` — "leg press" resolves and answers; "bom dia" does not resolve and is therefore not an answer, so the question stays open. **The test that stops a free-text question from swallowing every message.**
 
 `tests/integration/test_resume.py`
 
-- `test_the_round_trip_persists_on_the_second_message` — three sets after the answer, zero before, **both** messages present in `entity_sources`: the one that named the exercise and the one that gave the repetitions. The resumed command's `source_message_ids` is the union of the checkpointed originals and the answer's own, which is why `ClarificationAnswer` carries them.
+- `test_the_round_trip_persists_on_the_second_message` — three sets after the answer, zero before, **both** messages present in `entity_sources`: the one that named the exercise and the one that gave the repetitions.
+- `test_each_message_is_attributed_to_its_own_batch` — the row for the question's message names the question's batch, and the row for the answer's message names the answer's batch. A union of message ids would pair at least one of them with a batch it never belonged to, and a wrong provenance row is worse than a missing one: corrections read these.
 - `test_a_new_log_during_a_pending_question_does_not_answer_it` — the WAITING row is untouched and a second workflow runs. **The Q29 test; also the one that fails if the classifier's step order is changed.**
 - `test_the_original_question_is_still_answerable_afterwards` — the continuation of the test above, and the one that proves D4's namespace: `#log supino 80kg`, then an unrelated `#log agachamento 100kg 5 5 5`, *then* `8 8 8`. The answer must resume the first workflow, not the second. Without the per-execution namespace the intervening run becomes the thread's latest checkpoint and this test fails with a pending row nobody can ever close.
 - `test_an_answer_after_expiry_starts_a_new_workflow` — the row is EXPIRED, nothing is resumed.
 - `test_a_cancel_phrase_closes_the_question` — status CANCELLED and a confirmation the user can understand.
 - `test_a_redelivered_answer_resumes_once` — one set, not two; the second delivery finds the claim taken.
 - `test_the_classification_happens_before_the_graph_is_invoked` — a resumed run never visits the nodes before the interrupt, asserted on the node-visit trace. This is the test that fails if the decision is ever moved back into the graph.
+- `test_the_paused_execution_reaches_a_terminal_state` — after the answer, no execution is left `WAITING_FOR_USER`, the original names its outcome, and the answer's row points at it through `resumed_execution_id`.
+- `test_the_resumed_tasks_land_on_the_original_execution` — `execution_tasks` for the interrupted task reach `COMPLETED` under the id they were created with, not under the answer's.
 - `test_the_resumed_command_uses_its_own_operation_id` — asserted on `processed_operations`, two rows with different keys.
 
 `tests/integration/test_learned_aliases.py`
@@ -1269,6 +1386,10 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | The question and its row commit together | WS-8 |
 | `graph_version` is a column, not only checkpoint state | WS-2, WS-7 |
 | A terminal execution cannot have a NULL `finished_at` | WS-2 |
+| A swapped-load reply fails the guard | WS-6 |
+| No execution is left WAITING after its answer | WS-9 |
+| "bom dia" does not answer a free-text question | WS-9 |
+| Provenance pairs each message with its own batch | WS-9 |
 | `make check` green with containers in CI | all |
 | Every workstream on its own reviewed PR | all |
 | `#log supino 80kg` writes nothing and asks | WS-8 |

@@ -215,9 +215,13 @@ a merge, one PR each, reviewed and CI-green before merging.
    response group; INTERNAL results contribute facts and no prose (§25).
 3. `response_normalizer` is the deterministic pass-through this sprint — the
    templates Sprint 2 already writes — behind a `ResponseNormalizerPort`.
-4. `response_guard` compares every verifiable fact in the `DomainResult`
-   (exercise names, loads, repetitions, RPE, counts) against the text about to
-   be sent. A missing or altered fact fails the guard, and the §25 deterministic
+4. `response_guard` compares every verifiable fact against the segment of the
+   reply that describes **that entity** — not against the whole text. "Supino
+   100 kg; agachamento 80 kg" contains every expected name and number, unaltered,
+   with the two loads swapped; a does-it-appear-anywhere check passes it and
+   tells the user they lifted weights they did not lift. So the normalizer port
+   returns segments keyed by entity and prose is rendered after the check. A
+   missing or misattributed fact fails the guard, and the §25 deterministic
    fallback is what the user receives (Q62, Q136, DEC-004).
 5. The workflow ends `PARTIAL_SUCCESS` when at least one task committed and at
    least one failed or is skipped — no global rollback of unrelated work (Q28).
@@ -248,9 +252,13 @@ a merge, one PR each, reviewed and CI-green before merging.
 1. `ClarificationSpec` as §40.2 declares it, frozen by a golden fixture in
    `tests/contract/` — Sprint 4's LLM-assisted clarification gets a contract
    rather than an example, the same way `StructuredWorkoutInput` did.
-2. The LOG_WORKOUT handler stops answering-and-discarding. Deferred items with
-   `MISSING_ESSENTIAL_DATA` or `AMBIGUOUS_EXERCISE` become a
+2. The LOG_WORKOUT handler stops answering-and-discarding. A deferred item with
+   `MISSING_ESSENTIAL_DATA` or `AMBIGUOUS_EXERCISE` becomes a
    `ClarificationSpec`, the task goes `WAITING_FOR_USER`, the graph interrupts.
+   **One item per question:** a single scalar `expected_response_schema` cannot
+   say which of two incomplete exercises an answer belongs to, so a spec carries
+   exactly one item and the rest are deferred as Sprint 2 defers them today.
+   A deliberate deviation from a literal §40.2, and what D11 already implies.
 3. **Q126, concretely:** the valid activities of a mixed batch commit *before*
    the interrupt (Q56 requires it), and the interrupt happens before anything
    the pending item would write. The committed part carries the operation id it
@@ -282,20 +290,24 @@ a merge, one PR each, reviewed and CI-green before merging.
    ADR-016.
 3. An ANSWER resumes the paused run — same thread, the paused execution's
    namespace — with `Command(resume=…)`, the deferred activity completes, and
-   the confirmation names what was written. The sets it creates are attributed
-   to **both** messages: the one that named the exercise and the one that gave
-   the repetitions (§26.2), so the answer carries its own message ids rather
-   than only the checkpointed originals.
-4. A NEW_INTENT starts its own workflow and **leaves the pending clarification
+   the confirmation names what was written. Two consequences the plan spells
+   out: the sets are attributed to **both** messages, each paired with **its
+   own** batch (§26.2 — a union of message ids would file the answer under the
+   question's batch); and the paused execution reaches a terminal state instead
+   of waiting forever, while the answer's own execution row points back to it.
+4. An answer that names an exercise is only an answer if it **resolves against
+   the catalog**. A free-text question that accepts any string would let "bom
+   dia" close a pending workout.
+5. A NEW_INTENT starts its own workflow and **leaves the pending clarification
    open** — Q29 says a pending question must not block unrelated work.
-5. An answered *exercise* clarification writes a **user-scoped alias** into
+6. An answered *exercise* clarification writes a **user-scoped alias** into
    `exercise_aliases` — the resolver's stage 1 exists to be taught, the grant
    for it was already written in Sprint 2, and a user who explains a word once
    should not be asked about it again.
-6. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
+7. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
    `session-expiration-worker`. An expired question is closed, never answered
    later by an unrelated message.
-7. Tests: the two-message round trip persists the sets on the second message and
+8. Tests: the two-message round trip persists the sets on the second message and
    not the first; an answer arriving after expiry starts a new workflow instead
    of resuming a dead one; a `#log` during a pending clarification leaves the
    WAITING row untouched; a redelivered answer resumes once and writes one set;
@@ -346,6 +358,10 @@ that checks each line, not by agreement that it feels done.
 - [ ] `#log supino 80kg` writes zero `exercise_sets`, one WAITING `pending_clarifications` row, and one outbound question naming *repetições*.
 - [ ] Answering `8 8 8` resumes that workflow and writes three sets attributed to both messages through `entity_sources`.
 - [ ] A `#log` for a different exercise sent while a clarification is pending starts its own workflow and leaves the WAITING row untouched (Q29).
+- [ ] A reply that swaps two exercises' loads fails the guard, even though every name and number in it is unaltered.
+- [ ] No execution is left `WAITING_FOR_USER` after its question is answered, and the answer's row names the execution it resumed.
+- [ ] "bom dia" does not answer "como esse exercício se chama?" — the question stays open.
+- [ ] Each provenance row pairs a message with the batch that message actually arrived in (§26.2).
 - [ ] After an unrelated `#log` runs in between, the original question is still answerable — the intervening workflow does not become the checkpoint the answer resumes.
 - [ ] The sets written on resume are attributed to both the asking and the answering message through `entity_sources` (§26.2).
 - [ ] Every persisted set's load, repetitions and effort reach `DomainResult.facts`, so the guard has something to check.
