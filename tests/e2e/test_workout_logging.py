@@ -25,9 +25,15 @@ from tests.e2e.conftest import Skeleton
 pytestmark = [pytest.mark.e2e, pytest.mark.integration]
 
 
-async def _run(skeleton: Skeleton, text: str) -> None:
-    """The whole pipeline, one process at a time, over real infrastructure."""
-    assert (await skeleton.send_webhook(f"wamid.{uuid4()}", text)).status_code == 202
+async def _run(skeleton: Skeleton, text: str) -> str:
+    """The whole pipeline, one process at a time, over real infrastructure.
+
+    Returns the provider's message id, which is the unique key the assertions
+    join on: matching on the text would pass for a set some *other* message
+    produced, which is the opposite of what a provenance test is for.
+    """
+    external_id = f"wamid.{uuid4()}"
+    assert (await skeleton.send_webhook(external_id, text)).status_code == 202
 
     await skeleton.publish_outbox()
     await skeleton.drain("message.received", skeleton.aggregator.on_message_received)
@@ -43,6 +49,7 @@ async def _run(skeleton: Skeleton, text: str) -> None:
 
     await skeleton.publish_outbox()
     await skeleton.drain("outbound.dispatch", skeleton.dispatcher.dispatch)
+    return external_id
 
 
 async def test_a_logged_workout_reaches_the_database_and_comes_back(
@@ -50,7 +57,7 @@ async def test_a_logged_workout_reaches_the_database_and_comes_back(
 ) -> None:
     """The one that matters: three sets, in one session, reachable from the
     message, confirmed to the user by name."""
-    await _run(skeleton, "#log supino 80kg 10 9 8")
+    external_id = await _run(skeleton, "#log supino 80kg 10 9 8")
 
     rows = await skeleton.rows(
         """
@@ -61,10 +68,10 @@ async def test_a_logged_workout_reaches_the_database_and_comes_back(
         JOIN entity_sources src
           ON src.entity_id = es.id AND src.entity_type = 'exercise_set'
         JOIN messages m ON m.id = src.message_id
-        WHERE m.text = :text
+        WHERE m.external_message_id = :external_id
         ORDER BY es.set_index
         """,
-        text="#log supino 80kg 10 9 8",
+        external_id=external_id,
     )
 
     assert len(rows) == 3, "the sets must be reachable from the message that caused them"

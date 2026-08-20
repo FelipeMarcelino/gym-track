@@ -135,18 +135,30 @@ async def test_the_batch_can_be_processed_after_the_crash_is_fixed(
     assert await _count(skeleton, "exercise_sets") == 3
 
 
-async def test_publishing_the_same_event_twice_writes_nothing_twice(
+async def test_delivering_the_same_response_twice_sends_one_message(
     skeleton: Skeleton,
 ) -> None:
-    """The outbox publisher is at-least-once too. Draining it repeatedly must
-    not produce a second reply to the user."""
+    """The dispatcher is at-least-once too, so the same `response.ready`
+    envelope can arrive again.
+
+    Draining the outbox twice does not test this: the first drain marks every
+    row PUBLISHED, so the second claims nothing and the assertion passes
+    whatever the dispatcher does. The envelope has to be handed over twice.
+    """
     queue = await _to_the_worker(skeleton)
     await skeleton.drain(queue, skeleton.worker.handle)
+    await skeleton.publish_outbox()
 
-    await skeleton.publish_outbox()
-    await skeleton.publish_outbox()
-    await skeleton.drain("outbound.dispatch", skeleton.dispatcher.dispatch)
-    await skeleton.drain("outbound.dispatch", skeleton.dispatcher.dispatch)
+    delivered: list[dict[str, Any]] = []
+
+    async def recording(body: dict[str, Any]) -> Any:
+        delivered.append(body)
+        return await skeleton.dispatcher.dispatch(body)
+
+    assert await skeleton.drain("outbound.dispatch", recording) == 1
+
+    # The same envelope again, as a redelivery would bring it.
+    await skeleton.dispatcher.dispatch(delivered[0])
 
     assert await _count(skeleton, "exercise_sets") == 3
     assert len(skeleton.whatsapp.texts) == 1, "one workout, one confirmation"

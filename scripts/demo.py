@@ -64,6 +64,10 @@ GROUP BY b.id, w.id, o.delivery_state, o.text, b.trace_id
 #: reachable from the message through `entity_sources`, and the provenance
 #: distinguishes what the user stated from what we carried. A demo that passes
 #: while the domain silently persisted nothing is worse than no demo.
+#:
+#: The HAVING is part of that: without it, a second confirmation dispatched for
+#: the same workout would still return a row, and the demo would pass while
+#: the user had been told twice.
 WORKOUT_QUERY = """
 SELECT ts.id,
        se.exercise_block_index,
@@ -84,6 +88,7 @@ JOIN outbound_messages o ON o.workflow_execution_id = w.id
 WHERE m.external_message_id = %s
   AND o.delivery_state IN ('dispatched', 'delivered')
 GROUP BY ts.id, se.exercise_block_index, e.canonical_name
+HAVING count(DISTINCT o.id) = 1
 """
 
 
