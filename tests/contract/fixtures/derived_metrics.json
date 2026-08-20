@@ -1,0 +1,80 @@
+{
+  "volume.load_x_reps.v1": [
+    {
+      "inputs": {"load_kg": "80", "repetitions": 10, "load_mode": "total"},
+      "value": "800.000",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "20", "repetitions": 10, "load_mode": "per_implement"},
+      "value": "400.000",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "50", "repetitions": 8, "load_mode": "per_side"},
+      "value": "800.000",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "82.5", "repetitions": 3, "load_mode": "total"},
+      "value": "247.500",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "10", "repetitions": 5, "load_mode": "bodyweight_plus"},
+      "value": "50.000",
+      "unit": "kg"
+    }
+  ],
+  "1rm.epley.v1": [
+    {
+      "inputs": {"load_kg": "100", "repetitions": 5},
+      "value": "116.667",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "120", "repetitions": 1},
+      "value": "124.000",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "60", "repetitions": 12},
+      "value": "84.000",
+      "unit": "kg"
+    },
+    {
+      "inputs": {"load_kg": "82.5", "repetitions": 8},
+      "value": "104.500",
+      "unit": "kg"
+    }
+  ],
+  "pace.seconds_per_km.v1": [
+    {
+      "inputs": {"distance_m": "5000", "duration_s": "1500"},
+      "value": "300.000",
+      "unit": "s/km"
+    },
+    {
+      "inputs": {"distance_m": "10000", "duration_s": "3000"},
+      "value": "300.000",
+      "unit": "s/km"
+    },
+    {
+      "inputs": {"distance_m": "1609.344", "duration_s": "480"},
+      "value": "298.258",
+      "unit": "s/km"
+    }
+  ],
+  "speed.meters_per_second.v1": [
+    {
+      "inputs": {"distance_m": "5000", "duration_s": "1500"},
+      "value": "3.333",
+      "unit": "m/s"
+    },
+    {
+      "inputs": {"distance_m": "1000", "duration_s": "240"},
+      "value": "4.167",
+      "unit": "m/s"
+    }
+  ]
+}

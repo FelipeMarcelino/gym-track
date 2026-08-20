@@ -1,0 +1,160 @@
+"""Derived metrics as versioned pure functions (Q52, DEC-001).
+
+Volume, pace, speed and estimated 1RM are code, not model output, and every
+stored value carries the version of the code that produced it. That is what
+makes a change to a formula a *new metric* rather than a silent rewrite of
+history: last month's volume stays comparable to itself because the row says
+which arithmetic produced it.
+
+Two rules run through all of it:
+
+* **Insufficient input returns `None`, never zero.** A zero pace is a claim
+  the system is making; `None` is the truth. §19's trend analysis would average
+  a fabricated zero without noticing it was never a real measurement.
+* **A metric outside its useful range is not produced.** Epley past twelve
+  repetitions has more error than signal, and a fabricated number stored with a
+  version is worse than no number, because the version makes it look checked.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Final
+
+from app.domain.training.activities import ActivityDraft, LoadMode
+
+VOLUME_VERSION: Final = "volume.load_x_reps.v1"
+PACE_VERSION: Final = "pace.seconds_per_km.v1"
+SPEED_VERSION: Final = "speed.meters_per_second.v1"
+ONE_RM_VERSION: Final = "1rm.epley.v1"
+
+VOLUME = "volume"
+PACE = "pace"
+SPEED = "speed"
+ONE_RM = "estimated_one_rm"
+
+METRIC_VERSIONS: Final[Mapping[str, str]] = {
+    VOLUME: VOLUME_VERSION,
+    PACE: PACE_VERSION,
+    SPEED: SPEED_VERSION,
+    ONE_RM: ONE_RM_VERSION,
+}
+
+#: Epley's formula is fitted to sets people actually do. Past this, the estimate
+#: says more about the formula than about the lifter.
+MAX_REPS_FOR_ONE_RM: Final = 12
+
+#: Three decimals everywhere: enough to keep pounds-to-kilograms honest, few
+#: enough that two runs of the same arithmetic produce the same string.
+_PRECISION: Final = Decimal("0.001")
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedMetric:
+    name: str
+    value: Decimal
+    unit: str
+    version: str
+
+
+def _quantize(value: Decimal) -> Decimal:
+    return value.quantize(_PRECISION)
+
+
+def volume(
+    *,
+    load_kg: Decimal | None,
+    repetitions: int | None,
+    load_mode: LoadMode | None,
+    implements: int = 2,
+) -> DerivedMetric | None:
+    """Total load moved, in kilograms.
+
+    The load mode is what makes this arithmetic rather than a guess (Q49): a
+    dumbbell press at 20 kg moved 400 kg over ten reps, not 200, and reading
+    the catalog's `PER_IMPLEMENT` is the difference.
+
+    A bodyweight set with no external load yields `None`. Sprint 2 does not
+    know the user's body weight, and §14.2 is explicit that it must not need
+    to — inventing 70 kg would put a number in the history that nobody measured.
+    """
+    if load_kg is None or repetitions is None or repetitions <= 0:
+        return None
+    if load_mode in (LoadMode.BODYWEIGHT,) and load_kg == 0:
+        return None
+
+    multiplier = Decimal(1)
+    if load_mode is LoadMode.PER_IMPLEMENT:
+        multiplier = Decimal(implements)
+    elif load_mode is LoadMode.PER_SIDE:
+        multiplier = Decimal(2)
+
+    total = load_kg * multiplier * Decimal(repetitions)
+    return DerivedMetric(name=VOLUME, value=_quantize(total), unit="kg", version=VOLUME_VERSION)
+
+
+def pace(*, distance_m: Decimal | None, duration_s: Decimal | None) -> DerivedMetric | None:
+    """Seconds per kilometre. `None` unless both inputs exist and are positive."""
+    if distance_m is None or duration_s is None:
+        return None
+    if distance_m <= 0 or duration_s <= 0:
+        return None
+
+    seconds_per_km = duration_s / (distance_m / Decimal(1000))
+    return DerivedMetric(
+        name=PACE, value=_quantize(seconds_per_km), unit="s/km", version=PACE_VERSION
+    )
+
+
+def speed(*, distance_m: Decimal | None, duration_s: Decimal | None) -> DerivedMetric | None:
+    """Metres per second. Same insufficiency rule as pace."""
+    if distance_m is None or duration_s is None:
+        return None
+    if distance_m <= 0 or duration_s <= 0:
+        return None
+
+    return DerivedMetric(
+        name=SPEED,
+        value=_quantize(distance_m / duration_s),
+        unit="m/s",
+        version=SPEED_VERSION,
+    )
+
+
+def estimated_one_rm(*, load_kg: Decimal | None, repetitions: int | None) -> DerivedMetric | None:
+    """Epley (D5): `1RM = load * (1 + reps / 30)`.
+
+    Returns `None` past twelve repetitions rather than an estimate nobody
+    should act on, and `None` for a zero load because a bodyweight set has no
+    one-rep maximum this sprint can compute.
+    """
+    if load_kg is None or repetitions is None:
+        return None
+    if repetitions <= 0 or repetitions > MAX_REPS_FOR_ONE_RM:
+        return None
+    if load_kg <= 0:
+        return None
+
+    estimate = load_kg * (Decimal(1) + Decimal(repetitions) / Decimal(30))
+    return DerivedMetric(name=ONE_RM, value=_quantize(estimate), unit="kg", version=ONE_RM_VERSION)
+
+
+def derive_all(draft: ActivityDraft) -> tuple[DerivedMetric, ...]:
+    """Every metric this draft supports, skipping the ones it cannot support.
+
+    Order is stable so that a persisted set's metrics are written the same way
+    twice, which is what makes two runs of the seed-and-log path comparable.
+    """
+    candidates = (
+        volume(
+            load_kg=draft.load_kg,
+            repetitions=draft.repetitions,
+            load_mode=draft.load_mode,
+        ),
+        estimated_one_rm(load_kg=draft.load_kg, repetitions=draft.repetitions),
+        pace(distance_m=draft.distance_m, duration_s=draft.duration_s),
+        speed(distance_m=draft.distance_m, duration_s=draft.duration_s),
+    )
+    return tuple(metric for metric in candidates if metric is not None)
