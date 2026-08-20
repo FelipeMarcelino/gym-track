@@ -1,0 +1,42 @@
+{
+  "_comment": "WS-7's contract with real input. Frozen on purpose: the scorer is pinned in uv.lock, so a change here is a change in behaviour and has to be argued for in a diff. `canonical` null means the resolver must return nothing rather than a plausible substitute.",
+  "rows": [
+    {"raw": "supino", "canonical": "Supino reto", "method": "global_alias"},
+    {"raw": "supino reto", "canonical": "Supino reto", "method": "global_alias"},
+    {"raw": "Supino Reto", "canonical": "Supino reto", "method": "global_alias"},
+    {"raw": "bench press", "canonical": "Supino reto", "method": "global_alias"},
+    {"raw": "supino inclinado", "canonical": "Supino inclinado", "method": "global_alias"},
+    {"raw": "supino com halteres", "canonical": "Supino com halteres", "method": "global_alias"},
+    {"raw": "agachamento", "canonical": "Agachamento livre", "method": "global_alias"},
+    {"raw": "squat", "canonical": "Agachamento livre", "method": "global_alias"},
+    {"raw": "leg press", "canonical": "Leg press", "method": "global_alias"},
+    {"raw": "terra", "canonical": "Levantamento terra", "method": "global_alias"},
+    {"raw": "deadlift", "canonical": "Levantamento terra", "method": "global_alias"},
+    {"raw": "rdl", "canonical": "Levantamento terra romeno", "method": "global_alias"},
+    {"raw": "stiff", "canonical": "Levantamento terra romeno", "method": "global_alias"},
+    {"raw": "remada curvada", "canonical": "Remada curvada", "method": "global_alias"},
+    {"raw": "puxada frente", "canonical": "Puxada frente", "method": "global_alias"},
+    {"raw": "barra fixa", "canonical": "Barra fixa", "method": "global_alias"},
+    {"raw": "flexão", "canonical": "Flexão de braço", "method": "global_alias"},
+    {"raw": "flexao", "canonical": "Flexão de braço", "method": "global_alias"},
+    {"raw": "rosca direta", "canonical": "Rosca direta", "method": "global_alias"},
+    {"raw": "elevação lateral", "canonical": "Elevação lateral", "method": "global_alias"},
+    {"raw": "corrida", "canonical": "Corrida", "method": "global_alias"},
+    {"raw": "prancha", "canonical": "Prancha", "method": "global_alias"},
+
+    {"raw": "supino retp", "canonical": "Supino reto", "method": "fuzzy"},
+    {"raw": "agachamnto", "canonical": "Agachamento livre", "method": "fuzzy"},
+    {"raw": "levantamento tera", "canonical": "Levantamento terra", "method": "fuzzy"},
+    {"raw": "remada curvda", "canonical": "Remada curvada", "method": "fuzzy"},
+
+    {"raw": "aquele exercício do peito", "canonical": null, "method": null},
+    {"raw": "treino de ontem", "canonical": null, "method": null},
+    {"raw": "sei lá", "canonical": null, "method": null},
+    {"raw": "", "canonical": null, "method": null},
+    {"raw": "?!?!", "canonical": null, "method": null},
+
+    {"raw": "rosca direta com barra", "canonical": null, "method": null},
+    {"raw": "agachamento bulgaro", "canonical": null, "method": null},
+    {"raw": "supino com corda", "canonical": null, "method": null}
+  ]
+}
