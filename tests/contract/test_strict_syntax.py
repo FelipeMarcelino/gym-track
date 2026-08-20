@@ -40,6 +40,23 @@ def test_the_prefix_is_what_selects_this_parser() -> None:
     assert not matches("log supino")
 
 
+@pytest.mark.parametrize(
+    "text", ["#logger supino 80kg 10", "#logging today", "#logbook", "#logs supino"]
+)
+def test_a_word_that_merely_starts_with_the_prefix_is_not_the_prefix(text: str) -> None:
+    """`#logger` is an ordinary hashtag. Matching it would hand somebody's
+    message to a parser that strips four characters off the front and reads
+    the rest as a workout."""
+    assert not matches(text)
+    assert parse([text]) is None
+
+
+def test_the_prefix_may_stand_alone_or_be_followed_by_a_space() -> None:
+    assert matches("#log")
+    assert matches("#log supino 80kg")
+    assert matches("#log\tsupino")
+
+
 def test_text_without_the_prefix_is_not_this_parsers_business() -> None:
     """Returning None rather than raising: the caller falls through to the
     acknowledgement path, and a greeting is not a syntax error."""
@@ -131,6 +148,8 @@ def test_unmarked_lines_in_the_batch_are_kept_rather_than_dropped() -> None:
         ("#log 80kg 10", "exercise"),
         ("#log supino 3x10", "3x10"),
         ("#log supino 80kg 10 @", "effort"),
+        ("#log supino 80kg 10 @RPE7 @RPE9", "two efforts"),
+        ("#log supino 80kg 90kg 10", "two loads"),
     ],
 )
 def test_a_marked_line_that_does_not_parse_says_so(line: str, problem: str) -> None:

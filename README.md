@@ -59,7 +59,7 @@ goes through a deliberately rigid syntax:
 ```
 
 ```text
-#log supino 80kg 10 9 8      → supino reto, three sets, 80 kg carried forward
+#log supino 80kg 10 9 8      → three sets of supino, 80 kg on the first
 #log flexao 10               → one set of ten, no load
 #log supino 80kg 10 @RPE8    → one set, effort RPE 8
 ```

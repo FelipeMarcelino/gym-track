@@ -56,8 +56,17 @@ class StrictSyntaxError(ValueError):
 
 
 def matches(text: str) -> bool:
-    """Whether this line is addressed to this parser."""
-    return text.strip().casefold().startswith(LOG_PREFIX)
+    """Whether this line is addressed to this parser.
+
+    The prefix has to be the whole first token. A bare `startswith` also
+    claims `#logger` and `#logbook`, which are ordinary hashtags -- and this
+    parser would strip four characters off one and read the rest as a workout.
+    """
+    stripped = text.strip().casefold()
+    if not stripped.startswith(LOG_PREFIX):
+        return False
+    remainder = stripped[len(LOG_PREFIX) :]
+    return not remainder or remainder[0].isspace()
 
 
 def parse(texts: Sequence[str]) -> StructuredWorkoutInput | None:
@@ -100,6 +109,12 @@ def _activity(line: str) -> StructuredActivityInput:
                 "write the repetitions one per set",
             )
         if token.startswith("@"):
+            if effort is not None:
+                # Overwriting would accept the line and silently drop the
+                # first effort the user reported. The grammar allows one.
+                raise StrictSyntaxError(
+                    stripped, f"two efforts in one line: {effort!r} and {token[1:]!r}"
+                )
             effort = token[1:]
             if not effort:
                 raise StrictSyntaxError(stripped, "an effort marker with no effort after it")
