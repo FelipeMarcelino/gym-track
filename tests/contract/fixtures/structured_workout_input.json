@@ -1,0 +1,117 @@
+{
+  "schema_version": "workout-input.v1",
+  "activities": [
+    {
+      "raw_name": "supino reto",
+      "activity_type": null,
+      "sets": [
+        {
+          "repetitions": 12,
+          "load": "40kg",
+          "load_mode": null,
+          "set_type": "warmup",
+          "distance": null,
+          "duration": null,
+          "effort": null,
+          "notes": null
+        },
+        {
+          "repetitions": 10,
+          "load": "80kg",
+          "load_mode": null,
+          "set_type": "working",
+          "distance": null,
+          "duration": null,
+          "effort": null,
+          "notes": null
+        },
+        {
+          "repetitions": 9,
+          "load": null,
+          "load_mode": null,
+          "set_type": "working",
+          "distance": null,
+          "duration": null,
+          "effort": null,
+          "notes": null
+        },
+        {
+          "repetitions": 8,
+          "load": null,
+          "load_mode": null,
+          "set_type": "working",
+          "distance": null,
+          "duration": null,
+          "effort": "quase falhei",
+          "notes": null
+        }
+      ],
+      "effort": null,
+      "group_ref": null
+    },
+    {
+      "raw_name": "barra fixa",
+      "activity_type": null,
+      "sets": [
+        {
+          "repetitions": 8,
+          "load": null,
+          "load_mode": null,
+          "set_type": "working",
+          "distance": null,
+          "duration": null,
+          "effort": null,
+          "notes": null
+        }
+      ],
+      "effort": "RPE 9",
+      "group_ref": "A"
+    },
+    {
+      "raw_name": "remada curvada",
+      "activity_type": null,
+      "sets": [
+        {
+          "repetitions": 10,
+          "load": "60kg",
+          "load_mode": null,
+          "set_type": "working",
+          "distance": null,
+          "duration": null,
+          "effort": null,
+          "notes": null
+        }
+      ],
+      "effort": null,
+      "group_ref": "A"
+    },
+    {
+      "raw_name": "corrida",
+      "activity_type": "distance_activity",
+      "sets": [
+        {
+          "repetitions": null,
+          "load": null,
+          "load_mode": null,
+          "set_type": "working",
+          "distance": "5km",
+          "duration": "25:00",
+          "effort": null,
+          "notes": "esteira"
+        }
+      ],
+      "effort": null,
+      "group_ref": null
+    }
+  ],
+  "groups": [
+    {
+      "ref": "A",
+      "group_type": "superset",
+      "rounds": 3
+    }
+  ],
+  "unparsed": [
+    "depois alonguei um pouco"
+  ]
+}

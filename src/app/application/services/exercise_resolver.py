@@ -49,6 +49,25 @@ class ExerciseResolver:
         self._ambiguity_margin = ambiguity_margin
         self._max_candidates = max_candidates
 
+    async def resolve_entry(
+        self, raw_name: str, *, user_id: UUID
+    ) -> tuple[ExerciseResolution, CatalogEntry | None]:
+        """`resolve`, plus the catalog row it landed on.
+
+        Callers that go on to build something need the row's `is_bodyweight`
+        and `uses_implements` (Q49), and the resolution itself cannot carry
+        them: it is a domain type, and `CatalogEntry` belongs to the port. The
+        entry is None exactly when nothing resolved.
+        """
+        resolution = await self.resolve(raw_name, user_id=user_id)
+        if resolution.exercise_id is None:
+            return resolution, None
+
+        for searchable in await self._catalog.all_searchable():
+            if searchable.entry.exercise_id == resolution.exercise_id:
+                return resolution, searchable.entry
+        return resolution, None  # pragma: no cover - a resolved id is in the catalog
+
     async def resolve(self, raw_name: str, *, user_id: UUID) -> ExerciseResolution:
         """Stages 1-4 in the normative order, first hit wins."""
         normalized = normalize_for_match(raw_name)
