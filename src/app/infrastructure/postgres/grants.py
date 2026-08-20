@@ -38,6 +38,8 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
     },
     ServiceName.WORKFLOW_WORKER: {
         "users": ("SELECT",),
+        "training_sessions": ("SELECT", "INSERT", "UPDATE"),
+        "audit_events": ("SELECT", "INSERT"),
         # The catalog is read-only to every process except for learned aliases,
         # which Sprint 3 writes when a user answers a clarification.
         "exercises": ("SELECT",),
@@ -61,6 +63,16 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
         "domain_events": ("SELECT",),
         "outbox_events": ("SELECT", "UPDATE"),
     },
+    ServiceName.SESSION_EXPIRATION_WORKER: {
+        "users": ("SELECT",),
+        # No INSERT, deliberately: a bug that made the sweep *open* a session
+        # is refused by PostgreSQL rather than discovered in a user's history.
+        "training_sessions": ("SELECT", "UPDATE"),
+        # It closes sessions, so it attributes them.
+        "audit_events": ("SELECT", "INSERT"),
+        "domain_events": ("SELECT", "INSERT"),
+        "outbox_events": ("SELECT", "INSERT"),
+    },
     ServiceName.DISPATCHER: {
         "users": ("SELECT",),
         # It resolves the recipient's plaintext identifier before every send;
@@ -75,6 +87,8 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
 
 ALL_TABLES: Final[tuple[str, ...]] = (
     "users",
+    "training_sessions",
+    "audit_events",
     "exercises",
     "exercise_aliases",
     "muscles",

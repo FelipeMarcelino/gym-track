@@ -21,6 +21,7 @@ x-app: &app
     GYM_TRACK_POSTGRES__ROLES__WORKFLOW-WORKER__USER: gym_workflow_worker
     GYM_TRACK_POSTGRES__ROLES__OUTBOX-PUBLISHER__USER: gym_outbox_publisher
     GYM_TRACK_POSTGRES__ROLES__DISPATCHER__USER: gym_dispatcher
+    GYM_TRACK_POSTGRES__ROLES__SESSION-EXPIRATION-WORKER__USER: gym_session_expiration_worker
     GYM_TRACK_RABBITMQ__HOST: rabbitmq
     GYM_TRACK_RABBITMQ__USER: gym_track
     GYM_TRACK_REDIS__HOST: redis
@@ -32,6 +33,7 @@ x-app: &app
     GYM_TRACK_SECRET_POSTGRES_WORKFLOW_WORKER_PASSWORD: local-dev-only
     GYM_TRACK_SECRET_POSTGRES_OUTBOX_PUBLISHER_PASSWORD: local-dev-only
     GYM_TRACK_SECRET_POSTGRES_DISPATCHER_PASSWORD: local-dev-only
+    GYM_TRACK_SECRET_POSTGRES_SESSION_EXPIRATION_WORKER_PASSWORD: local-dev-only
     GYM_TRACK_SECRET_RABBITMQ_PASSWORD: local-dev-only
     GYM_TRACK_SECRET_SECURITY_WHATSAPP_APP_SECRET: local-dev-only
     GYM_TRACK_SECRET_SECURITY_BSUID_ENCRYPTION_KEY: local-dev-only-32-bytes-minimum!!
@@ -124,6 +126,10 @@ services:
   whatsapp-dispatcher:
     <<: *app
     command: ["python", "-m", "app.entrypoints.dispatcher"]
+
+  session-expiration-worker:
+    <<: *app
+    command: ["python", "-m", "app.entrypoints.session_expiration_worker"]
 
 volumes:
   postgres-data:

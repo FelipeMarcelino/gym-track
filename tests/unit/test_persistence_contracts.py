@@ -26,6 +26,8 @@ DOMAIN_ROOT = REPO_ROOT / "src" / "app" / "domain"
 EXPECTED_TABLES = frozenset(
     {
         "users",
+        "training_sessions",
+        "audit_events",
         "exercises",
         "exercise_aliases",
         "muscles",
@@ -47,7 +49,7 @@ EXPECTED_TABLES = frozenset(
 )
 
 #: Append-only by §26: nothing may rewrite history after the fact.
-APPEND_ONLY_TABLES = frozenset({"domain_events"})
+APPEND_ONLY_TABLES = frozenset({"domain_events", "audit_events"})
 
 
 def test_migration_0001_covers_exactly_the_sprint_tables() -> None:
@@ -90,7 +92,13 @@ def test_soft_delete_is_carried_only_by_entities_that_keep_history() -> None:
     soft_deletable = {
         name for name, table in Base.metadata.tables.items() if "deleted_at" in table.columns
     }
-    assert soft_deletable == {"users", "conversations", "exercises", "exercise_aliases"}
+    assert soft_deletable == {
+        "users",
+        "conversations",
+        "exercises",
+        "exercise_aliases",
+        "training_sessions",
+    }
 
 
 def test_enums_are_checked_strings_rather_than_native_types() -> None:
