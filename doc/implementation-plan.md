@@ -31,10 +31,10 @@ and is written **one at a time**, immediately before it starts — not all upfro
 
 | # | Sprint | Status | Detail |
 | --- | --- | --- | --- |
-| 1 | Walking skeleton — inbound to outbound, no intelligence | **Planned** | [sprint-01](sprints/sprint-01-walking-skeleton.md) |
-| 2 | Workout logging domain + deterministic exercise resolver | Provisional | — |
-| 3 | LangGraph MainGraph, ExecutionPlan, clarification interrupts | Provisional | — |
-| 4 | WorkoutExtractor (LLM), EffortNormalizer, ResponseNormalizer | Provisional | — |
+| 1 | Walking skeleton — inbound to outbound, no intelligence | Done | [sprint-01](sprints/sprint-01-walking-skeleton.md) |
+| 2 | Workout logging domain + deterministic exercise resolver | Done | [sprint-02](sprints/sprint-02-deterministic-workout-domain.md) |
+| 3 | LangGraph MainGraph, ExecutionPlan, clarification interrupts | **Planned** | [sprint-03](sprints/sprint-03-langgraph-orchestration.md) |
+| 4 | The LLM boundary: IntentRouter, ExecutionPlanner, WorkoutExtractor, ResponseNormalizer | Provisional | — |
 | 5 | Correction, undo, provenance, optimistic concurrency | Provisional | — |
 | 6 | Analytics + TrainingAnalysisAgent | Provisional | — |
 | 7 | RecommendationAgent + validator + critic | Provisional | — |
@@ -42,8 +42,14 @@ and is written **one at a time**, immediately before it starts — not all upfro
 | 9 | Workout programs + long-term memory | Provisional | — |
 | 10 | Hardening: privacy, retention, failure injection, SLOs | Provisional | — |
 
-Sprints 2–10 are a **restatement of spec §41 phases**, not a commitment. They are here so the
-shape of the whole is visible; only the row marked **Planned** is trustworthy.
+Sprints 4–10 are a **restatement of spec §41 phases**, not a commitment. They are here so the
+shape of the whole is visible; only the row marked **Planned** is trustworthy, and the rows marked
+**Done** are what actually shipped rather than what was once intended.
+
+Sprint 3 keeps the ordering invariant one level up: the graph, the plan DAG, the checkpointer and
+the interrupt/resume path are all deterministic, and they are built and falsified **before** an LLM
+produces anything that travels through them. Sprint 2's file closed by naming Sprint 3 as the LLM
+boundary; this index is the authority, and that paragraph has been corrected.
 
 ## Sequencing rationale
 
@@ -54,6 +60,8 @@ by real traffic from the first increment instead of being validated months later
 
 The ordering invariant for everything after: **deterministic before probabilistic.** The
 workout domain, its validators and its persistence are built and tested with hand-written
-inputs (Sprint 2) *before* an LLM is allowed to produce those inputs (Sprint 4). This follows
-spec §3.1 — probabilistic components propose, deterministic services validate and commit — and
-means LLM quality problems can never be confused with domain correctness problems.
+inputs (Sprint 2), and the orchestration that carries them — graph, plan, checkpoints, interrupts —
+is built and tested with deterministic inputs (Sprint 3), *before* an LLM is allowed to produce
+those inputs (Sprint 4). This follows spec §3.1 — probabilistic components propose, deterministic
+services validate and commit — and means LLM quality problems can never be confused with domain
+correctness problems, nor with orchestration bugs.

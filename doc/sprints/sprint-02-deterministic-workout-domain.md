@@ -356,9 +356,20 @@ Resolve at the start; record as ADRs where structural.
 ## Hand-off to Sprint 3
 
 Sprint 2 ends with a domain that is correct and completely literal: it records
-exactly what it is told, in a rigid syntax nobody would want to type. Sprint 3
-introduces the LLM boundary — `IntentRouter`, `WorkoutExtractor`, the
-`MainGraph` and `ResponseNormalizer` — against a domain whose rules are already
-falsifiable, so a bad extraction shows up as a validation failure rather than
-as a plausible wrong row. The strict-syntax adapter is removed there, and its
-contract test becomes the extractor's first eval case.
+exactly what it is told, in a rigid syntax nobody would want to type.
+
+**Corrected after the fact:** this paragraph originally named Sprint 3 as the
+LLM boundary. It is not. `doc/implementation-plan.md` is the index and it puts
+orchestration first — `MainGraph`, the `ExecutionPlan` DAG, the PostgreSQL
+checkpointer and resumable clarification, all deterministic — and the ordering
+invariant that governed this sprint applies unchanged one level up: the
+machinery an LLM's output will travel through must be falsifiable before that
+output becomes a variable inside it. See
+[sprint-03](sprint-03-langgraph-orchestration.md).
+
+**Sprint 4** is then the LLM boundary — `IntentRouter`, `ExecutionPlanner`,
+`WorkoutExtractor` and `ResponseNormalizerAgent` — against a domain whose rules
+and an orchestration whose failure modes are both already falsifiable, so a bad
+extraction shows up as a validation failure rather than as a plausible wrong
+row. The strict-syntax adapter is removed there, and its contract test becomes
+the extractor's first eval case.
