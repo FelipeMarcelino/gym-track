@@ -43,21 +43,43 @@ class SessionExpirationWorker:
         self._batch = batch
 
     async def run_once(self) -> list[UUID]:
-        """One sweep. Returns the sessions it closed."""
-        candidates = None
-        if self._hints is not None:
-            # Only ever a narrowing: the hint says where to look, and
-            # `last_activity_at` says whether to act (§18).
-            candidates = await self._hints.expiry_candidates(limit=self._batch)
+        """One sweep: the hinted users first, then everybody. Returns what closed.
 
-        async with unit_of_work(self._session_factory) as session:
-            closed = await self._manager.close_expired(
-                session, limit=self._batch, candidates=candidates
-            )
+        Two passes rather than one filtered pass, because a hint is a place to
+        look and not the set of sessions that exist. Filtering on it would mean
+        a user whose hint expired — or was never written, or fell outside the
+        scan — keeps an open session for as long as *other* hints remain, and
+        §18 puts that decision in `last_activity_at`, not in Redis.
+        """
+        closed = await self._sweep(candidates=await self._hinted_users())
+        closed.extend(await self._sweep(candidates=None))
 
         if closed:
             logger.info("expired training sessions closed", extra={"closed": len(closed)})
         return closed
+
+    async def _hinted_users(self) -> list[UUID]:
+        """Who to check first, or nobody if Redis cannot say.
+
+        A Redis outage costs a slower sweep and nothing else — the pass below
+        it is unfiltered, so losing the whole keyspace never leaves a session
+        open (§10 declares the store non-authoritative).
+        """
+        if self._hints is None:
+            return []
+        try:
+            return await self._hints.expiry_candidates(limit=self._batch)
+        except Exception:
+            logger.warning("expiry hints unavailable; sweeping without them", exc_info=True)
+            return []
+
+    async def _sweep(self, *, candidates: list[UUID] | None) -> list[UUID]:
+        if candidates is not None and not candidates:
+            return []
+        async with unit_of_work(self._session_factory) as session:
+            return await self._manager.close_expired(
+                session, limit=self._batch, candidates=candidates
+            )
 
     async def run_forever(self, stop: asyncio.Event) -> None:
         """Sweep until asked to stop, sleeping on the stop event between passes."""

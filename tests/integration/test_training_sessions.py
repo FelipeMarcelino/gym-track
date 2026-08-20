@@ -338,6 +338,87 @@ async def test_every_close_emits_its_domain_event_and_outbox_row(
     assert len(outbox) == 1
 
 
+async def _open_and_age(
+    manager: TrainingSessionManager,
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    by: timedelta,
+) -> tuple[UUID, UUID]:
+    """A fresh user with a session that went quiet `by` ago. Returns (user, session)."""
+    async with unit_of_work(session_factory) as session:
+        user = User()
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.flush()
+        opened, _ = await manager.start_or_resume(
+            session, user_id=user.id, conversation_id=conversation.id
+        )
+        opened.last_activity_at = datetime.now(UTC) - by
+        return user.id, opened.id
+
+
+class _StubHints:
+    """Stands in for Redis: returns what it is told, or raises."""
+
+    def __init__(self, *, candidates: list[UUID] | None = None, error: Exception | None = None):
+        self._candidates = candidates or []
+        self._error = error
+
+    async def expiry_candidates(self, *, limit: int = 100) -> list[UUID]:
+        if self._error is not None:
+            raise self._error
+        return self._candidates
+
+
+async def test_a_session_with_no_hint_is_still_closed(
+    manager: TrainingSessionManager,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The hint narrows *where the sweep looks first*, never which sessions
+    exist. A hint that expired, or a keyspace holding only some users, must not
+    turn into a session that stays open forever (§18)."""
+    hinted_user, hinted_session = await _open_and_age(
+        manager, session_factory, by=TIMEOUT + timedelta(minutes=1)
+    )
+    _, unhinted_session = await _open_and_age(
+        manager, session_factory, by=TIMEOUT + timedelta(hours=4)
+    )
+
+    worker = SessionExpirationWorker(
+        session_factory=session_factory,
+        manager=manager,
+        hints=_StubHints(candidates=[hinted_user]),  # type: ignore[arg-type]
+    )
+    closed = await worker.run_once()
+
+    assert set(closed) == {hinted_session, unhinted_session}, (
+        "a user missing from the hints must still be swept"
+    )
+
+
+async def test_a_redis_outage_does_not_stop_the_sweep(
+    manager: TrainingSessionManager,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Redis is non-authoritative (§10, §18), so losing it costs a slower sweep
+    and nothing else. A worker that dies on it stops closing sessions entirely
+    while the database still knows which ones ended."""
+    _, stale_session = await _open_and_age(
+        manager, session_factory, by=TIMEOUT + timedelta(minutes=1)
+    )
+
+    worker = SessionExpirationWorker(
+        session_factory=session_factory,
+        manager=manager,
+        hints=_StubHints(error=ConnectionError("redis is down")),  # type: ignore[arg-type]
+    )
+    closed = await worker.run_once()
+
+    assert closed == [stale_session]
+
+
 async def test_the_expiration_role_cannot_open_a_session(
     migrated_database: ApplicationSettings,
 ) -> None:

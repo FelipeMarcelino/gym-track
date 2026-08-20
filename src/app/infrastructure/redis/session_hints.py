@@ -2,9 +2,11 @@
 
 §18 says PostgreSQL's `last_activity_at` decides whether a session has ended,
 and Redis "may provide expiration hints". The distinction is the whole reason
-this module is small: a hint narrows the sweep's scan from every open session
-to the ones that recently went quiet, and losing the whole keyspace costs a
-slower sweep rather than a session that never closes.
+this module is small: a hint tells the sweep which users to look at *first*,
+and the sweep follows it with an unfiltered pass regardless. It is a priority,
+not a filter — treating it as a filter would mean a user whose hint expired
+keeps an open session for as long as other hints remain. Losing the whole
+keyspace costs a slower sweep, never a session that stays open.
 
 Every key carries a TTL slightly longer than the timeout it describes, so a
 hint cannot outlive its own relevance by much — and even when one does, the
@@ -42,9 +44,9 @@ class RedisSessionHintStore:
     async def expiry_candidates(self, *, limit: int = 100) -> list[UUID]:
         """Users worth checking. Wrong answers here are harmless by design.
 
-        A user missing from the list is simply checked by the next full sweep;
-        a user wrongly present is refused by `last_activity_at`. Neither costs
-        correctness, which is what makes it safe to keep in a store §10 already
+        A user missing from the list is checked by the unfiltered pass that
+        follows; a user wrongly present is refused by `last_activity_at`.
+        Neither costs correctness, which is what makes it safe to keep in a store §10 already
         declares non-authoritative.
         """
         found: list[UUID] = []
