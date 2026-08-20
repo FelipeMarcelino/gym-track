@@ -17,7 +17,13 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.application.commands.workout import LogWorkoutCommand, operation_id_for
+from app.application.commands.workout import (
+    ActivityCommand,
+    GroupCommand,
+    LogWorkoutCommand,
+    SetCommand,
+    operation_id_for,
+)
 from app.application.services.exercise_resolver import ExerciseResolver
 from app.application.services.strict_syntax import parse
 from app.application.services.training_sessions import TrainingSessionManager
@@ -420,3 +426,273 @@ async def test_the_operation_claim_is_recorded(
         ).all()
 
     assert operation_id_for(batch.batch_id) in claims
+
+
+# --------------------------------------------------------------------------
+# Groups, blocks and what a replay actually describes
+# --------------------------------------------------------------------------
+
+
+def _activity(
+    exercise_id: UUID, name: str, *, sets: int = 1, group_ref: str | None = None
+) -> ActivityCommand:
+    from app.domain.training.activities import ActivityType, SetType
+    from app.domain.training.provenance import Provenance
+
+    return ActivityCommand(
+        exercise_id=exercise_id,
+        canonical_name=name,
+        activity_type=ActivityType.STRENGTH,
+        effort=None,
+        group_ref=group_ref,
+        sets=tuple(
+            SetCommand(
+                set_index=index,
+                set_type=SetType.WORKING,
+                repetitions=10,
+                repetitions_provenance=Provenance.EXPLICIT,
+                load_kg=Decimal("80.000"),
+                load_mode=None,
+                load_provenance=Provenance.EXPLICIT,
+                raw_load_text="80kg",
+                distance_m=None,
+                distance_provenance=Provenance.EXPLICIT,
+                duration_s=None,
+                duration_provenance=Provenance.EXPLICIT,
+                effort=None,
+            )
+            for index in range(sets)
+        ),
+    )
+
+
+async def _exercise_ids(
+    session_factory: async_sessionmaker[AsyncSession], *slugs: str
+) -> tuple[UUID, ...]:
+    from app.infrastructure.postgres.models import Exercise
+
+    async with session_factory() as session:
+        found: list[UUID] = []
+        for slug in slugs:
+            found.append(
+                (await session.scalars(sa.select(Exercise.id).where(Exercise.slug == slug))).one()
+            )
+        return tuple(found)
+
+
+def _manual(
+    fixture: _Fixture,
+    *activities: ActivityCommand,
+    groups: tuple[GroupCommand, ...] = (),
+    batch_id: UUID | None = None,
+) -> LogWorkoutCommand:
+    resolved = batch_id or fixture.batch_id
+    return LogWorkoutCommand(
+        operation_id=operation_id_for(resolved),
+        user_id=fixture.user_id,
+        conversation_id=fixture.conversation_id,
+        message_batch_id=resolved,
+        source_message_ids=(fixture.message_id,),
+        activities=activities,
+        groups=groups,
+    )
+
+
+async def test_a_superset_gives_each_member_its_own_place(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """Two exercises in one group need two positions. Giving both the same one
+    violates the index that makes the group's order readable, and takes the
+    whole workout down with it."""
+    from app.domain.training.provenance import ExerciseGroupType
+
+    bench, row = await _exercise_ids(session_factory, "supino-reto", "remada-curvada")
+
+    await workout.log_workout(
+        _manual(
+            batch,
+            _activity(bench, "Supino reto", group_ref="A"),
+            _activity(row, "Remada curvada", group_ref="A"),
+            groups=(GroupCommand(ref="A", group_type=ExerciseGroupType.SUPERSET, rounds=3),),
+        )
+    )
+
+    async with session_factory() as session:
+        blocks = (
+            await session.scalars(
+                sa.select(SessionExercise).order_by(SessionExercise.exercise_block_index)
+            )
+        ).all()
+
+    assert [block.position_in_group for block in blocks] == [0, 1]
+    assert len({block.exercise_group_id for block in blocks}) == 1
+
+
+async def test_two_groups_in_one_workout_are_numbered_consecutively(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """The block index is a position, so it counts 0, 1 — not 0, 2."""
+    from app.domain.training.provenance import ExerciseGroupType
+    from app.infrastructure.postgres.models import ExerciseGroup
+
+    bench, row = await _exercise_ids(session_factory, "supino-reto", "remada-curvada")
+
+    await workout.log_workout(
+        _manual(
+            batch,
+            _activity(bench, "Supino reto", group_ref="A"),
+            _activity(row, "Remada curvada", group_ref="B"),
+            groups=(
+                GroupCommand(ref="A", group_type=ExerciseGroupType.SUPERSET),
+                GroupCommand(ref="B", group_type=ExerciseGroupType.CIRCUIT),
+            ),
+        )
+    )
+
+    async with session_factory() as session:
+        indexes = (
+            await session.scalars(
+                sa.select(ExerciseGroup.block_index).order_by(ExerciseGroup.block_index)
+            )
+        ).all()
+
+    assert list(indexes) == [0, 1]
+
+
+async def test_a_group_reference_that_names_nothing_does_not_lose_the_workout(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """Q57: a producer bug in the grouping must not cost the user the sets they
+    actually did."""
+    (bench,) = await _exercise_ids(session_factory, "supino-reto")
+
+    result = await workout.log_workout(
+        _manual(batch, _activity(bench, "Supino reto", sets=3, group_ref="ghost"))
+    )
+
+    assert result.set_count == 3
+    async with session_factory() as session:
+        block = (await session.scalars(sa.select(SessionExercise))).one()
+    assert block.exercise_group_id is None
+
+
+async def test_the_same_exercise_in_a_new_group_starts_a_new_block(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """Bench alone and then bench inside a superset are two different things
+    that happened. Reusing the block by exercise id alone would file the
+    superset's sets under the ungrouped block and lose the grouping."""
+    from app.domain.training.provenance import ExerciseGroupType
+
+    (bench,) = await _exercise_ids(session_factory, "supino-reto")
+
+    await workout.log_workout(_manual(batch, _activity(bench, "Supino reto")))
+
+    async with unit_of_work(session_factory) as session:
+        from app.infrastructure.postgres.models import MessageBatch as _Batch
+
+        second = _Batch(user_id=batch.user_id, conversation_id=batch.conversation_id)
+        session.add(second)
+        await session.flush()
+        second_id = second.id
+
+    await workout.log_workout(
+        _manual(
+            batch,
+            _activity(bench, "Supino reto", group_ref="A"),
+            groups=(GroupCommand(ref="A", group_type=ExerciseGroupType.SUPERSET),),
+            batch_id=second_id,
+        )
+    )
+
+    async with session_factory() as session:
+        blocks = (
+            await session.scalars(
+                sa.select(SessionExercise).order_by(SessionExercise.exercise_block_index)
+            )
+        ).all()
+
+    assert len(blocks) == 2
+    assert blocks[0].exercise_group_id is None
+    assert blocks[1].exercise_group_id is not None
+
+
+async def test_a_replay_describes_its_own_batch_and_not_the_ones_after_it(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """A later message adding sets to the same block must not change what the
+    earlier operation says it wrote — and the later operation, which reused
+    that block, still has to be replayable at all."""
+    (bench,) = await _exercise_ids(session_factory, "supino-reto")
+
+    first_command = _manual(batch, _activity(bench, "Supino reto", sets=3))
+    await workout.log_workout(first_command)
+
+    async with unit_of_work(session_factory) as session:
+        from app.infrastructure.postgres.models import MessageBatch as _Batch
+
+        second = _Batch(user_id=batch.user_id, conversation_id=batch.conversation_id)
+        session.add(second)
+        await session.flush()
+        second_id = second.id
+
+    second_command = _manual(batch, _activity(bench, "Supino reto", sets=2), batch_id=second_id)
+    await workout.log_workout(second_command)
+
+    first_replay = await workout.log_workout(first_command)
+    second_replay = await workout.log_workout(second_command)
+
+    assert first_replay.replayed is True
+    assert first_replay.set_count == 3, "the earlier operation wrote three sets, and still did"
+    assert second_replay.replayed is True
+    assert second_replay.set_count == 2
+    assert await _count(session_factory, SessionExercise) == 1
+    assert await _count(session_factory, ExerciseSet) == 5
+
+
+async def test_a_soft_deleted_block_keeps_its_index(
+    session_factory: async_sessionmaker[AsyncSession],
+    workout: WorkoutApplicationService,
+    batch: _Fixture,
+) -> None:
+    """The unique index counts soft-deleted rows, so numbering the next block
+    as though they were gone collides with one that still exists."""
+    from datetime import UTC, datetime
+
+    bench, row = await _exercise_ids(session_factory, "supino-reto", "remada-curvada")
+
+    await workout.log_workout(_manual(batch, _activity(bench, "Supino reto")))
+
+    async with unit_of_work(session_factory) as session:
+        block = (await session.scalars(sa.select(SessionExercise))).one()
+        block.deleted_at = datetime.now(UTC)
+
+        from app.infrastructure.postgres.models import MessageBatch as _Batch
+
+        second = _Batch(user_id=batch.user_id, conversation_id=batch.conversation_id)
+        session.add(second)
+        await session.flush()
+        second_id = second.id
+
+    await workout.log_workout(_manual(batch, _activity(row, "Remada curvada"), batch_id=second_id))
+
+    async with session_factory() as session:
+        indexes = (
+            await session.scalars(
+                sa.select(SessionExercise.exercise_block_index).order_by(
+                    SessionExercise.exercise_block_index
+                )
+            )
+        ).all()
+
+    assert list(indexes) == [0, 1]

@@ -138,44 +138,51 @@ class WorkoutApplicationService:
             "log workout replayed",
             extra={"operation_id": command.operation_id},
         )
-        blocks = (
-            await session.scalars(
-                sa.select(SessionExercise)
+        # Reconstructed from the *sets* this batch wrote, not from the blocks.
+        # A block is reused when the same exercise is logged again, so a later
+        # batch adds no block-level provenance: reading blocks would find
+        # nothing for that operation, and would credit the earlier one with
+        # sets it never wrote.
+        # count(distinct): one provenance row per source message means the join
+        # multiplies, and it is the sets being counted rather than the rows
+        # that point at them.
+        rows = (
+            await session.execute(
+                sa.select(
+                    ExerciseSet.session_exercise_id,
+                    sa.func.count(sa.distinct(ExerciseSet.id)),
+                )
                 .join(
                     EntitySource,
                     sa.and_(
-                        EntitySource.entity_id == SessionExercise.id,
-                        EntitySource.entity_type == "session_exercise",
+                        EntitySource.entity_id == ExerciseSet.id,
+                        EntitySource.entity_type == "exercise_set",
                     ),
                 )
-                .where(EntitySource.message_batch_id == command.message_batch_id)
-                # One row per source message means several per block; the
-                # blocks are what is being counted, not the provenance.
-                .distinct()
-                .order_by(SessionExercise.exercise_block_index)
+                .where(
+                    EntitySource.message_batch_id == command.message_batch_id,
+                    ExerciseSet.deleted_at.is_(None),
+                )
+                .group_by(ExerciseSet.session_exercise_id)
             )
         ).all()
 
         exercises: list[LoggedExercise] = []
         training_session_id: UUID | None = None
-        for block in blocks:
+        for session_exercise_id, count in rows:
+            block = await session.get(SessionExercise, session_exercise_id)
+            if block is None:  # pragma: no cover - the set references it
+                continue
             training_session_id = block.training_session_id
-            count = await session.scalar(
-                sa.select(sa.func.count())
-                .select_from(ExerciseSet)
-                .where(
-                    ExerciseSet.session_exercise_id == block.id,
-                    ExerciseSet.deleted_at.is_(None),
-                )
-            )
             exercises.append(
                 LoggedExercise(
                     session_exercise_id=block.id,
                     canonical_name=await self._canonical_name(session, block),
                     block_index=block.exercise_block_index,
-                    set_count=int(count or 0),
+                    set_count=count,
                 )
             )
+        exercises.sort(key=lambda exercise: exercise.block_index)
 
         if training_session_id is None:  # pragma: no cover - a claim implies rows
             raise RuntimeError(
@@ -207,11 +214,14 @@ class WorkoutApplicationService:
         training_session: TrainingSession,
     ) -> dict[str, ExerciseGroup]:
         groups: dict[str, ExerciseGroup] = {}
-        for index, group in enumerate(command.groups):
+        for group in command.groups:
+            # Read fresh each time: the previous group was flushed, so the max
+            # has already moved. Adding an offset on top of it would number
+            # them 0, 2, 4 and lose what a position means.
             row = ExerciseGroup(
                 training_session_id=training_session.id,
                 group_type=group.group_type,
-                block_index=await self._next_group_index(session, training_session, index),
+                block_index=await self._next_group_index(session, training_session),
                 rounds=group.rounds,
             )
             session.add(row)
@@ -227,14 +237,14 @@ class WorkoutApplicationService:
         return groups
 
     async def _next_group_index(
-        self, session: AsyncSession, training_session: TrainingSession, offset: int
+        self, session: AsyncSession, training_session: TrainingSession
     ) -> int:
         highest = await session.scalar(
             sa.select(sa.func.max(ExerciseGroup.block_index)).where(
                 ExerciseGroup.training_session_id == training_session.id
             )
         )
-        return (int(highest) + 1 if highest is not None else 0) + offset
+        return int(highest) + 1 if highest is not None else 0
 
     async def _write_activity(
         self,
@@ -291,29 +301,44 @@ class WorkoutApplicationService:
         highest block is the only reuse candidate — anything earlier would
         reorder the workout.
         """
+        # A reference naming no declared group is a producer bug, not the
+        # user's. Dropping the grouping keeps the sets they actually did (Q57),
+        # where a KeyError here would take the whole workout down with it.
+        group = groups.get(activity.group_ref) if activity.group_ref else None
+        if activity.group_ref and group is None:
+            logger.warning(
+                "group reference names no group",
+                extra={"group_ref": activity.group_ref, "exercise": activity.canonical_name},
+            )
+        group_id = group.id if group is not None else None
+
+        # Every block, including soft-deleted ones: the unique index counts
+        # them, so numbering the next one as though they were gone collides
+        # with a row that still exists.
         highest = await session.scalar(
             sa.select(SessionExercise)
-            .where(
-                SessionExercise.training_session_id == training_session.id,
-                SessionExercise.deleted_at.is_(None),
-            )
+            .where(SessionExercise.training_session_id == training_session.id)
             .order_by(SessionExercise.exercise_block_index.desc())
             .limit(1)
         )
-        if highest is not None and highest.exercise_id == activity.exercise_id:
+        if (
+            highest is not None
+            and highest.deleted_at is None
+            and highest.exercise_id == activity.exercise_id
+            # Group membership is part of what a block *is*: bench alone and
+            # bench inside a superset are two things that happened, and filing
+            # the second under the first loses the grouping silently.
+            and highest.exercise_group_id == group_id
+        ):
             return highest, False
 
         block = SessionExercise(
             training_session_id=training_session.id,
             exercise_id=activity.exercise_id,
-            exercise_group_id=groups[activity.group_ref].id if activity.group_ref else None,
+            exercise_group_id=group_id,
             position_in_group=(
-                len([1 for key in groups if key == activity.group_ref]) - 1
-                if activity.group_ref
-                else None
+                await self._next_position(session, group_id) if group_id is not None else None
             ),
-            # Soft-deleted blocks still consume an index: renumbering would
-            # rewrite an order the user was already shown.
             exercise_block_index=(highest.exercise_block_index + 1) if highest else 0,
             activity_type=activity.activity_type,
             raw_effort=activity.effort.raw if activity.effort else None,
@@ -325,6 +350,21 @@ class WorkoutApplicationService:
         session.add(block)
         await session.flush()
         return block, True
+
+    async def _next_position(self, session: AsyncSession, group_id: UUID) -> int:
+        """The next free place in a group.
+
+        Read from the rows already assigned to it rather than counted in
+        Python: two members sharing a position violate the index that makes the
+        group's order readable, and take the whole workout down with them.
+        """
+        highest = await session.scalar(
+            sa.select(sa.func.max(SessionExercise.position_in_group)).where(
+                SessionExercise.exercise_group_id == group_id,
+                SessionExercise.deleted_at.is_(None),
+            )
+        )
+        return int(highest) + 1 if highest is not None else 0
 
     async def _next_set_index(self, session: AsyncSession, block: SessionExercise) -> int:
         highest = await session.scalar(
