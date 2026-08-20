@@ -49,6 +49,35 @@ Locally the dispatcher uses `FakeWhatsAppClient`: there is no Meta integration
 yet (decision D6), and nothing leaves the machine. In a deployed environment
 that process refuses to start rather than silently dropping replies.
 
+## Strict-syntax logging (temporary)
+
+Sprint 2 records real workouts without a language model in the loop, so logging
+goes through a deliberately rigid syntax:
+
+```text
+#log <exercise words> [<load>] [<reps> ...] [@<effort>]
+```
+
+```text
+#log supino 80kg 10 9 8      → three sets of supino, 80 kg on the first
+#log flexao 10               → one set of ten, no load
+#log supino 80kg 10 @RPE8    → one set, effort RPE 8
+```
+
+Every token type is told apart by its shape: a load carries a unit suffix, reps
+are bare integers, an effort is prefixed with `@`. The parser knows no synonyms
+and infers nothing — `#log supino 80kg` records a set with no repetitions,
+which becomes a question rather than a guess. `3x10` is refused on purpose: it
+is natural language, and this adapter must not grow toward the extractor it is
+standing in for.
+
+A line that starts with `#log` and does not parse is reported back to the user.
+Anything without the prefix is not addressed to this parser and gets the
+ordinary acknowledgement.
+
+**This file is removed in Sprint 3**, when the `WorkoutExtractor` lands; its
+contract test becomes that extractor's first eval case.
+
 ## Layout
 
 `src/app/` follows §6 of the spec, and `tests/unit/test_project_layout.py` parses that
