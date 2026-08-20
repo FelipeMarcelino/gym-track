@@ -296,11 +296,11 @@ Every item is mechanically verifiable — no "works on my machine". All 22 are
 met; each line names what checks it.
 
 - [x] `make demo` logs a workout through the running stack and fails if the sets are not persisted. — `scripts/demo.py::WORKOUT_QUERY`; verified by running it, and by stopping `workflow-worker` and watching it fail.
-- [x] `make check` passes: unit, domain, contract, integration and E2E, with containers, in CI. — 1266 tests, green on every WS PR.
+- [x] `make check` passes: unit, domain, contract, integration and E2E, with containers, in CI. — green on every WS PR, containers included.
 - [x] No workstream merged without the tests listed under it, on a correctly prefixed branch with its own reviewed PR. — PRs #22–#33, each reviewed by Codex and CI-green before merge.
 - [x] `supino 80kg 10 9 8` produces one session, one exercise block and three sets, with the load EXPLICIT on the first and INHERITED on the rest. — `tests/e2e/test_workout_logging.py::test_a_logged_workout_reaches_the_database_and_comes_back`.
 - [x] `supino 80kg` produces no sets and a clarification naming *repetitions* (Q46). — `tests/e2e/test_workout_logging.py::test_an_incomplete_workout_asks_instead_of_writing`.
-- [x] `10 flexões` produces a valid set with no load (Q48). — `tests/application/test_workout_command_builder.py::test_ten_push_ups_are_a_complete_set`.
+- [x] `10 flexões` produces a valid set with no load (Q48). — `tests/application/test_workout_command_builder.py::test_ten_push_ups_are_a_complete_set`, parametrized over the plural the criterion actually names.
 - [x] A dumbbell load of 20 kg is stored as PER_IMPLEMENT without being asked (Q49). — `test_a_dumbbell_exercise_is_per_implement_without_being_told`, read from `equipment.is_implement`.
 - [x] Returning to an exercise after another creates a second block, and the two blocks' indices preserve workout order (Q58). — `tests/integration/test_workout_schema.py::test_a_b_a_keeps_the_order_it_was_performed_in`.
 - [x] A raw name matching a user alias resolves to that user's exercise even when a global alias says otherwise (§16 order). — `test_a_users_own_alias_wins_over_the_global_one`.
