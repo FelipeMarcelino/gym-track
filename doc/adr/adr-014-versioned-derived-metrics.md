@@ -91,7 +91,9 @@ known outputs, known versions. It has already caught a real arithmetic error —
 
 The CHECK constraints in migration `0007_workout_domain` are asserted by
 `tests/integration/test_workout_schema.py::test_a_derived_value_cannot_be_stored_without_its_version`,
-which requires an `IntegrityError` when a value arrives without its version.
+which requires an `IntegrityError` when a value arrives without its version —
+parametrized over **all four pairs**, because a constraint no test exercises is
+one a later migration can drop without anything noticing.
 
 `WorkoutApplicationService._apply_metrics` writes through a version-to-column
 map and raises on an unknown version, so a metric added without a column pair

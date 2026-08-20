@@ -38,8 +38,9 @@ A rigid, positional syntax, and no more:
 ```
 
 Every token type is distinguished by shape: a load carries a unit suffix, reps
-are bare integers, an effort is prefixed with `@`. The prefix must be the whole
-first token, so `#logger` is an ordinary hashtag.
+are bare integers, an effort is prefixed with `@` and must be the **last** token
+on the line. The `#log` prefix must be the whole first token, so `#logger` is an
+ordinary hashtag.
 
 The parser **infers nothing**. `#log supino 80kg` produces a set with no
 repetitions, which is exactly what Q46 turns into a clarification. `3x10` is
@@ -91,6 +92,10 @@ every failure ambiguous between the two.
 `test_the_x_notation_is_refused_on_purpose` requires `3x10` to raise, and
 `test_a_marked_line_that_does_not_parse_says_so` requires an error rather than
 a silent skip.
+
+The declared positions are enforced rather than merely documented: an effort
+anywhere but last is refused, which is the difference between a positional
+grammar and a README that describes one.
 
 `test_no_value_is_invented` is the mechanical form of the whole decision: for
 every accepted line, every value in the produced contract must appear as a
