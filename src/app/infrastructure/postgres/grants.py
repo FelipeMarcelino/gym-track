@@ -39,6 +39,13 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
     ServiceName.WORKFLOW_WORKER: {
         "users": ("SELECT",),
         "training_sessions": ("SELECT", "INSERT", "UPDATE"),
+        "session_exercises": ("SELECT", "INSERT", "UPDATE"),
+        "exercise_sets": ("SELECT", "INSERT", "UPDATE"),
+        "exercise_groups": ("SELECT", "INSERT", "UPDATE"),
+        # No UPDATE: provenance is history, and history that can be edited
+        # answers "why does the database say this" with whatever was most
+        # recently convenient (§26.2).
+        "entity_sources": ("SELECT", "INSERT"),
         "audit_events": ("SELECT", "INSERT"),
         # The catalog is read-only to every process except for learned aliases,
         # which Sprint 3 writes when a user answers a clarification.
@@ -88,6 +95,10 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
 ALL_TABLES: Final[tuple[str, ...]] = (
     "users",
     "training_sessions",
+    "session_exercises",
+    "exercise_sets",
+    "exercise_groups",
+    "entity_sources",
     "audit_events",
     "exercises",
     "exercise_aliases",

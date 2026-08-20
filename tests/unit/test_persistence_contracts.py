@@ -27,6 +27,10 @@ EXPECTED_TABLES = frozenset(
     {
         "users",
         "training_sessions",
+        "session_exercises",
+        "exercise_sets",
+        "exercise_groups",
+        "entity_sources",
         "audit_events",
         "exercises",
         "exercise_aliases",
@@ -49,7 +53,7 @@ EXPECTED_TABLES = frozenset(
 )
 
 #: Append-only by §26: nothing may rewrite history after the fact.
-APPEND_ONLY_TABLES = frozenset({"domain_events", "audit_events"})
+APPEND_ONLY_TABLES = frozenset({"domain_events", "audit_events", "entity_sources"})
 
 
 def test_migration_0001_covers_exactly_the_sprint_tables() -> None:
@@ -98,6 +102,9 @@ def test_soft_delete_is_carried_only_by_entities_that_keep_history() -> None:
         "exercises",
         "exercise_aliases",
         "training_sessions",
+        "session_exercises",
+        "exercise_sets",
+        "exercise_groups",
     }
 
 

@@ -9,6 +9,7 @@ ages badly.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -18,7 +19,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.domain.exercises.catalog import AliasSource, ExerciseRelationType, MuscleRole
-from app.domain.training.activities import ActivityType, LoadMode
+from app.domain.training.activities import ActivityType, LoadMode, SetType
+from app.domain.training.effort import EffortMethod
+from app.domain.training.provenance import ExerciseGroupType, Provenance, SourceRole
 from app.infrastructure.postgres.base import Base, SoftDeleteMixin, enum_column
 
 
@@ -625,3 +628,196 @@ class AuditEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
     )
+
+
+class SessionExercise(Base, SoftDeleteMixin):
+    """One exercise as performed inside a session (Q58).
+
+    A block rather than "the exercise in this workout": coming back to the
+    bench press after squats is a second block, and the index preserves the
+    order it happened in. Grouping by exercise would answer "what did I do
+    first" with an ordering the user never performed.
+    """
+
+    __tablename__ = "session_exercises"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "training_session_id", "exercise_block_index", name="uq_session_exercises_block"
+        ),
+        sa.Index("ix_session_exercises_block", "training_session_id", "exercise_block_index"),
+    )
+
+    training_session_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("training_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: NOT NULL on purpose: WS-7 resolves before anything is written, so an
+    #: unresolved exercise never reaches a row (§16).
+    exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("exercises.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    exercise_group_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("exercise_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    position_in_group: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    exercise_block_index: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    #: Denormalized from the catalog at write time so a later catalog edit
+    #: cannot retroactively change what a past workout says it was.
+    activity_type: Mapped[ActivityType] = mapped_column(enum_column(ActivityType), nullable=False)
+    raw_effort: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    normalized_rpe: Mapped[Decimal | None] = mapped_column(sa.Numeric(3, 1), nullable=True)
+    effort_method: Mapped[EffortMethod | None] = mapped_column(
+        enum_column(EffortMethod), nullable=True
+    )
+    effort_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    #: The current interaction's time (§7.3, Q32). Backdating is Sprint 4's.
+    performed_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+    notes: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    expected_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
+
+
+class ExerciseSet(Base, SoftDeleteMixin):
+    """One set. Every derived number carries the version that produced it."""
+
+    __tablename__ = "exercise_sets"
+    __table_args__ = (
+        sa.UniqueConstraint("session_exercise_id", "set_index", name="uq_exercise_sets_index"),
+        # Q52: a derived value without its version cannot be reproduced or
+        # recomputed, which makes it worse than no value. The pairing is a
+        # CHECK because a code review is a weaker place to enforce it.
+        sa.CheckConstraint(
+            "(volume_kg IS NULL) = (volume_metric_version IS NULL)",
+            name="ck_exercise_sets_volume_versioned",
+        ),
+        sa.CheckConstraint(
+            "(estimated_one_rm_kg IS NULL) = (one_rm_metric_version IS NULL)",
+            name="ck_exercise_sets_one_rm_versioned",
+        ),
+        sa.CheckConstraint(
+            "(pace_s_per_km IS NULL) = (pace_metric_version IS NULL)",
+            name="ck_exercise_sets_pace_versioned",
+        ),
+        sa.CheckConstraint(
+            "(speed_m_s IS NULL) = (speed_metric_version IS NULL)",
+            name="ck_exercise_sets_speed_versioned",
+        ),
+    )
+
+    session_exercise_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("session_exercises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: Never renumbered when a set is soft-deleted: the numbering is what the
+    #: user was already shown, and rewriting it rewrites their history.
+    set_index: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    set_type: Mapped[SetType] = mapped_column(
+        enum_column(SetType), default=SetType.WORKING, nullable=False
+    )
+
+    repetitions: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    repetitions_provenance: Mapped[Provenance | None] = mapped_column(
+        # Named explicitly: SQLAlchemy names an enum's CHECK after the enum,
+        # and four Provenance columns in one table would collide.
+        enum_column(Provenance, name="ck_exercise_sets_repetitions_provenance"),
+        nullable=True,
+    )
+    #: SI throughout (D4). Numeric rather than float: 2.5 kg plates do not
+    #: survive binary floating point unchanged, and a total that drifts by
+    #: grams looks like a bug in the arithmetic to the person reading it.
+    load_kg: Mapped[Decimal | None] = mapped_column(sa.Numeric(7, 3), nullable=True)
+    load_mode: Mapped[LoadMode | None] = mapped_column(enum_column(LoadMode), nullable=True)
+    load_provenance: Mapped[Provenance | None] = mapped_column(
+        # Named explicitly: SQLAlchemy names an enum's CHECK after the enum,
+        # and four Provenance columns in one table would collide.
+        enum_column(Provenance, name="ck_exercise_sets_load_provenance"),
+        nullable=True,
+    )
+    #: §19 keeps what the user reported separate from what it means: "60kg" on
+    #: a machine is the reported load, and the effective one may differ.
+    raw_load_text: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+
+    distance_m: Mapped[Decimal | None] = mapped_column(sa.Numeric(10, 3), nullable=True)
+    distance_provenance: Mapped[Provenance | None] = mapped_column(
+        # Named explicitly: SQLAlchemy names an enum's CHECK after the enum,
+        # and four Provenance columns in one table would collide.
+        enum_column(Provenance, name="ck_exercise_sets_distance_provenance"),
+        nullable=True,
+    )
+    duration_s: Mapped[Decimal | None] = mapped_column(sa.Numeric(10, 3), nullable=True)
+    duration_provenance: Mapped[Provenance | None] = mapped_column(
+        # Named explicitly: SQLAlchemy names an enum's CHECK after the enum,
+        # and four Provenance columns in one table would collide.
+        enum_column(Provenance, name="ck_exercise_sets_duration_provenance"),
+        nullable=True,
+    )
+
+    raw_effort: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    normalized_rpe: Mapped[Decimal | None] = mapped_column(sa.Numeric(3, 1), nullable=True)
+    effort_method: Mapped[EffortMethod | None] = mapped_column(
+        enum_column(EffortMethod), nullable=True
+    )
+    effort_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+
+    volume_kg: Mapped[Decimal | None] = mapped_column(sa.Numeric(12, 3), nullable=True)
+    volume_metric_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    estimated_one_rm_kg: Mapped[Decimal | None] = mapped_column(sa.Numeric(7, 3), nullable=True)
+    one_rm_metric_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    pace_s_per_km: Mapped[Decimal | None] = mapped_column(sa.Numeric(10, 3), nullable=True)
+    pace_metric_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    speed_m_s: Mapped[Decimal | None] = mapped_column(sa.Numeric(10, 3), nullable=True)
+    speed_metric_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+
+    expected_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
+
+
+class ExerciseGroup(Base, SoftDeleteMixin):
+    """A superset, triset, circuit or complex (Q51).
+
+    A row rather than a naming convention on the block, because "I supersetted
+    these two" is a fact about how the workout was performed and questions get
+    asked of it later.
+    """
+
+    __tablename__ = "exercise_groups"
+    __table_args__ = (
+        sa.UniqueConstraint("training_session_id", "block_index", name="uq_exercise_groups_block"),
+    )
+
+    training_session_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("training_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    group_type: Mapped[ExerciseGroupType] = mapped_column(
+        enum_column(ExerciseGroupType), nullable=False
+    )
+    block_index: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    rounds: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+
+
+class EntitySource(Base):
+    """Which message a stored row exists because of (§26.2).
+
+    Append-only and never updated: provenance that can be rewritten answers
+    "why does the database say this" with whatever was most recently convenient.
+    """
+
+    __tablename__ = "entity_sources"
+    __table_args__ = (
+        # A row naming neither a message nor a batch records that something
+        # came from somewhere, which is not provenance.
+        sa.CheckConstraint(
+            "message_id IS NOT NULL OR message_batch_id IS NOT NULL",
+            name="ck_entity_sources_has_a_source",
+        ),
+        sa.Index("ix_entity_sources_entity", "entity_type", "entity_id"),
+        sa.Index("ix_entity_sources_batch", "message_batch_id"),
+    )
+
+    entity_type: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    entity_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    message_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=True
+    )
+    message_batch_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("message_batches.id", ondelete="CASCADE"), nullable=True
+    )
+    source_role: Mapped[SourceRole] = mapped_column(enum_column(SourceRole), nullable=False)

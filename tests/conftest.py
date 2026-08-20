@@ -199,6 +199,10 @@ async def session_factory(
 #: User-learned aliases *are* test state, so those go by predicate.
 CLEANUP_STATEMENTS: tuple[str, ...] = (
     "DELETE FROM audit_events",
+    "DELETE FROM entity_sources",
+    "DELETE FROM exercise_sets",
+    "DELETE FROM session_exercises",
+    "DELETE FROM exercise_groups",
     "DELETE FROM outbox_events",
     "DELETE FROM domain_events",
     "DELETE FROM outbound_messages",
