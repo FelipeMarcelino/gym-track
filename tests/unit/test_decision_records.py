@@ -27,12 +27,16 @@ REQUIRED_SECTIONS = (
     "## How this is enforced",
 )
 
-#: The ADRs Sprint 1 commits to, from the sprint plan's WS-12.
+#: The records each sprint's WS-12 promised: ADR-001 through ADR-011 from
+#: Sprint 1, ADR-012 through ADR-014 from Sprint 2.
 EXPECTED_ADRS = {
     "adr-001-modular-monolith.md",
     "adr-003-at-least-once-outbox.md",
     "adr-004-workflow-partitions.md",
     "adr-011-debounce-flush-mechanism.md",
+    "adr-012-deterministic-exercise-resolution.md",
+    "adr-013-strict-syntax-adapter.md",
+    "adr-014-versioned-derived-metrics.md",
 }
 
 

@@ -150,6 +150,10 @@ def test_unmarked_lines_in_the_batch_are_kept_rather_than_dropped() -> None:
         ("#log supino 80kg 10 @", "effort"),
         ("#log supino 80kg 10 @RPE7 @RPE9", "two efforts"),
         ("#log supino 80kg 90kg 10", "two loads"),
+        # The grammar puts the effort last. Accepting it anywhere would make
+        # the syntax positional in the documentation and not in the parser.
+        ("#log supino @RPE8 10", "last"),
+        ("#log @RPE8 supino 10", "last"),
     ],
 )
 def test_a_marked_line_that_does_not_parse_says_so(line: str, problem: str) -> None:

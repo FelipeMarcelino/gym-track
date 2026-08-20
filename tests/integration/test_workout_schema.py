@@ -225,17 +225,26 @@ async def test_a_set_records_which_of_its_values_were_stated(
     assert stored.raw_load_text == "60kg"
 
 
+@pytest.mark.parametrize(
+    "column",
+    ["volume_kg", "estimated_one_rm_kg", "pace_s_per_km", "speed_m_s"],
+)
 async def test_a_derived_value_cannot_be_stored_without_its_version(
-    session_factory: async_sessionmaker[AsyncSession], workout: _Workout
+    session_factory: async_sessionmaker[AsyncSession], workout: _Workout, column: str
 ) -> None:
     """Q52: a number nobody can reproduce is worse than no number. The pairing
-    is a CHECK because a review is a weaker place to enforce it."""
+    is a CHECK because a review is a weaker place to enforce it.
+
+    All four pairs, not just volume: a constraint that is never exercised is a
+    constraint that can be dropped by a later migration without anything
+    noticing, and ADR-014 cites this test as the thing that would notice.
+    """
     bench = await _exercise_id(session_factory, "supino-reto")
 
     with pytest.raises(IntegrityError):
         async with unit_of_work(session_factory) as session:
             block = await _block(session, workout, bench, 0)
-            session.add(_set(block.id, 0, repetitions=10, volume_kg=Decimal("600.000")))
+            session.add(_set(block.id, 0, repetitions=10, **{column: Decimal("600.000")}))
 
 
 async def test_a_derived_value_with_its_version_is_accepted(

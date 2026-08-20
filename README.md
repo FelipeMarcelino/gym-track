@@ -77,7 +77,7 @@ goes through a deliberately rigid syntax:
 ```
 
 Every token type is told apart by its shape: a load carries a unit suffix, reps
-are bare integers, an effort is prefixed with `@`. The parser knows no synonyms
+are bare integers, an effort is prefixed with `@` and comes last. The parser knows no synonyms
 and infers nothing — `#log supino 80kg` records a set with no repetitions,
 which becomes a question rather than a guess. `3x10` is refused on purpose: it
 is natural language, and this adapter must not grow toward the extractor it is

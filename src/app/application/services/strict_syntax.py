@@ -101,7 +101,15 @@ def _activity(line: str) -> StructuredActivityInput:
     repetitions: list[int] = []
     effort: str | None = None
 
-    for token in tokens:
+    # Counted up front so a line with two of them is told it has two, rather
+    # than being told the first one is in the wrong place.
+    marked = [token for token in tokens if token.startswith("@")]
+    if len(marked) > 1:
+        raise StrictSyntaxError(
+            stripped, f"two efforts in one line: {marked[0][1:]!r} and {marked[1][1:]!r}"
+        )
+
+    for position, token in enumerate(tokens):
         if _SETS_BY_REPS.match(token):
             raise StrictSyntaxError(
                 stripped,
@@ -109,11 +117,12 @@ def _activity(line: str) -> StructuredActivityInput:
                 "write the repetitions one per set",
             )
         if token.startswith("@"):
-            if effort is not None:
-                # Overwriting would accept the line and silently drop the
-                # first effort the user reported. The grammar allows one.
+            if position != len(tokens) - 1:
+                # The grammar puts the effort last. Accepting it anywhere would
+                # make the syntax positional in the README and not in the
+                # parser, which is the drift ADR-013 exists to prevent.
                 raise StrictSyntaxError(
-                    stripped, f"two efforts in one line: {effort!r} and {token[1:]!r}"
+                    stripped, f"the effort {token!r} must be the last token on the line"
                 )
             effort = token[1:]
             if not effort:
