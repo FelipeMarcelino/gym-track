@@ -217,6 +217,7 @@ execution_tasks
   started_at            timestamptz null
   finished_at           timestamptz null
   created_at            timestamptz not null default now()
+  updated_at            timestamptz not null default now()
   UNIQUE (workflow_execution_id, task_key)
   CHECK (status IN ('completed','failed','skipped')) = (finished_at IS NOT NULL)
 
@@ -232,6 +233,7 @@ pending_clarifications
   spec                     jsonb not null           -- the frozen ClarificationSpec
   expires_at               timestamptz not null
   created_at               timestamptz not null default now()
+  updated_at               timestamptz not null default now()
   resolved_at              timestamptz null
   answer_message_batch_id  uuid null fk -> message_batches(id) on delete set null
   FOREIGN KEY (workflow_execution_id, task_key) -> execution_tasks(workflow_execution_id, task_key)
@@ -245,16 +247,44 @@ Two details that will be got wrong if they are not written down:
 - The composite FK to `execution_tasks(workflow_execution_id, task_key)` needs a `UNIQUE` on exactly that pair to reference — Alembic **will not** emit it from a `UniqueConstraint` declared only in `__table_args__` if a same-column index already exists. Sprint 2's WS-6 lost an afternoon to precisely this; write it into the migration by hand and assert the constraint exists.
 - The status CHECKs must be **named explicitly** (`ck_execution_tasks_status`, `ck_pending_clarifications_status`, `ck_pending_clarifications_reason`). Two auto-named CHECKs on one table collide.
 
-Altering `workflow_executions.status`:
+Both tables inherit `Base`, which maps `id`, `created_at` **and** a non-null
+`updated_at` with an `onupdate` (`src/app/infrastructure/postgres/base.py`). A
+migration that stops at `created_at` produces an ORM that selects a column the
+database does not have — write `updated_at` into both `create_table` calls.
+
+`workflow_executions` changes in three ways, not one:
 
 ```python
+# 1. the status vocabulary (Q28)
 op.drop_constraint("workflowexecutionstatus", "workflow_executions", type_="check")
 op.create_check_constraint(
     "ck_workflow_executions_status", "workflow_executions",
     "status IN ('running','succeeded','failed','waiting_for_user','partial_success')")
+
+# 2. terminality, which the sprint file promises and the enum CHECK does not give
+op.create_check_constraint(
+    "ck_workflow_executions_finished_when_terminal", "workflow_executions",
+    "(status IN ('succeeded','failed','partial_success')) = (finished_at IS NOT NULL)")
+
+# 3. Q132: the version of the graph that produced this execution
+op.add_column("workflow_executions",
+              sa.Column("graph_version", sa.String(32), nullable=True))
 ```
 
-`downgrade()` drops both tables and restores the three-value constraint — which fails loudly if a `waiting_for_user` row exists, and that is the correct behaviour: a downgrade that silently discards a user's open question is worse than one that refuses.
+`waiting_for_user` is deliberately **not** terminal: the execution is paused,
+not finished, and stamping `finished_at` on it would make "how long do users
+wait for an answer" unanswerable.
+
+`graph_version` is nullable because rows written before this migration have no
+honest value for it; WS-7 populates it on every new execution. It is a column
+rather than a checkpoint field for the reason ADR-015 states — the checkpoint is
+not authoritative and may be pruned, so traceability that lives only there is
+traceability that disappears.
+
+`downgrade()` drops both tables, both new constraints and the column, and
+restores the three-value constraint — which fails loudly if a `waiting_for_user`
+row exists, and that is the correct behaviour: a downgrade that silently
+discards a user's open question is worse than one that refuses.
 
 ## Grants
 
@@ -268,6 +298,8 @@ op.create_check_constraint(
 - `test_a_finished_task_must_say_when` — COMPLETED with `finished_at` NULL is refused.
 - `test_a_clarification_belongs_to_a_task_of_its_own_execution` — the composite FK refuses a `task_key` from another execution.
 - `test_the_new_workflow_statuses_are_accepted` — `waiting_for_user` and `partial_success` insert; `nonsense` is refused.
+- `test_a_terminal_execution_must_say_when_it_finished` — `succeeded` with `finished_at` NULL is refused, and `waiting_for_user` with `finished_at` NULL is accepted, because a paused execution has not finished.
+- `test_an_execution_records_the_graph_that_produced_it` — `graph_version` is present on every row WS-7 writes.
 - `test_no_role_can_delete_a_clarification` — per role, fresh connection each.
 
 `tests/unit/test_persistence_contracts.py` — `EXPECTED_TABLES` grows by two and still equals `ALL_TABLES`.
@@ -704,12 +736,14 @@ WS-7 does not argue this. It injects the failure and counts rows.
 ```text
 + src/app/domain/clarification/__init__.py
 + src/app/domain/clarification/spec.py
++ src/app/domain/clarification/questions.py
 + src/app/graphs/main/interrupts.py
 + src/app/infrastructure/postgres/clarifications.py
 + tests/contract/fixtures/clarification_spec.json
 + tests/contract/test_clarification_spec.py
 + tests/integration/test_clarification_interrupt.py
 ~ src/app/graphs/main/handlers.py
+~ src/app/workers/workflow_worker.py            # completes the interrupt: row, question, status
 ~ src/app/application/commands/workout.py       # operation_id_for_clarification
 ```
 
@@ -771,14 +805,50 @@ build the command from the batch
   -> if there are valid activities:
          commit them          # operation_id_for(message_batch_id), unchanged
   -> if there are deferrals that are answerable:
-         write pending_clarifications  (same transaction as the commit above)
          ask(spec)            # <- the interrupt; nothing after this line runs now
   -> confirmation naming what was written and what is still open
 ```
 
-Two rules that the tests exist to pin down:
+**`ask()` ends the delivery, and that is the trap.** `interrupt()` suspends the
+whole graph: `collect_results`, `response_normalizer` and `persist_outbound`
+never run for this message. A plan that leaves the question to "the normal
+outbound path" therefore ships a system that suspends a workflow and tells the
+user nothing — the one failure mode this sprint exists to remove.
 
-- **Commit before interrupting, never after.** Q56 requires the valid activities to be persisted, and Q126 requires the interrupt to precede the *dependent* side effect — the deferred item's rows, which is exactly what is not written yet.
+So the interrupt is completed **by the worker, outside the paused graph**, in the
+transaction it already owns (WS-7):
+
+```text
+state = await graph.ainvoke(initial_state, config=thread_for(conversation_id))
+
+if interrupt_of(state) is not None:          # LangGraph reports the pending interrupt
+    spec = interrupt_of(state)
+    write pending_clarifications(spec)       # WAITING, expires_at = now + D10
+    write outbound_messages(question_for(spec))   # the same response-group path
+    execution.status = WAITING_FOR_USER
+    # commit, then ACK -- unchanged from Q130
+```
+
+Three consequences worth stating, because each is a test below:
+
+- The question text is built by `question_for(spec)` in
+  `domain/clarification/questions.py` — a pure function, reusing Sprint 2's
+  `clarification_request()` phrasing so the user sees the same sentences as today.
+- It goes through `outbound_messages` and the outbox like every other reply, so
+  the dispatcher, the retry tiers and the ordering guarantee all still apply.
+  Nothing about the outbound path is special-cased for clarifications.
+- The `pending_clarifications` row and the outbound question commit **together**.
+  A question the user received with no row to answer against, or a row with no
+  question sent, are both worse than neither.
+
+`interrupt_of(state)` is the one place the plan touches LangGraph's interrupt
+representation, and it is deliberately one function: the exact shape of what
+`ainvoke` returns for a suspended graph is on the *unmeasured* list at the top
+of this file. Measure it in WS-4 and keep the coupling to a single accessor.
+
+Two further rules that the tests exist to pin down:
+
+- **Commit before interrupting, never after.** Q56 requires the valid activities to be persisted, and Q126 requires the interrupt to precede the *dependent* side effect — the deferred item's rows, which is exactly what is not written yet. The clarification row and the question are not dependent side effects; they are how the pause becomes visible.
 - **The resumed write uses a different idempotency key.** `operation_id_for(batch)` is already claimed by the commit above. The resumed command uses `operation_id_for_clarification(clarification_id)`, so resuming cannot collide with, or be swallowed by, the claim the first delivery took.
 
 `ClarificationReason` is mapped from `DeferralReason` explicitly:
@@ -802,6 +872,8 @@ Two rules that the tests exist to pin down:
 - `test_a_mixed_batch_keeps_what_it_understood` — the valid exercise is persisted, the ambiguous one is not, and the reply says both (Q56, Q57).
 - `test_the_interrupt_precedes_the_deferred_write` — asserted on row counts at the moment of suspension, not by reading the code.
 - `test_the_clarification_row_and_the_checkpoint_agree` — the WAITING row's `clarification_id` is the one inside the checkpointed spec.
+- `test_the_question_and_its_row_commit_together` — inject a failure between the two writes; assert neither survives. A question with nothing to answer against is the worst outcome available here.
+- `test_the_question_travels_the_ordinary_outbound_path` — it lands in `outbound_messages` with a response group and an outbox row, exactly like a confirmation.
 - `test_a_redelivery_while_waiting_asks_once` — the same batch delivered twice produces one WAITING row and one outbound question.
 
 ## Done when
@@ -824,9 +896,9 @@ Two rules that the tests exist to pin down:
 + tests/domain/test_clarification_answers.py
 + tests/integration/test_resume.py
 + tests/integration/test_learned_aliases.py
-~ src/app/graphs/main/nodes.py                  # resolve_pending_workflow
+~ src/app/graphs/main/nodes.py                  # resolve_pending_workflow reads the decision
 ~ src/app/workers/session_expiration_worker.py  # the expiry sweep
-~ src/app/workers/workflow_worker.py            # resume instead of invoke
+~ src/app/workers/workflow_worker.py            # classify, then invoke or resume
 ```
 
 ## Signatures
@@ -875,7 +947,34 @@ The order of the checks is the design, and it is deliberately not "try to parse 
 
 Step 4 before step 5 matters: `#log agachamento 100kg 5 5 5` contains a list of integers and *would* parse as an answer to "quantas repetições?". Ordering the marker check first is what makes Q29 hold, and the test named below is the one that fails if the two steps are ever swapped.
 
-`resolve_pending_workflow` (the §11.1 node WS-4 left as identity) consults the resolver and puts the decision in state; the worker uses it to choose between `ainvoke(...)` and `ainvoke(Command(resume=answer), config=thread_for(conversation_id))`.
+**The decision cannot be made inside the graph, and §11.1's node list makes it
+look as though it can.** A resumed run re-enters at the interrupted node; it
+never visits `resolve_pending_workflow`, which sits near the start of the graph.
+A node that decides "is this an answer?" would therefore run only on the path
+where the answer is *not* being applied — the classification would be correct
+and useless.
+
+So the classification runs in the **worker**, before it chooses how to invoke:
+
+```text
+decision = await resolver.classify(session, conversation_id=..., texts=...)
+
+ANSWER        -> await graph.ainvoke(Command(resume=decision.answer),
+                                     config=thread_for(conversation_id))
+NEW_INTENT    -> await graph.ainvoke(initial_state | {"pending_decision": decision},
+                                     config=thread_for(conversation_id))
+CANCELLATION  -> close the row CANCELLED, confirm, do not touch the graph
+```
+
+`resolve_pending_workflow` **stays** as a §11.1 node and stops being identity: it
+reads the decision the worker put into the initial state and records it into
+`MainGraphState`, so the topology still matches the spec and the graph still
+carries the fact. What it must not do is *compute* it.
+
+This is a deviation from a literal reading of §11.1 and belongs in ADR-016 with
+the reason above — the node exists, its input is computed one layer out, and
+Sprint 4's harder classification (Q29's open cases) lands in the resolver
+service, not in the node.
 
 ## Learned aliases
 
@@ -901,6 +1000,7 @@ An ANSWER to an `AMBIGUOUS_ENTITY` question writes a **user-scoped row** into `e
 - `test_an_answer_after_expiry_starts_a_new_workflow` — the row is EXPIRED, nothing is resumed.
 - `test_a_cancel_phrase_closes_the_question` — status CANCELLED and a confirmation the user can understand.
 - `test_a_redelivered_answer_resumes_once` — one set, not two; the second delivery finds the claim taken.
+- `test_the_classification_happens_before_the_graph_is_invoked` — a resumed run never visits the nodes before the interrupt, asserted on the node-visit trace. This is the test that fails if the decision is ever moved back into the graph.
 - `test_the_resumed_command_uses_its_own_operation_id` — asserted on `processed_operations`, two rows with different keys.
 
 `tests/integration/test_learned_aliases.py`
@@ -1029,7 +1129,7 @@ The demo runs green against `make up`, and red against a stack with the worker s
 
 **ADR-015 — LangGraph checkpoint isolation.** The dedicated schema, `search_path` rather than a parameter that does not exist, admin-owned DDL, `thread_id = conversation_id`, and the sentence that matters most: *a checkpoint is never authoritative for business state.* Traceability: §11.5, Q123, Q124, Q145, DEC-005. Enforced by: the schema-location test, the role tests, and the checkpoint-ahead-of-rollback failure injection.
 
-**ADR-016 — Clarification as an interrupt.** Why `pending_clarifications` exists beside the checkpoint (Q125), why at most one is open per conversation, why the marker check precedes the parse (Q29), and why `expected_response_schema` had to gain a `kind` §40.2 does not name. Traceability: §15, §39.2, §40.2, Q29, Q125, Q126. Enforced by: the partial unique index test, the Q29 ordering test, the golden spec fixture.
+**ADR-016 — Clarification as an interrupt.** Why `pending_clarifications` exists beside the checkpoint (Q125), why at most one is open per conversation, why the marker check precedes the parse (Q29), why `expected_response_schema` had to gain a `kind` §40.2 does not name, why the pause is completed by the worker rather than by the suspended graph, and why `resolve_pending_workflow` records a decision it does not compute. Traceability: §15, §39.2, §40.2, Q29, Q125, Q126. Enforced by: the partial unique index test, the Q29 ordering test, the golden spec fixture.
 
 ## Done when
 

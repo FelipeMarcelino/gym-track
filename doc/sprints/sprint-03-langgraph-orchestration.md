@@ -249,8 +249,13 @@ a merge, one PR each, reviewed and CI-green before merging.
    the pending item would write. The committed part carries the operation id it
    already had; the resumed part gets its own, derived from `clarification_id`,
    so resuming cannot rewrite what is already there.
-4. A `pending_clarifications` row is written in the same transaction (Q125), and
-   the question reaches the user through the normal outbound path.
+4. **The pause is completed by the worker, not by the suspended graph.**
+   `interrupt()` stops everything downstream of it, so the nodes that would
+   normally write the reply never run. The worker reads the pending interrupt
+   out of the returned state and writes the `pending_clarifications` row, the
+   outbound question and the `WAITING_FOR_USER` status in the one transaction it
+   already owns (Q125, Q130). A row without a question, or a question without a
+   row, are both worse than neither — so they commit together.
 5. Tests: `#log supino 80kg` writes zero sets, one WAITING row and one outbound
    question; a mixed batch writes the valid exercise and still asks about the
    other; the interrupt is proven to happen before the deferred item's write by
@@ -262,18 +267,24 @@ a merge, one PR each, reviewed and CI-green before merging.
    spec's `expected_response_schema`, **NEW_INTENT** when it carries the strict
    marker or fails that parse, **CANCELLATION** on an explicit pt-BR cancel
    phrase. Deterministic this sprint; Q29's harder cases are Sprint 4's.
-2. An ANSWER resumes the original thread with `Command(resume=…)`, the deferred
+2. It runs in the **worker**, before the graph is invoked. A resumed run
+   re-enters at the interrupted node and never visits the earlier nodes, so a
+   classification computed inside the graph would run only on the path where its
+   answer is not needed. §11.1's `resolve_pending_workflow` stays a node and
+   records the decision; it does not compute it. The deviation is recorded in
+   ADR-016.
+3. An ANSWER resumes the original thread with `Command(resume=…)`, the deferred
    activity completes, and the confirmation names what was written.
-3. A NEW_INTENT starts its own workflow and **leaves the pending clarification
+4. A NEW_INTENT starts its own workflow and **leaves the pending clarification
    open** — Q29 says a pending question must not block unrelated work.
-4. An answered *exercise* clarification writes a **user-scoped alias** into
+5. An answered *exercise* clarification writes a **user-scoped alias** into
    `exercise_aliases` — the resolver's stage 1 exists to be taught, the grant
    for it was already written in Sprint 2, and a user who explains a word once
    should not be asked about it again.
-5. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
+6. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
    `session-expiration-worker`. An expired question is closed, never answered
    later by an unrelated message.
-6. Tests: the two-message round trip persists the sets on the second message and
+7. Tests: the two-message round trip persists the sets on the second message and
    not the first; an answer arriving after expiry starts a new workflow instead
    of resuming a dead one; a `#log` during a pending clarification leaves the
    WAITING row untouched; a redelivered answer resumes once and writes one set;
@@ -324,6 +335,9 @@ that checks each line, not by agreement that it feels done.
 - [ ] `#log supino 80kg` writes zero `exercise_sets`, one WAITING `pending_clarifications` row, and one outbound question naming *repetições*.
 - [ ] Answering `8 8 8` resumes that workflow and writes three sets attributed to both messages through `entity_sources`.
 - [ ] A `#log` for a different exercise sent while a clarification is pending starts its own workflow and leaves the WAITING row untouched (Q29).
+- [ ] The clarification question and its `pending_clarifications` row commit together, or neither exists.
+- [ ] Every `workflow_executions` row records the `graph_version` that produced it, in SQL rather than only in a checkpoint (Q132).
+- [ ] A terminal execution cannot have a NULL `finished_at`, and a `WAITING_FOR_USER` one must.
 - [ ] Answering *which* exercise was meant writes a user alias, and the same raw name resolves without asking the second time (§16 stage 1).
 - [ ] A clarification past `expires_at` is closed by the sweeper, and a later answer starts a new workflow rather than resuming a dead one.
 - [ ] Two WAITING clarifications in one conversation are refused by a partial unique index, not by application code.
