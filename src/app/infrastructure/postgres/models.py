@@ -791,6 +791,10 @@ class ExerciseSet(Base, SoftDeleteMixin):
     speed_m_s: Mapped[Decimal | None] = mapped_column(sa.Numeric(10, 3), nullable=True)
     speed_metric_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
 
+    #: Per set, because the contract accepts it per set: "esteira" on one
+    #: interval is a fact about that interval, and dropping it would lose
+    #: something the user took the trouble to say.
+    notes: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     expected_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
 
 
