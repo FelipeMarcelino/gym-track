@@ -58,13 +58,21 @@ class ExerciseResolver:
             # understand rather than a candidate list built from nothing.
             return ExerciseResolution(raw_name=raw_name, requires_clarification=True)
 
-        for method, entry in (
-            (ResolutionMethod.USER_ALIAS, await self._catalog.by_user_alias(normalized, user_id)),
-            (ResolutionMethod.GLOBAL_ALIAS, await self._catalog.by_global_alias(normalized)),
-            (ResolutionMethod.CANONICAL, await self._catalog.by_canonical_name(normalized)),
-        ):
-            if entry is not None:
-                return self._exact(raw_name, entry, method)
+        # Awaited one at a time, and only when the stage before it came back
+        # empty. Building this as a tuple ran all three every time: each is a
+        # round trip, the canonical one loads the whole catalog, and a failure
+        # in a stage nobody needed would discard a hit that already succeeded.
+        entry = await self._catalog.by_user_alias(normalized, user_id)
+        if entry is not None:
+            return self._exact(raw_name, entry, ResolutionMethod.USER_ALIAS)
+
+        entry = await self._catalog.by_global_alias(normalized)
+        if entry is not None:
+            return self._exact(raw_name, entry, ResolutionMethod.GLOBAL_ALIAS)
+
+        entry = await self._catalog.by_canonical_name(normalized)
+        if entry is not None:
+            return self._exact(raw_name, entry, ResolutionMethod.CANONICAL)
 
         return await self._fuzzy(raw_name, normalized)
 

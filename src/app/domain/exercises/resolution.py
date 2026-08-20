@@ -75,6 +75,11 @@ class ExerciseResolution:
                 "a resolution cannot both name an exercise and require clarification; "
                 "one of them is what the caller acts on"
             )
+        if self.exercise_id is not None and self.canonical_name is None:
+            raise ValueError(
+                "a resolved exercise must carry its canonical_name; an id alone is a resolution "
+                "nothing can show the user or read back in an audit row"
+            )
         if self.exercise_id is not None and self.method is None:
             raise ValueError(
                 "a resolved exercise must carry the method that resolved it, or the row it "

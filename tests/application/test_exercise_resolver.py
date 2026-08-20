@@ -108,6 +108,30 @@ class FakeCatalog:
         ]
 
 
+class _CountingCatalog:
+    """Records which stages were consulted, in order."""
+
+    def __init__(self, inner: FakeCatalog) -> None:
+        self._inner = inner
+        self.calls: list[str] = []
+
+    async def by_user_alias(self, normalized: str, user_id: UUID) -> CatalogEntry | None:
+        self.calls.append("by_user_alias")
+        return await self._inner.by_user_alias(normalized, user_id)
+
+    async def by_global_alias(self, normalized: str) -> CatalogEntry | None:
+        self.calls.append("by_global_alias")
+        return await self._inner.by_global_alias(normalized)
+
+    async def by_canonical_name(self, normalized: str) -> CatalogEntry | None:
+        self.calls.append("by_canonical_name")
+        return await self._inner.by_canonical_name(normalized)
+
+    async def all_searchable(self) -> Sequence[SearchableExercise]:
+        self.calls.append("all_searchable")
+        return await self._inner.all_searchable()
+
+
 @pytest.fixture
 def catalog() -> FakeCatalog:
     return FakeCatalog()
@@ -165,6 +189,29 @@ async def test_a_users_own_alias_wins_over_the_global_one(
     assert mine.method is ResolutionMethod.USER_ALIAS
     assert theirs.canonical_name == "Supino reto"
     assert theirs.method is ResolutionMethod.GLOBAL_ALIAS
+
+
+async def test_a_hit_stops_the_stages_that_follow_it(catalog: FakeCatalog) -> None:
+    """ "First hit wins" has to mean the later stages never run: each is a
+    database round trip, and the canonical stage loads the whole catalog. It
+    also means a failure in a stage nobody needed cannot discard a good answer
+    from one that already succeeded."""
+    catalog.add_user_alias(user_id=USER, alias="supino", canonical_name="Supino inclinado")
+    counting = _CountingCatalog(catalog)
+
+    resolution = await ExerciseResolver(counting).resolve("supino", user_id=USER)
+
+    assert resolution.method is ResolutionMethod.USER_ALIAS
+    assert counting.calls == ["by_user_alias"]
+
+
+async def test_only_the_stages_before_the_hit_are_consulted(catalog: FakeCatalog) -> None:
+    counting = _CountingCatalog(catalog)
+
+    resolution = await ExerciseResolver(counting).resolve("supino", user_id=USER)
+
+    assert resolution.method is ResolutionMethod.GLOBAL_ALIAS
+    assert counting.calls == ["by_user_alias", "by_global_alias"]
 
 
 async def test_the_canonical_name_resolves_when_no_alias_covers_it(
@@ -248,6 +295,18 @@ def test_a_resolution_cannot_both_answer_and_ask() -> None:
             method=ResolutionMethod.GLOBAL_ALIAS,
             confidence=1.0,
             requires_clarification=True,
+        )
+
+
+def test_a_resolution_cannot_name_an_exercise_it_cannot_name() -> None:
+    """An id with no canonical name is a resolution nothing can display back to
+    the user or read in an audit row."""
+    with pytest.raises(ValueError, match="canonical_name"):
+        ExerciseResolution(
+            raw_name="supino",
+            exercise_id=uuid4(),
+            method=ResolutionMethod.GLOBAL_ALIAS,
+            confidence=1.0,
         )
 
 
