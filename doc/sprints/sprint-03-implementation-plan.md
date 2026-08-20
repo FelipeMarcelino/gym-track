@@ -490,9 +490,21 @@ class WorkerContext:
     checkpointed, and a serialized session is a crash at resume time. It is
     passed per invocation, so every node writes inside the worker's one
     transaction.
+
+    **Two execution ids, and they differ exactly on a resume.** An answer is its
+    own `MessageBatch` and therefore its own execution, but the tasks it
+    completes were created by the paused one. Collapsing them into a single
+    field makes one of the two writes land on the wrong row: either
+    `execution_tasks` transitions go to an execution that has no such tasks (the
+    composite FK refuses it), or the answer's reply is filed under the execution
+    that asked the question rather than the delivery that produced it.
     """
     session: AsyncSession
-    execution_id: UUID
+    #: Owns this delivery's outbound rows and its `workflow_executions` status.
+    delivery_execution_id: UUID
+    #: Owns the `execution_tasks` rows being transitioned. Equal to
+    #: `delivery_execution_id` on every path except a resume.
+    task_execution_id: UUID
     settings: ApplicationSettings
 
 def build_main_graph(
@@ -506,8 +518,11 @@ def build_main_graph(
 ) -> CompiledStateGraph:
     """Compiled once, at process start (Q121)."""
 
-def thread_for(conversation_id: UUID, execution_id: UUID, attempt: int = 1,
-               *, checkpoint_id: str | None = None) -> dict[str, Any]:
+def thread_for(conversation_id: UUID, *, checkpoint_ns: str,
+               checkpoint_id: str | None = None) -> dict[str, Any]:
+
+def fresh_namespace(execution_id: UUID) -> str:
+    """`f"{execution_id}:{uuid4()}"` -- see WS-7 on why this is not a counter."""
     """`{"configurable": {"thread_id": ..., "checkpoint_ns": ...}}` (Q123, D4).
 
     The thread is the conversation, as Q123 requires. The namespace is the
@@ -518,8 +533,9 @@ def thread_for(conversation_id: UUID, execution_id: UUID, attempt: int = 1,
       one shared namespace would make the new run the thread's latest
       checkpoint -- the later `Command(resume=...)` would resume the wrong
       thing while the pending row stayed open forever;
-    * the attempt, because a retry after a rolled-back transaction must not
-      inherit a checkpoint describing work the database never kept.
+    * a per-delivery uuid, because a retry after a rolled-back transaction must
+      not inherit a checkpoint describing work the database never kept, and any
+      counter that lives in that transaction rolls back with it (WS-7).
 
     `checkpoint_id` is passed only on a resume, and it is read from
     `pending_clarifications` rather than remembered: forking from the exact
@@ -861,15 +877,26 @@ class WorkflowWorker:
         Unchanged from Sprint 1 and re-asserted rather than assumed:
         `workflow_executions`, `outbound_messages`, `domain_events` and
         `outbox_events` commit together; the ACK follows that commit and not
-        the provider's delivery (Q130); a redelivered batch that already
-        SUCCEEDED returns without effects.
+        the provider's delivery (Q130).
+
+        **Widened, and it must be:** Sprint 1's redelivery check was
+        `status is SUCCEEDED`, because that was the only committed outcome.
+        This sprint adds two more -- `WAITING_FOR_USER` and `PARTIAL_SUCCESS`
+        are *durable results*, not failures. A batch whose question committed
+        but whose ACK was lost would otherwise re-enter the graph and either
+        send the question twice or collide with the open clarification on the
+        partial unique index. The check is now "did this delivery commit an
+        outcome", and only `RUNNING` (a crash mid-flight) and `FAILED` re-run.
 
         Changed: the routing and handler call become
 
             await graph.ainvoke(
                 initial_state,
-                config=thread_for(batch.conversation_id, execution.id),
-                context=WorkerContext(session=session, execution_id=execution.id,
+                config=thread_for(batch.conversation_id,
+                                  checkpoint_ns=fresh_namespace(execution.id)),
+                context=WorkerContext(session=session,
+                                      delivery_execution_id=execution.id,
+                                      task_execution_id=execution.id,
                                       settings=self._settings),
             )
 
@@ -899,10 +926,22 @@ So the reconciliation is explicit, and it is built out of the only thing that is
 authoritative: SQL.
 
 **A fresh run gets a namespace nobody has used.**
-`checkpoint_ns = f"{execution_id}:{attempt}"`, and `attempts` is a column
-`workflow_executions` has carried since Sprint 1. A retry after a rolled-back
-attempt therefore starts from an empty namespace and re-executes honestly,
-rather than inheriting a checkpoint that describes work the database never kept.
+`checkpoint_ns = f"{execution_id}:{delivery_id}"`, where `delivery_id` is a
+`uuid4()` minted **per delivery** and stored nowhere by default.
+
+The obvious choice — `workflow_executions.attempts` — does not work, and the
+reason is the whole point of this section: `handle()` increments `attempts`
+*inside* the unit of work, so the rollback that stranded the checkpoint rolls
+the counter back too. The redelivery would compute the same namespace, find the
+advanced checkpoint, and skip the handler again. A counter that shares a fate
+with the transaction cannot be the thing that recovers from that transaction.
+
+A fresh uuid has no fate to share. If the transaction commits, whatever needs to
+find the namespace later has it durably: the `pending_clarifications` row records
+`checkpoint_ns` in the same commit. If it rolls back, the namespace is garbage
+nobody references, and the retry starts from nothing — which is exactly what it
+should do. Orphaned checkpoints are storage, not correctness; retention is
+Sprint 10's.
 
 **A resume forks from the checkpoint the interrupt was taken at, every time.**
 `pending_clarifications` stores `checkpoint_ns` and `checkpoint_id` at the moment
@@ -933,6 +972,8 @@ rows.
 - `test_the_thread_is_the_conversation` — the checkpoint lands under `str(conversation_id)` (Q123).
 - `test_two_batches_in_one_conversation_share_a_thread` — and the second does not resume the first.
 - `test_a_graph_that_raises_fails_the_execution` — status FAILED, error recorded, the exception propagates so the broker retries.
+- `test_a_redelivered_question_is_not_asked_twice` — a batch that committed `WAITING_FOR_USER` and lost its ACK returns without effects: one outbound question, one WAITING row, no second run.
+- `test_a_redelivered_partial_success_is_not_repeated` — the same for `PARTIAL_SUCCESS`.
 
 `tests/e2e/test_checkpoint_failure_injection.py`
 
@@ -1226,7 +1267,7 @@ The order of the checks is the design, and it is deliberately not "try to parse 
 
 ```text
 1. no WAITING clarification for this conversation -> NEW_INTENT
-2. it has expired                                 -> close it EXPIRED, then NEW_INTENT
+2. it has expired                                 -> abandon(EXPIRED), then NEW_INTENT
 3. the text is a cancel phrase                    -> CANCELLATION
 4. the text carries the strict marker             -> NEW_INTENT   (Q29: a new log is not an answer)
 5. parse_answer succeeds                          -> ANSWER
@@ -1247,21 +1288,32 @@ So the classification runs in the **worker**, before it chooses how to invoke:
 ```text
 decision = await resolver.classify(session, conversation_id=..., texts=...)
 
-ANSWER        -> await graph.ainvoke(
+ANSWER        -> row = decision.clarification
+                 await graph.ainvoke(
                      Command(resume=decision.answer),
-                     config=thread_for(conversation_id, decision.clarification.workflow_execution_id),
-                     context=WorkerContext(session=session, ...))
-                 # the paused execution's id IS the namespace: same thread,
-                 # the run that is actually waiting
+                     config=thread_for(conversation_id,
+                                       checkpoint_ns=row.checkpoint_ns,
+                                       checkpoint_id=row.checkpoint_id),
+                     context=WorkerContext(
+                         session=session,
+                         delivery_execution_id=answer_execution.id,
+                         task_execution_id=row.workflow_execution_id, ...))
+                 # both stored values, every time: forking from the interrupt
+                 # point is what makes a redelivered answer re-run the handler
+                 # instead of resuming whatever the last attempt left behind
 
 NEW_INTENT    -> await graph.ainvoke(
                      initial_state | {"pending_decision": decision},
-                     config=thread_for(conversation_id, new_execution.id),
-                     context=WorkerContext(session=session, ...))
+                     config=thread_for(conversation_id,
+                                       checkpoint_ns=fresh_namespace(new_execution.id)),
+                     context=WorkerContext(session=session,
+                                           delivery_execution_id=new_execution.id,
+                                           task_execution_id=new_execution.id, ...))
                  # its own namespace, so it cannot become the pending run's
                  # latest checkpoint (Q29)
 
-CANCELLATION  -> close the row CANCELLED, confirm, do not touch the graph
+CANCELLATION  -> close the row CANCELLED **and terminate what it was blocking**
+                 (below), confirm, do not touch the graph
 ```
 
 `resolve_pending_workflow` **stays** as a §11.1 node and stops being identity: it
@@ -1334,30 +1386,48 @@ paused execution -> status moves to its real terminal outcome
                     the *original* id -- that is where its tasks live
 ```
 
-`WorkerContext.execution_id` is therefore the **paused** execution on a resume
-and the new one otherwise. Getting this backwards writes the resumed task
-transitions under an execution that has no such tasks, and the composite FK from
-`pending_clarifications` refuses it — loudly, which is the point.
+That is why `WorkerContext` carries **two** ids: `task_execution_id` is the
+paused execution, so the interrupted task's transitions land on the rows that
+exist; `delivery_execution_id` is the answer's own, so `persist_outbound` files
+the confirmation under the delivery that produced it and
+`MainGraphState.workflow_execution_id` names the run the user is actually
+talking to. On every other path the two are equal. Collapsing them is refused
+loudly by the composite FK in one direction and quietly wrong in the other,
+which is the more dangerous half.
 
 `resumed_execution_id` is a nullable self-FK added in migration `0011` (WS-2),
 listed there.
 
-## Expiry
+## Abandoning a question: one function, three call sites
 
-`session-expiration-worker` gains a second sweep: `pending_clarifications` where
-`status = 'waiting' AND expires_at < now()`. Closing that row alone is **not
-enough** — nothing can resume the checkpoint afterwards, so its execution and
-its interrupted task would sit in `WAITING_FOR_USER` forever and every
-operational query about "what is waiting on a user" would be wrong from then on.
+A question stops being answerable in three ways — it expires on the sweeper's
+clock, it expires and an incoming message is what notices, or the user cancels
+it — and in **all three** the same three rows have to move. Closing the
+clarification alone leaves nothing able to resume the checkpoint, so its
+execution and its interrupted task sit in `WAITING_FOR_USER` forever and every
+operational query about "what is waiting on a user" is wrong from then on.
 
-One transaction, three rows:
+So it is one function, and the three call sites call it rather than reimplement
+two thirds of it:
 
-```text
-clarification -> EXPIRED, resolved_at set
-execution_task -> SKIPPED, error = "clarification expired"
-workflow_execution -> PARTIAL_SUCCESS if any task COMPLETED, else FAILED
-                      finished_at stamped, error naming the expiry
+```python
+# application/services/pending_workflows.py
+async def abandon(session, clarification, *, status: ClarificationStatus,
+                  reason: str) -> None:
+    """Close a question and terminate what it was blocking, in one transaction.
+
+        clarification      -> EXPIRED | CANCELLED, resolved_at set
+        execution_task     -> SKIPPED, error = reason
+        workflow_execution -> PARTIAL_SUCCESS if any task COMPLETED, else FAILED
+                              finished_at stamped, error naming the reason
+    """
 ```
+
+Call sites: the sweeper; the classifier's step 2, where an incoming message is
+the first thing to notice the expiry — **the sweeper selects
+`status = 'waiting'`, so a row this path marks EXPIRED will never be seen by it
+again, and a partial cleanup here is permanent**; and the CANCELLATION branch,
+which otherwise leaves exactly the same abandoned pair behind.
 
 That needs grants the sweeper does not have: `workflow_executions`
 `(SELECT, UPDATE)` and `execution_tasks` `(SELECT, UPDATE)` for
@@ -1366,8 +1436,9 @@ there. The checkpoint is left alone — it is garbage that costs storage, not
 correctness, and a retention pass is Sprint 10's business.
 
 `test_an_expired_question_leaves_nothing_waiting` asserts all three rows, and it
-is the test that fails if the sweep is written against the clarification table
-alone.
+is parametrized over all three call sites — the sweeper, the on-demand
+discovery, and the cancellation — because a fix applied to one of them is the
+shape of bug this section exists to prevent.
 
 ## Tests
 
@@ -1386,7 +1457,7 @@ alone.
 - `test_a_new_log_during_a_pending_question_does_not_answer_it` — the WAITING row is untouched and a second workflow runs. **The Q29 test; also the one that fails if the classifier's step order is changed.**
 - `test_the_original_question_is_still_answerable_afterwards` — the continuation of the test above, and the one that proves D4's namespace: `#log supino 80kg`, then an unrelated `#log agachamento 100kg 5 5 5`, *then* `8 8 8`. The answer must resume the first workflow, not the second. Without the per-execution namespace the intervening run becomes the thread's latest checkpoint and this test fails with a pending row nobody can ever close.
 - `test_an_answer_after_expiry_starts_a_new_workflow` — the row is EXPIRED, nothing is resumed.
-- `test_a_cancel_phrase_closes_the_question` — status CANCELLED and a confirmation the user can understand.
+- `test_a_cancel_phrase_closes_the_question` — status CANCELLED, a confirmation the user can understand, **and** no execution or task left waiting.
 - `test_a_redelivered_answer_resumes_once` — one set, not two; the second delivery finds the claim taken.
 - `test_the_classification_happens_before_the_graph_is_invoked` — a resumed run never visits the nodes before the interrupt, asserted on the node-visit trace. This is the test that fails if the decision is ever moved back into the graph.
 - `test_the_paused_execution_reaches_a_terminal_state` — after the answer, no execution is left `WAITING_FOR_USER`, the original names its outcome, and the answer's row points at it through `resumed_execution_id`.
@@ -1550,6 +1621,9 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | An answered clarification is closed and unblocks the next | WS-9 |
 | An expired clarification leaves nothing waiting | WS-9 |
 | A rolled-back resume still writes the workout | WS-7 |
+| A redelivered question is not asked twice | WS-7 |
+| Cancel and on-demand expiry leave nothing waiting | WS-9 |
+| The resume forks from the stored checkpoint | WS-9 |
 | `make check` green with containers in CI | all |
 | Every workstream on its own reviewed PR | all |
 | `#log supino 80kg` writes nothing and asks | WS-8 |

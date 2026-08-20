@@ -248,11 +248,16 @@ a merge, one PR each, reviewed and CI-green before merging.
    failure that causes is not a duplicate but an **absence**: the redelivery
    resumes a thread that believes the work is done, so the handler never re-runs
    and the workout is simply missing. Idempotency does not rewind a checkpoint.
-   The reconciliation is therefore explicit: a retry runs in a fresh namespace
-   (`execution:attempt`), a resume forks from the `checkpoint_id` stored in
-   `pending_clarifications`, and the database decides what happened while the
-   checkpoint only decides where to continue from.
-4. Tests: the existing worker, integration and E2E suites pass **unchanged** in
+   The reconciliation is therefore explicit: a retry runs in a namespace minted
+   fresh per delivery — **not** from `attempts`, which is incremented inside the
+   very transaction that rolls back — a resume forks from the `checkpoint_id`
+   stored in `pending_clarifications`, and the database decides what happened
+   while the checkpoint only decides where to continue from.
+4. The redelivery check widens with the status vocabulary: `WAITING_FOR_USER`
+   and `PARTIAL_SUCCESS` are durable *results*, so a batch that committed one
+   and lost its ACK must return without effects, exactly as a `SUCCEEDED` one
+   does. Only a crash mid-flight and a genuine failure re-run.
+5. Tests: the existing worker, integration and E2E suites pass **unchanged** in
    observable behaviour; a batch redelivered after a checkpoint write but before
    the domain commit produces exactly one set; a workflow whose graph raises
    marks the execution FAILED and lets the broker retry.
@@ -322,11 +327,14 @@ a merge, one PR each, reviewed and CI-green before merging.
    `exercise_aliases` — the resolver's stage 1 exists to be taught, the grant
    for it was already written in Sprint 2, and a user who explains a word once
    should not be asked about it again.
-8. Clarifications expire: `expires_at`, default `PT6H`, swept by the existing
-   `session-expiration-worker`. Closing the question is not enough — nothing can
-   resume its checkpoint afterwards, so the sweep also terminates the execution
-   and the interrupted task, in one transaction, or they wait forever and every
-   "what is waiting on a user" query is wrong from then on.
+8. A question stops being answerable in three ways — the sweeper's clock, an
+   incoming message noticing the expiry first, or the user cancelling — and all
+   three move the same three rows: the clarification closes, the interrupted
+   task is SKIPPED, the execution reaches a terminal outcome. One function,
+   three call sites. Closing only the clarification leaves nothing able to
+   resume its checkpoint, so its execution and task wait forever and every
+   "what is waiting on a user" query is wrong from then on. `expires_at`
+   defaults to `PT6H`.
 9. Tests: the two-message round trip persists the sets on the second message and
    not the first; an answer arriving after expiry starts a new workflow instead
    of resuming a dead one; a `#log` during a pending clarification leaves the
@@ -381,6 +389,8 @@ that checks each line, not by agreement that it feels done.
 - [ ] A reply that swaps two *sets* of one exercise fails the guard too, and a summary that omits loads passes.
 - [ ] A mixed batch's confirmation is not lost to the interrupt: one reply names what was written and what is being asked.
 - [ ] An answered clarification is closed, and a second question can be asked in that conversation afterwards.
+- [ ] A cancelled clarification, and one whose expiry an incoming message discovers first, leave nothing waiting either — all three paths, one transition.
+- [ ] A batch that committed `WAITING_FOR_USER` and lost its ACK is not asked twice on redelivery.
 - [ ] An expired clarification leaves no execution and no task in `WAITING_FOR_USER`.
 - [ ] A resume whose transaction rolls back still writes the workout on redelivery — absence, not duplication, is what that proves against.
 - [ ] A reply that swaps two exercises' loads fails the guard, even though every name and number in it is unaltered.
