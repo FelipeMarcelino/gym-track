@@ -171,6 +171,12 @@ def _clock_to_seconds(match: re.Match[str], raw: str) -> Decimal:
     separator = match.group("separator")
     first = Decimal(match.group("first"))
     second_raw = match.group("second")
+
+    if separator == ":" and not second_raw:
+        # `1:` is a message somebody stopped typing. Reading it as sixty
+        # seconds stores a duration they never finished.
+        raise UnitParseError(raw, "a duration such as '1:30'")
+
     second = Decimal(second_raw) if second_raw else Decimal(0)
 
     if separator == "h":

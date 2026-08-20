@@ -12,4 +12,5 @@ Crie sprints para poder seguir o roadmap do projeto dado a spec
 Use código em inglês, nunca em português. Para as branches name também coloque em inglês.
 Sempre antes de mergear uma branch por pull request verifique se há comentários que foram inseridos.
 Verifique o workflow actions do PR antes de mergear para ver se passou.
-Faça uma implementação TDD primeiro escreva os testes e depois faça a implementação 
+Faça uma implementação TDD primeiro escreva os testes e depois faça a implementação do código para qualquer feature que
+for implementar

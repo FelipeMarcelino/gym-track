@@ -170,3 +170,17 @@ def test_a_mile_is_exact() -> None:
 def test_converting_the_wrong_dimension_is_an_error() -> None:
     with pytest.raises(UnitParseError):
         to_kilograms(Quantity(value=Decimal(5), unit=Unit.KILOMETER))
+
+
+@pytest.mark.parametrize("raw", ["1:", "1 :", ":30", ":"])
+def test_an_incomplete_clock_value_is_refused(raw: str) -> None:
+    """`1:` is a typo mid-message, and reading it as sixty seconds stores a
+    duration the user never finished typing."""
+    with pytest.raises(UnitParseError):
+        parse_duration(raw)
+
+
+def test_a_unit_without_a_second_half_is_still_fine() -> None:
+    """`1h` and `2min` are complete durations, not truncated clock values."""
+    assert to_seconds(parse_duration("1h")) == Decimal(3600)
+    assert to_seconds(parse_duration("2min")) == Decimal(120)

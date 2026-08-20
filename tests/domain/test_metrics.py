@@ -125,18 +125,20 @@ def test_pace_and_speed_are_absent_rather_than_zero(
 
 def test_epley_matches_the_hand_computed_value() -> None:
     """100 kg for 5 reps: 100 * (1 + 5/30) = 116.667."""
-    metric = estimated_one_rm(load_kg=Decimal(100), repetitions=5)
+    metric = estimated_one_rm(load_kg=Decimal(100), repetitions=5, load_mode=LoadMode.TOTAL)
 
     assert metric is not None
     assert metric.value == Decimal("116.667")
     assert metric.version == ONE_RM_VERSION
 
 
-def test_a_single_repetition_is_the_load_itself() -> None:
-    metric = estimated_one_rm(load_kg=Decimal(120), repetitions=1)
+def test_epley_adds_its_increment_even_at_one_repetition() -> None:
+    """Not the load itself: Epley is `load * (1 + reps/30)`, so a single rep
+    still adds 1/30. Worth pinning because the intuition says otherwise."""
+    metric = estimated_one_rm(load_kg=Decimal(120), repetitions=1, load_mode=LoadMode.TOTAL)
 
     assert metric is not None
-    assert metric.value == Decimal("124.000"), "Epley adds 1/30 even at one rep"
+    assert metric.value == Decimal("124.000")
 
 
 @pytest.mark.parametrize("repetitions", [13, 20, 100])
@@ -144,7 +146,10 @@ def test_no_estimate_past_twelve_repetitions(repetitions: int) -> None:
     """Epley's error past twelve is larger than the signal, and a fabricated
     number stored *with a version* is worse than no number — the version makes
     it look checked."""
-    assert estimated_one_rm(load_kg=Decimal(60), repetitions=repetitions) is None
+    assert (
+        estimated_one_rm(load_kg=Decimal(60), repetitions=repetitions, load_mode=LoadMode.TOTAL)
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -154,7 +159,9 @@ def test_no_estimate_past_twelve_repetitions(repetitions: int) -> None:
 def test_one_rm_is_absent_when_it_cannot_be_computed(
     load_kg: Decimal | None, repetitions: int | None
 ) -> None:
-    assert estimated_one_rm(load_kg=load_kg, repetitions=repetitions) is None
+    assert (
+        estimated_one_rm(load_kg=load_kg, repetitions=repetitions, load_mode=LoadMode.TOTAL) is None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -226,3 +233,61 @@ def test_derivation_is_stable_across_runs() -> None:
     )
 
     assert derive_all(draft) == derive_all(draft)
+
+
+# --------------------------------------------------------------------------
+# What the load mode changes
+# --------------------------------------------------------------------------
+
+
+def test_volume_needs_a_load_mode_to_be_arithmetic() -> None:
+    """Without one, 20 kg on a dumbbell curl and 20 kg on a barbell curl are
+    the same number — and one of them is half the truth. Defaulting to TOTAL
+    would undercount every implement exercise whose caller forgot to say."""
+    assert volume(load_kg=Decimal(20), repetitions=10, load_mode=None) is None
+
+
+def test_assistance_is_not_volume() -> None:
+    """BODYWEIGHT_MINUS carries assistance, not weight lifted. Counting it
+    would make a user who needed *more* help look like they trained more."""
+    assert volume(load_kg=Decimal(30), repetitions=8, load_mode=LoadMode.BODYWEIGHT_MINUS) is None
+
+
+@pytest.mark.parametrize(
+    "load_mode",
+    [LoadMode.BODYWEIGHT, LoadMode.BODYWEIGHT_PLUS, LoadMode.BODYWEIGHT_MINUS],
+)
+def test_no_one_rep_maximum_for_bodyweight_modes(load_mode: LoadMode) -> None:
+    """The real maximum includes a body weight this sprint does not know, so
+    every one of these estimates would be a fabricated number wearing a version
+    string. Assistance is the worst of the three: more help would read as a
+    higher maximum."""
+    assert estimated_one_rm(load_kg=Decimal(20), repetitions=5, load_mode=load_mode) is None
+
+
+def test_derive_all_skips_what_the_load_mode_makes_dishonest() -> None:
+    metrics = derive_all(
+        ActivityDraft(
+            activity_type=ActivityType.STRENGTH,
+            repetitions=8,
+            load_kg=Decimal(30),
+            load_mode=LoadMode.BODYWEIGHT_MINUS,
+        )
+    )
+
+    assert metrics == ()
+
+
+def test_derive_all_still_counts_added_weight() -> None:
+    """A weighted pull-up moved something real: the volume is honest even
+    though the maximum is not computable."""
+    metrics = derive_all(
+        ActivityDraft(
+            activity_type=ActivityType.STRENGTH,
+            repetitions=5,
+            load_kg=Decimal(10),
+            load_mode=LoadMode.BODYWEIGHT_PLUS,
+        )
+    )
+
+    assert [metric.name for metric in metrics] == ["volume"]

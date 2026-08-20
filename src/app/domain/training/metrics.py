@@ -18,10 +18,10 @@ Two rules run through all of it:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Final
+from typing import Any, Final
 
 from app.domain.training.activities import ActivityDraft, LoadMode
 
@@ -82,7 +82,17 @@ def volume(
     """
     if load_kg is None or repetitions is None or repetitions <= 0:
         return None
-    if load_mode in (LoadMode.BODYWEIGHT,) and load_kg == 0:
+    if load_mode is None:
+        # Without it, 20 kg on a dumbbell curl and 20 kg on a barbell curl are
+        # the same number, and one of them is half the truth. Defaulting to
+        # TOTAL would undercount every implement exercise whose caller forgot
+        # to say -- silently, which is the part that matters.
+        return None
+    if load_mode is LoadMode.BODYWEIGHT:
+        return None
+    if load_mode is LoadMode.BODYWEIGHT_MINUS:
+        # The load is *assistance*, not weight moved. Counting it would make a
+        # user who needed more help look like they trained more.
         return None
 
     multiplier = Decimal(1)
@@ -123,14 +133,26 @@ def speed(*, distance_m: Decimal | None, duration_s: Decimal | None) -> DerivedM
     )
 
 
-def estimated_one_rm(*, load_kg: Decimal | None, repetitions: int | None) -> DerivedMetric | None:
+#: Load modes whose number is the weight actually lifted. The bodyweight modes
+#: are absent because the real maximum includes a body weight this sprint does
+#: not know, and BODYWEIGHT_MINUS is worse than unknown: its load is
+#: assistance, so more help would read as a higher maximum.
+_ONE_RM_LOAD_MODES: Final = (LoadMode.TOTAL, LoadMode.PER_SIDE, LoadMode.PER_IMPLEMENT)
+
+
+def estimated_one_rm(
+    *, load_kg: Decimal | None, repetitions: int | None, load_mode: LoadMode | None
+) -> DerivedMetric | None:
     """Epley (D5): `1RM = load * (1 + reps / 30)`.
 
     Returns `None` past twelve repetitions rather than an estimate nobody
-    should act on, and `None` for a zero load because a bodyweight set has no
-    one-rep maximum this sprint can compute.
+    should act on, and `None` for every bodyweight mode: those estimates would
+    be fabricated numbers wearing a version string, which is worse than no
+    number because the version makes them look checked.
     """
     if load_kg is None or repetitions is None:
+        return None
+    if load_mode not in _ONE_RM_LOAD_MODES:
         return None
     if repetitions <= 0 or repetitions > MAX_REPS_FOR_ONE_RM:
         return None
@@ -139,6 +161,73 @@ def estimated_one_rm(*, load_kg: Decimal | None, repetitions: int | None) -> Der
 
     estimate = load_kg * (Decimal(1) + Decimal(repetitions) / Decimal(30))
     return DerivedMetric(name=ONE_RM, value=_quantize(estimate), unit="kg", version=ONE_RM_VERSION)
+
+
+def _volume_v1(inputs: Mapping[str, Any]) -> DerivedMetric | None:
+    return volume(
+        load_kg=Decimal(str(inputs["load_kg"])),
+        repetitions=int(inputs["repetitions"]),
+        load_mode=LoadMode(inputs["load_mode"]),
+    )
+
+
+def _one_rm_epley_v1(inputs: Mapping[str, Any]) -> DerivedMetric | None:
+    return estimated_one_rm(
+        load_kg=Decimal(str(inputs["load_kg"])),
+        repetitions=int(inputs["repetitions"]),
+        load_mode=LoadMode(inputs.get("load_mode", LoadMode.TOTAL.value)),
+    )
+
+
+def _pace_v1(inputs: Mapping[str, Any]) -> DerivedMetric | None:
+    return pace(
+        distance_m=Decimal(str(inputs["distance_m"])),
+        duration_s=Decimal(str(inputs["duration_s"])),
+    )
+
+
+def _speed_v1(inputs: Mapping[str, Any]) -> DerivedMetric | None:
+    return speed(
+        distance_m=Decimal(str(inputs["distance_m"])),
+        duration_s=Decimal(str(inputs["duration_s"])),
+    )
+
+
+#: Every version this codebase can still compute, current or not.
+#:
+#: Separate from `METRIC_VERSIONS` on purpose. That mapping says which version a
+#: *new* row gets; this one says which versions an *existing* row can be
+#: recomputed from. When a formula is bumped to v2, v1 stays here — otherwise
+#: the only way to keep the test suite green would be deleting v1's frozen
+#: cases, and the historical freeze would exist exactly until the first time it
+#: mattered.
+SUPPORTED_METRIC_VERSIONS: Final[
+    Mapping[str, Callable[[Mapping[str, Any]], DerivedMetric | None]]
+] = {
+    VOLUME_VERSION: _volume_v1,
+    ONE_RM_VERSION: _one_rm_epley_v1,
+    PACE_VERSION: _pace_v1,
+    SPEED_VERSION: _speed_v1,
+}
+
+
+class UnknownMetricVersionError(LookupError):
+    def __init__(self, version: str) -> None:
+        super().__init__(f"no implementation is registered for metric version {version!r}")
+        self.version = version
+
+
+def compute_by_version(version: str, inputs: Mapping[str, Any]) -> DerivedMetric | None:
+    """Recompute a stored value from its version and its inputs.
+
+    This is what a version on a row is *for*: the number can be produced again
+    without knowing which formula happened to be current when it was written.
+    """
+    try:
+        implementation = SUPPORTED_METRIC_VERSIONS[version]
+    except KeyError as error:
+        raise UnknownMetricVersionError(version) from error
+    return implementation(inputs)
 
 
 def derive_all(draft: ActivityDraft) -> tuple[DerivedMetric, ...]:
@@ -153,7 +242,11 @@ def derive_all(draft: ActivityDraft) -> tuple[DerivedMetric, ...]:
             repetitions=draft.repetitions,
             load_mode=draft.load_mode,
         ),
-        estimated_one_rm(load_kg=draft.load_kg, repetitions=draft.repetitions),
+        estimated_one_rm(
+            load_kg=draft.load_kg,
+            repetitions=draft.repetitions,
+            load_mode=draft.load_mode,
+        ),
         pace(distance_m=draft.distance_m, duration_s=draft.duration_s),
         speed(distance_m=draft.distance_m, duration_s=draft.duration_s),
     )

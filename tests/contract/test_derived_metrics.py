@@ -18,18 +18,10 @@ from typing import Any
 
 import pytest
 
-from app.domain.training.activities import LoadMode
 from app.domain.training.metrics import (
     METRIC_VERSIONS,
-    ONE_RM_VERSION,
-    PACE_VERSION,
-    SPEED_VERSION,
-    VOLUME_VERSION,
     DerivedMetric,
-    estimated_one_rm,
-    pace,
-    speed,
-    volume,
+    compute_by_version,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "derived_metrics.json"
@@ -37,31 +29,13 @@ GOLDEN: dict[str, list[dict[str, Any]]] = json.loads(FIXTURE.read_text(encoding=
 
 
 def _compute(version: str, inputs: dict[str, Any]) -> DerivedMetric | None:
-    """Call the function that owns a version, with the fixture's inputs."""
-    match version:
-        case _ if version == VOLUME_VERSION:
-            return volume(
-                load_kg=Decimal(inputs["load_kg"]),
-                repetitions=int(inputs["repetitions"]),
-                load_mode=LoadMode(inputs["load_mode"]),
-            )
-        case _ if version == ONE_RM_VERSION:
-            return estimated_one_rm(
-                load_kg=Decimal(inputs["load_kg"]),
-                repetitions=int(inputs["repetitions"]),
-            )
-        case _ if version == PACE_VERSION:
-            return pace(
-                distance_m=Decimal(inputs["distance_m"]),
-                duration_s=Decimal(inputs["duration_s"]),
-            )
-        case _ if version == SPEED_VERSION:
-            return speed(
-                distance_m=Decimal(inputs["distance_m"]),
-                duration_s=Decimal(inputs["duration_s"]),
-            )
-        case _:
-            raise AssertionError(f"the fixture has no way to compute {version!r}")
+    """Dispatch through the same registry production would use.
+
+    Calling the functions directly here would let the fixture keep passing
+    after a version was bumped and its dispatch entry forgotten — the fixture
+    would be checking arithmetic nothing reaches.
+    """
+    return compute_by_version(version, inputs)
 
 
 CASES = [
@@ -111,3 +85,35 @@ def test_version_strings_say_what_the_arithmetic_is() -> None:
     for name, version in METRIC_VERSIONS.items():
         assert version.endswith(".v1") or ".v" in version
         assert len(version.split(".")) >= 3, f"{name}'s version does not name a method"
+
+
+def test_every_frozen_version_is_still_computable() -> None:
+    """The version-bump path documented at the top of this file only works if
+    an old version stays *replayable*. If bumping to v2 made v1's frozen cases
+    impossible to compute, the only green path would be deleting them — which
+    is exactly the historical freeze this file exists to keep."""
+    from app.domain.training.metrics import SUPPORTED_METRIC_VERSIONS
+
+    unreachable = sorted(set(GOLDEN) - set(SUPPORTED_METRIC_VERSIONS))
+
+    assert not unreachable, f"frozen versions with no implementation: {unreachable}"
+
+
+def test_the_current_version_of_every_metric_is_supported() -> None:
+    from app.domain.training.metrics import SUPPORTED_METRIC_VERSIONS
+
+    assert set(METRIC_VERSIONS.values()) <= set(SUPPORTED_METRIC_VERSIONS)
+
+
+def test_a_stored_row_can_be_recomputed_from_its_version_alone() -> None:
+    """This is what a version on a row is *for*: given the inputs and the
+    version, the number can be produced again without knowing which formula was
+    current at the time."""
+    from app.domain.training.metrics import compute_by_version
+
+    metric = compute_by_version(
+        "1rm.epley.v1", {"load_kg": "100", "repetitions": 5, "load_mode": "total"}
+    )
+
+    assert metric is not None
+    assert metric.value == Decimal("116.667")
