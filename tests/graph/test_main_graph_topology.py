@@ -9,6 +9,7 @@ what makes adding it a decision instead of a detail.
 
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from app.application.services.execution_planner import (
     DeterministicExecutionPlanner,
     DeterministicIntentRouter,
 )
-from app.graphs.main.graph import NODE_SEQUENCE, build_main_graph
+from app.graphs.main.graph import NODE_SEQUENCE, build_main_graph, compiled_main_graph
 from app.graphs.main.state import GRAPH_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -71,26 +72,50 @@ def test_the_graph_has_exactly_the_nodes_the_spec_lists(graph) -> None:  # type:
 
 
 def test_the_nodes_are_in_the_order_the_spec_lists(graph) -> None:  # type: ignore[no-untyped-def]
-    assert NODE_SEQUENCE == _spec_nodes()
+    assert _spec_nodes() == NODE_SEQUENCE
 
 
 def test_the_edges_are_the_straight_line_the_spec_draws(graph) -> None:  # type: ignore[no-untyped-def]
     """The test that catches a "quick fix" edge added to route around a bug."""
     edges = {(edge.source, edge.target) for edge in graph.get_graph().edges if not edge.conditional}
     expected = {("__start__", NODE_SEQUENCE[0]), (NODE_SEQUENCE[-1], "__end__")}
-    expected |= set(zip(NODE_SEQUENCE, NODE_SEQUENCE[1:], strict=False))
+    expected |= set(pairwise(NODE_SEQUENCE))
 
     assert edges == expected
 
 
 def test_the_graph_is_compiled_from_a_fixed_topology(graph) -> None:  # type: ignore[no-untyped-def]
-    """Q121: two builds produce the same shape, because nothing about the
-    topology depends on an input. What varies is the plan."""
+    """Q121, first half: nothing about the shape depends on an input.
+
+    Two independent builds agree, which is what makes the topology static.
+    It says nothing about *how often* the process builds one -- see below.
+    """
     other = build_main_graph(
         router=DeterministicIntentRouter(), planner=DeterministicExecutionPlanner()
     )
 
     assert set(other.get_graph().nodes) == set(graph.get_graph().nodes)
+
+
+def test_the_process_compiles_the_graph_once() -> None:
+    """Q121, second half, and the half a shape comparison cannot make.
+
+    Two builds producing the same topology is not the same as a process
+    building it once. Compilation walks every node and edge; doing it per
+    message would still work, and would quietly turn "static" into a comment
+    while paying for a graph rebuild on every WhatsApp fragment.
+
+    `compiled_main_graph` is the accessor the entrypoint uses, and it is
+    memoised. The counter here proves the memo rather than trusting it.
+    """
+    router = DeterministicIntentRouter()
+    planner = DeterministicExecutionPlanner()
+
+    compiled_main_graph.cache_clear()
+    first = compiled_main_graph(router=router, planner=planner)
+    second = compiled_main_graph(router=router, planner=planner)
+
+    assert first is second, "a second call must return the graph already compiled"
 
 
 def test_the_graph_version_is_a_pinned_constant() -> None:

@@ -12,6 +12,7 @@ still work and would quietly make the "static" in DEC-002 a comment.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 from itertools import pairwise
 from typing import Any, Final
 
@@ -38,6 +39,28 @@ NODE_SEQUENCE: Final[tuple[str, ...]] = (
     "response_guard",
     "persist_outbound",
 )
+
+
+@lru_cache(maxsize=1)
+def compiled_main_graph(
+    *,
+    router: IntentRouterPort,
+    planner: ExecutionPlannerPort,
+    checkpointer: BaseCheckpointSaver[str] | None = None,
+) -> CompiledStateGraph[MainGraphState, WorkerContext]:
+    """The process's graph. Built on first use and reused afterwards (Q121).
+
+    `build_main_graph` below is the pure constructor -- tests want a fresh one
+    per case. This is the accessor an entrypoint calls, and the memo is what
+    makes "static" a property of the running process rather than a claim in a
+    docstring: compilation walks every node and edge, and doing it per message
+    would still work while paying for a rebuild on every WhatsApp fragment.
+
+    The cache is keyed on the collaborators, so a worker composed differently
+    -- one without the workout service, say -- gets its own graph rather than
+    silently reusing another's.
+    """
+    return build_main_graph(router=router, planner=planner, checkpointer=checkpointer)
 
 
 def build_main_graph(
