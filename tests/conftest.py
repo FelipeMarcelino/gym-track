@@ -207,6 +207,8 @@ CLEANUP_STATEMENTS: tuple[str, ...] = (
     "DELETE FROM domain_events",
     "DELETE FROM outbound_messages",
     "DELETE FROM processed_operations",
+    "DELETE FROM pending_clarifications",
+    "DELETE FROM execution_tasks",
     "DELETE FROM workflow_executions",
     "DELETE FROM message_batch_items",
     "DELETE FROM message_batches",

@@ -45,6 +45,8 @@ EXPECTED_TABLES = frozenset(
         "message_batches",
         "message_batch_items",
         "workflow_executions",
+        "execution_tasks",
+        "pending_clarifications",
         "processed_operations",
         "outbound_messages",
         "domain_events",
