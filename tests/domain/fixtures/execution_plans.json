@@ -1,0 +1,87 @@
+[
+  {
+    "name": "single task, the shape real traffic produces this sprint",
+    "tasks": [{"key": "log_workout", "task_type": "log_workout"}],
+    "waves": [{"ready": ["log_workout"], "completed": ["log_workout"]}],
+    "outcome": "succeeded",
+    "final_statuses": {"log_workout": "completed"}
+  },
+  {
+    "name": "diamond: two waves, then the join",
+    "tasks": [
+      {"key": "analysis", "task_type": "training_analysis"},
+      {
+        "key": "recommendation",
+        "task_type": "recommendation",
+        "depends_on": [{"task_key": "analysis", "policy": "require_success"}]
+      },
+      {
+        "key": "program",
+        "task_type": "workout_program",
+        "depends_on": [{"task_key": "analysis", "policy": "require_success"}]
+      },
+      {
+        "key": "reply",
+        "task_type": "conversation",
+        "depends_on": [
+          {"task_key": "recommendation", "policy": "require_success"},
+          {"task_key": "program", "policy": "allow_partial"}
+        ]
+      }
+    ],
+    "waves": [
+      {"ready": ["analysis"], "completed": ["analysis"]},
+      {"ready": ["recommendation", "program"], "completed": ["recommendation", "program"]},
+      {"ready": ["reply"], "completed": ["reply"]}
+    ],
+    "outcome": "succeeded",
+    "final_statuses": {
+      "analysis": "completed",
+      "recommendation": "completed",
+      "program": "completed",
+      "reply": "completed"
+    }
+  },
+  {
+    "name": "a failure skips its required subtree and spares the rest",
+    "tasks": [
+      {"key": "analysis", "task_type": "training_analysis"},
+      {
+        "key": "recommendation",
+        "task_type": "recommendation",
+        "depends_on": [{"task_key": "analysis", "policy": "require_success"}]
+      },
+      {
+        "key": "critic",
+        "task_type": "recommendation",
+        "visibility": "internal",
+        "depends_on": [{"task_key": "recommendation", "policy": "require_success"}]
+      },
+      {"key": "log_workout", "task_type": "log_workout"}
+    ],
+    "waves": [
+      {"ready": ["analysis", "log_workout"], "completed": ["log_workout"], "failed": ["analysis"]}
+    ],
+    "outcome": "partial_success",
+    "final_statuses": {
+      "analysis": "failed",
+      "recommendation": "skipped",
+      "critic": "skipped",
+      "log_workout": "completed"
+    }
+  },
+  {
+    "name": "a pause ends the delivery with its dependants still pending",
+    "tasks": [
+      {"key": "log_workout", "task_type": "log_workout"},
+      {
+        "key": "reply",
+        "task_type": "conversation",
+        "depends_on": [{"task_key": "log_workout", "policy": "require_success"}]
+      }
+    ],
+    "waves": [{"ready": ["log_workout"], "waiting": ["log_workout"]}],
+    "outcome": "waiting_for_user",
+    "final_statuses": {"log_workout": "waiting_for_user", "reply": "pending"}
+  }
+]
