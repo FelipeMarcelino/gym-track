@@ -256,7 +256,7 @@ pending_clarifications
   status                   varchar(64) not null check
   spec                     jsonb not null           -- the frozen ClarificationSpec
   expires_at               timestamptz not null
-  checkpoint_ns            text not null            -- where the pause lives
+  checkpoint_thread_id     text not null            -- the composite thread the pause lives on
   checkpoint_id            text not null            -- the exact point to fork from
   created_at               timestamptz not null default now()
   updated_at               timestamptz not null default now()
@@ -522,12 +522,14 @@ def build_main_graph(
 ) -> CompiledStateGraph:
     """Compiled once, at process start (Q121)."""
 
-def thread_for(conversation_id: UUID, *, checkpoint_ns: str,
-               checkpoint_id: str | None = None) -> dict[str, Any]:
+def thread_id_for(conversation_id: UUID, execution_id: UUID, delivery_id: UUID) -> str:
 
-def fresh_namespace(execution_id: UUID) -> str:
-    """`f"{execution_id}:{uuid4()}"` -- see WS-7 on why this is not a counter."""
-    """`{"configurable": {"thread_id": ..., "checkpoint_ns": ...}}` (Q123, D4).
+def thread_for(conversation_id: UUID, execution_id: UUID, delivery_id: UUID, *,
+               checkpoint_id: str | None = None) -> RunnableConfig:
+
+def new_delivery_id() -> UUID:
+    """A uuid per delivery -- see WS-7 on why this is not a counter."""
+    """`{"configurable": {"thread_id": "<conversation>:<execution>:<delivery>"}}`.
 
     The thread is the conversation, as Q123 requires. The namespace is the
     execution *and its attempt*, and neither half is decoration:
@@ -896,8 +898,8 @@ class WorkflowWorker:
 
             await graph.ainvoke(
                 initial_state,
-                config=thread_for(batch.conversation_id,
-                                  checkpoint_ns=fresh_namespace(execution.id)),
+                config=thread_for(batch.conversation_id, execution.id,
+                                  new_delivery_id()),
                 context=WorkerContext(session=session,
                                       delivery_execution_id=execution.id,
                                       task_execution_id=execution.id,
@@ -929,8 +931,8 @@ missing half fails in the *opposite* direction to a duplicate:
 So the reconciliation is explicit, and it is built out of the only thing that is
 authoritative: SQL.
 
-**A fresh run gets a namespace nobody has used.**
-`checkpoint_ns = f"{execution_id}:{delivery_id}"`, where `delivery_id` is a
+**A fresh run gets a thread nobody has used.**
+`thread_id = f"{conversation_id}:{execution_id}:{delivery_id}"`, where `delivery_id` is a
 `uuid4()` minted **per delivery** and stored nowhere by default.
 
 The obvious choice — `workflow_executions.attempts` — does not work, and the
@@ -942,13 +944,13 @@ with the transaction cannot be the thing that recovers from that transaction.
 
 A fresh uuid has no fate to share. If the transaction commits, whatever needs to
 find the namespace later has it durably: the `pending_clarifications` row records
-`checkpoint_ns` in the same commit. If it rolls back, the namespace is garbage
+`checkpoint_thread_id` in the same commit. If it rolls back, the thread is garbage
 nobody references, and the retry starts from nothing — which is exactly what it
 should do. Orphaned checkpoints are storage, not correctness; retention is
 Sprint 10's.
 
 **A resume forks from the checkpoint the interrupt was taken at, every time.**
-`pending_clarifications` stores `checkpoint_ns` and `checkpoint_id` at the moment
+`pending_clarifications` stores `checkpoint_thread_id` and `checkpoint_id` at the moment
 of suspension — durable, in the same transaction as the WAITING row — and the
 resume config carries both. A redelivered answer forks from the same point again
 instead of resuming wherever the last attempt died, and the double-commit that
@@ -1119,12 +1121,13 @@ So the interrupt is completed **by the worker, outside the paused graph**, in th
 transaction it already owns (WS-7):
 
 ```text
-state = await graph.ainvoke(initial_state, config=thread_for(conversation_id))
+state = await graph.ainvoke(initial_state,
+                            config=thread_for(conversation_id, execution.id, delivery_id))
 
 if interrupt_of(state) is not None:              # LangGraph reports the pending interrupt
     pause = interrupt_of(state)                  # a Suspension
     write pending_clarifications(pause.spec)     # WAITING, expires_at = now + D10,
-                                                 # checkpoint_ns and checkpoint_id stored
+                                                 # checkpoint_thread_id and checkpoint_id stored
     write outbound_messages(reply_for(pause))    # confirmation + question + dropped items
     execution.status = WAITING_FOR_USER
     # commit, then ACK -- unchanged from Q130
@@ -1295,9 +1298,9 @@ decision = await resolver.classify(session, conversation_id=..., texts=...)
 ANSWER        -> row = decision.clarification
                  await graph.ainvoke(
                      Command(resume=decision.answer),
-                     config=thread_for(conversation_id,
-                                       checkpoint_ns=row.checkpoint_ns,
-                                       checkpoint_id=row.checkpoint_id),
+                     config={"configurable": {
+                         "thread_id": row.checkpoint_thread_id,
+                         "checkpoint_id": row.checkpoint_id}},
                      context=WorkerContext(
                          session=session,
                          delivery_execution_id=answer_execution.id,
@@ -1308,8 +1311,8 @@ ANSWER        -> row = decision.clarification
 
 NEW_INTENT    -> await graph.ainvoke(
                      initial_state | {"pending_decision": decision},
-                     config=thread_for(conversation_id,
-                                       checkpoint_ns=fresh_namespace(new_execution.id)),
+                     config=thread_for(conversation_id, new_execution.id,
+                                       new_delivery_id()),
                      context=WorkerContext(session=session,
                                            delivery_execution_id=new_execution.id,
                                            task_execution_id=new_execution.id, ...))
