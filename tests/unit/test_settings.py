@@ -148,6 +148,10 @@ def test_missing_secret_is_reported_as_the_field_it_feeds(env: dict[str, str]) -
         ({"debounce_window": "PT0S"}, "debounce_window must be positive"),
         ({"debounce_window": "PT10S", "max_batch_window": "PT10S"}, "shorter than"),
         ({"debounce_window": "PT30S", "max_batch_window": "PT10S"}, "shorter than"),
+        # A question that expires the instant it is asked can never be
+        # answered, and the failure would look like a user who never replied.
+        ({"clarification_timeout": "PT0S"}, "clarification_timeout must be positive"),
+        ({"clarification_timeout": "-PT1H"}, "clarification_timeout must be positive"),
     ],
 )
 def test_out_of_range_workflow_values_are_rejected(

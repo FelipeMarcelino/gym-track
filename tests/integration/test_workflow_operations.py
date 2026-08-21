@@ -22,6 +22,8 @@ from app.domain.results import ResultVisibility, TaskType
 from app.domain.workflow.tasks import TaskStatus
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
+    COMMITTED_WORKFLOW_OUTCOMES,
+    FINISHED_WORKFLOW_STATUSES,
     Conversation,
     ExecutionTask,
     MessageBatch,
@@ -308,3 +310,33 @@ async def test_an_answer_points_back_at_the_execution_it_resumed(
             )
         )
         assert resumed is not None
+
+
+async def test_a_committed_delivery_is_not_re_run(
+    session_factory: async_sessionmaker[AsyncSession], workflow: _Workflow
+) -> None:
+    """The set the redelivery gate reads, asserted against the one the CHECK
+    constraint enforces.
+
+    They are deliberately different, and the two differences are the point:
+    a waiting execution committed durable work without finishing, and a failed
+    one finished without committing anything. Reading either set for the
+    other's job re-asks a question or drops a retry.
+    """
+    assert WorkflowExecutionStatus.WAITING_FOR_USER in COMMITTED_WORKFLOW_OUTCOMES
+    assert WorkflowExecutionStatus.WAITING_FOR_USER not in FINISHED_WORKFLOW_STATUSES
+    assert WorkflowExecutionStatus.FAILED in FINISHED_WORKFLOW_STATUSES
+    assert WorkflowExecutionStatus.FAILED not in COMMITTED_WORKFLOW_OUTCOMES
+
+    # And the finished set is exactly what migration 0011 wrote in SQL.
+    async with unit_of_work(session_factory) as session:
+        definition = await session.scalar(
+            sa.text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'ck_workflow_executions_finished_when_terminal'"
+            )
+        )
+    assert definition is not None
+    for status in FINISHED_WORKFLOW_STATUSES:
+        assert status.value in definition
+    assert WorkflowExecutionStatus.WAITING_FOR_USER.value not in definition

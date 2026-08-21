@@ -16,8 +16,14 @@ class TaskStatus(StrEnum):
 
     `SKIPPED` is deliberately not `FAILED`: a skipped task never ran, has no
     error of its own, and must not be reported to the user as a failure.
-    `WAITING_FOR_USER` is terminal *for one delivery* -- the workflow ends and
-    resumes on a later message.
+
+    `WAITING_FOR_USER` is **suspended, not finished**. It ends the current
+    delivery -- the message is answered and acked -- while the task itself has
+    produced nothing, carries no `finished_at`, and may still complete when the
+    user replies. `DELIVERY_TERMINAL_STATUSES` and `FINISHED_TASK_STATUSES`
+    below are that distinction, and describing it as "terminal" without saying
+    which of the two is meant is how a caller ends up stamping a completion
+    time the database then refuses.
     """
 
     PENDING = "pending"

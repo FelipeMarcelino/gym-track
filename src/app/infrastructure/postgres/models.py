@@ -75,14 +75,35 @@ class WorkflowExecutionStatus(StrEnum):
     PARTIAL_SUCCESS = "partial_success"
 
 
-#: Outcomes that mean this delivery finished and its work is durable. Paired
-#: with `finished_at` by a CHECK -- `WAITING_FOR_USER` is deliberately absent,
-#: because a paused execution has not finished and stamping it would make "how
-#: long do users take to answer" unanswerable.
-TERMINAL_WORKFLOW_STATUSES: frozenset[WorkflowExecutionStatus] = frozenset(
+#: The execution finished. Paired with `finished_at` by a CHECK constraint --
+#: `WAITING_FOR_USER` is deliberately absent, because a paused execution has
+#: not finished and stamping it would make "how long do users take to answer"
+#: unanswerable.
+FINISHED_WORKFLOW_STATUSES: frozenset[WorkflowExecutionStatus] = frozenset(
     {
         WorkflowExecutionStatus.SUCCEEDED,
         WorkflowExecutionStatus.FAILED,
+        WorkflowExecutionStatus.PARTIAL_SUCCESS,
+    }
+)
+
+#: This delivery committed an outcome, so a redelivery of its batch must
+#: produce nothing. A *different* set from the one above, and the two
+#: differences are the whole point:
+#:
+#: * `WAITING_FOR_USER` is here and not there -- a question that committed is
+#:   durable work even though the execution has not finished. Re-running it
+#:   would ask twice, or collide with its own row on the open-clarification
+#:   index.
+#: * `FAILED` is there and not here -- a failed delivery is exactly the one the
+#:   broker should redeliver.
+#:
+#: The same distinction `FINISHED_TASK_STATUSES` and
+#: `DELIVERY_TERMINAL_STATUSES` draw one level down.
+COMMITTED_WORKFLOW_OUTCOMES: frozenset[WorkflowExecutionStatus] = frozenset(
+    {
+        WorkflowExecutionStatus.SUCCEEDED,
+        WorkflowExecutionStatus.WAITING_FOR_USER,
         WorkflowExecutionStatus.PARTIAL_SUCCESS,
     }
 )
