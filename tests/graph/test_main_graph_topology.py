@@ -118,6 +118,26 @@ def test_the_process_compiles_the_graph_once() -> None:
     assert first is second, "a second call must return the graph already compiled"
 
 
+def test_two_compositions_do_not_evict_each_other() -> None:
+    """The memo is keyed on collaborators, so it must hold more than one.
+
+    A bound of one turns "a differently composed worker gets its own graph"
+    into "whichever composition ran last keeps its graph": A, then B, then A
+    again would compile A twice. That is the reuse this accessor exists to
+    provide, so the sequence is the test.
+    """
+    composition_a = (DeterministicIntentRouter(), DeterministicExecutionPlanner())
+    composition_b = (DeterministicIntentRouter(), DeterministicExecutionPlanner())
+
+    compiled_main_graph.cache_clear()
+    first_a = compiled_main_graph(router=composition_a[0], planner=composition_a[1])
+    graph_b = compiled_main_graph(router=composition_b[0], planner=composition_b[1])
+    second_a = compiled_main_graph(router=composition_a[0], planner=composition_a[1])
+
+    assert first_a is second_a, "B must not have evicted A"
+    assert graph_b is not first_a, "distinct compositions get distinct graphs"
+
+
 def test_the_graph_version_is_a_pinned_constant() -> None:
     """Q132. Recorded on every execution row, so a graph change without a
     version bump makes two different shapes indistinguishable in the data."""

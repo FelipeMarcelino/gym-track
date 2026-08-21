@@ -12,7 +12,7 @@ still work and would quietly make the "static" in DEC-002 a comment.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import lru_cache
+from functools import cache
 from itertools import pairwise
 from typing import Any, Final
 
@@ -41,7 +41,7 @@ NODE_SEQUENCE: Final[tuple[str, ...]] = (
 )
 
 
-@lru_cache(maxsize=1)
+@cache
 def compiled_main_graph(
     *,
     router: IntentRouterPort,
@@ -59,6 +59,14 @@ def compiled_main_graph(
     The cache is keyed on the collaborators, so a worker composed differently
     -- one without the workout service, say -- gets its own graph rather than
     silently reusing another's.
+
+    `cache` rather than a bounded LRU, and that is the point rather than an
+    oversight. A bound of one would make two coexisting compositions evict each
+    other: A, then B, then A
+    again compiles A twice, which is exactly the reuse this function exists to
+    provide. There is no growth to bound anyway -- an entry is one composition,
+    and a process composes at startup. Something building compositions in a
+    loop is the bug this accessor is meant to prevent, not a case to cap.
     """
     return build_main_graph(router=router, planner=planner, checkpointer=checkpointer)
 
