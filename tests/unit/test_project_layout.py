@@ -150,3 +150,29 @@ def test_only_the_graph_package_imports_the_orchestration_library(source: Path) 
         f"{relative} imports {sorted(offending)}; LangGraph is an adapter and "
         "belongs behind app/graphs/ or app/infrastructure/langgraph/"
     )
+
+
+def test_the_grant_policy_does_not_import_the_orchestration_library() -> None:
+    """`alembic upgrade` must not need LangGraph to learn a schema name.
+
+    The grant policy and the migrations only want a string. Reaching into the
+    adapter for it drags LangGraph and a connection pool into every migration
+    run, and turns an unrelated import failure into a failed upgrade.
+    """
+    import subprocess
+    import sys
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import app.infrastructure.postgres.grants; "
+            "import app.infrastructure.postgres.provisioning; "
+            "print(any(name.startswith(('langgraph', 'langchain')) for name in sys.modules))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    assert probe.stdout.strip() == "False", probe.stdout

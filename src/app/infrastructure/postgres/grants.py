@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Final
 
 from app.config import ServiceName
-from app.infrastructure.langgraph.checkpointer import CHECKPOINT_SCHEMA
+from app.infrastructure.postgres.schemas import CHECKPOINT_SCHEMA
 
 #: table -> privileges, per service. Anything absent is denied by omission.
 SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {

@@ -24,8 +24,8 @@ import sqlalchemy as sa
 from alembic import op
 
 from app.config import load_settings
-from app.infrastructure.langgraph.checkpointer import CHECKPOINT_SCHEMA
 from app.infrastructure.postgres.provisioning import sync_service_roles
+from app.infrastructure.postgres.schemas import CHECKPOINT_SCHEMA
 
 revision: str = "0010_langgraph_schema"
 down_revision: str | None = "0009_plural_aliases"

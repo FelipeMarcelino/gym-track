@@ -37,11 +37,9 @@ from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import PostgresRole, PostgresSettings
+from app.infrastructure.postgres.schemas import CHECKPOINT_SCHEMA
 
 logger = logging.getLogger(__name__)
-
-#: Isolated from `public` on purpose (Q124). Named in ADR-015.
-CHECKPOINT_SCHEMA: Final = "langgraph"
 
 #: What `setup()` creates, read out of the package rather than guessed. The
 #: integration suite asserts this set is exactly what appears in the schema, so

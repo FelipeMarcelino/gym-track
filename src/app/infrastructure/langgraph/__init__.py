@@ -9,7 +9,6 @@ nowhere else.
 from __future__ import annotations
 
 from app.infrastructure.langgraph.checkpointer import (
-    CHECKPOINT_SCHEMA,
     CHECKPOINT_TABLES,
     CheckpointerProvider,
     checkpointer_dsn,
@@ -17,7 +16,6 @@ from app.infrastructure.langgraph.checkpointer import (
 )
 
 __all__ = [
-    "CHECKPOINT_SCHEMA",
     "CHECKPOINT_TABLES",
     "CheckpointerProvider",
     "checkpointer_dsn",

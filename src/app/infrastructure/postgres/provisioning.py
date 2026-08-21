@@ -24,6 +24,7 @@ from sqlalchemy.engine import Connection
 
 from app.config import ApplicationSettings, ServiceName
 from app.infrastructure.postgres.grants import SCHEMA_GRANTS, SERVICE_GRANTS
+from app.infrastructure.postgres.schemas import MANAGED_SCHEMAS
 
 logger = logging.getLogger(__name__)
 
@@ -77,26 +78,53 @@ def _schema_exists(connection: Connection, schema: str) -> bool:
     return found is not None
 
 
-def _sync_schema_grants(connection: Connection, service: ServiceName, role: str) -> None:
-    """Grants on a schema outside `public`, applied convergently.
+def _revoke_schema(connection: Connection, schema: str, role: str) -> None:
+    """Take everything back, including what future tables would have inherited.
 
-    `ALTER DEFAULT PRIVILEGES` is the half that matters. The checkpoint tables
-    are created after this runs -- by `make migrate`, not by a migration -- and
-    a checkpointer release that adds a fifth table must not need a migration
-    before the worker can write to it. Default privileges make the grant apply
-    to whatever the admin creates there next.
+    `ALTER DEFAULT PRIVILEGES ... GRANT` only *adds* to the default ACL, so a
+    privilege dropped from the policy would keep appearing on every table the
+    checkpointer creates from then on. Revoking first is what makes the policy
+    a policy rather than a high-water mark.
     """
-    for schema, privileges in SCHEMA_GRANTS.get(service, {}).items():
+    name = _identifier(schema)
+    connection.execute(
+        sa.text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {name} REVOKE ALL ON TABLES FROM {role}")
+    )
+    connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {name} FROM {role}"))
+    connection.execute(sa.text(f"REVOKE ALL ON SCHEMA {name} FROM {role}"))
+
+
+def _sync_schema_grants(connection: Connection, service: ServiceName, role: str) -> None:
+    """Grants on schemas outside `public`, applied convergently.
+
+    Every managed schema is revoked first, not only the ones this service is
+    granted today: a schema deleted from `SCHEMA_GRANTS` is never visited by a
+    loop over the policy, so its privileges would outlive the decision to
+    remove them.
+
+    `ALTER DEFAULT PRIVILEGES` is the half that earns its keep. The checkpoint
+    tables are created after this runs -- by `make migrate`, not by a migration
+    -- and a checkpointer release that adds a fifth table must not need a
+    migration before the worker can write to it.
+    """
+    desired = SCHEMA_GRANTS.get(service, {})
+    for schema in MANAGED_SCHEMAS:
         if not _schema_exists(connection, schema):
             logger.info(
                 "skipping grants for a schema that does not exist yet",
                 extra={"schema": schema, "role": role},
             )
             continue
+
+        _revoke_schema(connection, schema, role)
+
+        privileges = desired.get(schema)
+        if privileges is None:
+            continue
+
         name = _identifier(schema)
         granted = ", ".join(_privilege(privilege) for privilege in privileges)
         connection.execute(sa.text(f"GRANT USAGE ON SCHEMA {name} TO {role}"))
-        connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {name} FROM {role}"))
         connection.execute(sa.text(f"GRANT {granted} ON ALL TABLES IN SCHEMA {name} TO {role}"))
         connection.execute(
             sa.text(
@@ -147,20 +175,9 @@ def drop_service_roles(connection: Connection, settings: ApplicationSettings) ->
         name = _identifier(settings.postgres.roles[service].user)
         if not _role_exists(connection, name):
             continue
-        for schema in SCHEMA_GRANTS.get(service, {}):
-            if not _schema_exists(connection, schema):
-                continue
-            qualified = _identifier(schema)
-            connection.execute(
-                sa.text(
-                    f"ALTER DEFAULT PRIVILEGES IN SCHEMA {qualified} "
-                    f"REVOKE ALL ON TABLES FROM {name}"
-                )
-            )
-            connection.execute(
-                sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {qualified} FROM {name}")
-            )
-            connection.execute(sa.text(f"REVOKE ALL ON SCHEMA {qualified} FROM {name}"))
+        for schema in MANAGED_SCHEMAS:
+            if _schema_exists(connection, schema):
+                _revoke_schema(connection, schema, name)
         connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {name}"))
         connection.execute(sa.text(f"REVOKE ALL ON SCHEMA public FROM {name}"))
         connection.execute(sa.text(f"DROP OWNED BY {name}"))

@@ -16,17 +16,18 @@ from collections.abc import AsyncIterator
 import psycopg
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
 
 from app.config import ApplicationSettings, ServiceName
 from app.infrastructure.langgraph.checkpointer import (
-    CHECKPOINT_SCHEMA,
     CHECKPOINT_TABLES,
     CheckpointerProvider,
     checkpointer_dsn,
     setup_checkpoint_tables,
 )
+from app.infrastructure.postgres.schemas import CHECKPOINT_SCHEMA
 from tests.conftest import requires_docker
 
 pytestmark = [requires_docker, pytest.mark.asyncio]
@@ -75,15 +76,24 @@ async def test_the_checkpoint_tables_live_in_their_own_schema(
     async with await psycopg.AsyncConnection.connect(
         _unscoped_admin_dsn(checkpoint_store)
     ) as connection:
+        # Every table in the schema, not only the ones we expect: a release
+        # that adds a fifth must fail here rather than land somewhere the
+        # grants and this module's constant do not know about.
         cursor = await connection.execute(
-            "SELECT table_schema, table_name FROM information_schema.tables "
-            "WHERE table_name = ANY(%s)",
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+            (CHECKPOINT_SCHEMA,),
+        )
+        in_schema = {name for (name,) in await cursor.fetchall()}
+
+        cursor = await connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = ANY(%s)",
             (list(CHECKPOINT_TABLES),),
         )
-        found = {(schema, table) for schema, table in await cursor.fetchall()}
+        in_public = {name for (name,) in await cursor.fetchall()}
 
-    assert found == {(CHECKPOINT_SCHEMA, table) for table in CHECKPOINT_TABLES}
-    assert not any(schema == "public" for schema, _ in found)
+    assert in_schema == set(CHECKPOINT_TABLES)
+    assert in_public == set()
 
 
 async def test_a_checkpoint_survives_the_process_that_wrote_it(
@@ -159,6 +169,58 @@ async def test_a_table_created_later_is_writable_without_a_migration(
             _admin_dsn(checkpoint_store), autocommit=True
         ) as connection:
             await connection.execute(f"DROP TABLE {CHECKPOINT_SCHEMA}.checkpoint_later")
+
+
+async def test_a_privilege_removed_from_the_policy_stops_reaching_new_tables(
+    checkpoint_store: ApplicationSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The policy has to be able to take something away, not only add.
+
+    `ALTER DEFAULT PRIVILEGES ... GRANT` accumulates, so without a revoke first
+    a privilege dropped from `SCHEMA_GRANTS` would keep landing on every table
+    the checkpointer creates afterwards -- the grants would drift permanently
+    away from the policy that is supposed to describe them.
+    """
+    from sqlalchemy import create_engine
+
+    from app.infrastructure.postgres import grants, provisioning
+
+    reduced = {
+        ServiceName.WORKFLOW_WORKER: {CHECKPOINT_SCHEMA: ("SELECT",)},
+    }
+    monkeypatch.setattr(provisioning, "SCHEMA_GRANTS", reduced)
+    monkeypatch.setattr(grants, "SCHEMA_GRANTS", reduced)
+
+    engine = create_engine(checkpoint_store.postgres.admin_dsn().replace("+asyncpg", "+psycopg"))
+    try:
+        with engine.begin() as connection:
+            provisioning.sync_service_roles(connection, checkpoint_store)
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE TABLE {CHECKPOINT_SCHEMA}.checkpoint_reduced (id int)")
+            )
+
+        worker = checkpoint_store.postgres.roles[ServiceName.WORKFLOW_WORKER].user
+        with engine.connect() as connection:
+            allowed = connection.execute(
+                sa.text(
+                    "SELECT privilege_type FROM information_schema.table_privileges "
+                    "WHERE table_schema = :schema AND table_name = 'checkpoint_reduced' "
+                    "AND grantee = :role"
+                ),
+                {"schema": CHECKPOINT_SCHEMA, "role": worker},
+            ).scalars()
+            assert set(allowed) == {"SELECT"}
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(f"DROP TABLE IF EXISTS {CHECKPOINT_SCHEMA}.checkpoint_reduced")
+            )
+            # Put the real policy back: the schema grants are session state for
+            # every test that runs after this one.
+            provisioning.sync_service_roles(connection, checkpoint_store)
+        engine.dispose()
 
 
 async def test_the_search_path_is_what_isolates_it(
