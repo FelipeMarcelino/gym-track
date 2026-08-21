@@ -44,6 +44,7 @@ demo: ## Send a fragmented message to the running stack and report the reply
 
 migrate: ## Apply database migrations to the local stack
 	uv run alembic upgrade head
+	uv run python -m app.infrastructure.langgraph.checkpointer
 
 provision: ## Reconcile database roles, passwords and grants with the policy
 	uv run python -m app.infrastructure.postgres.provisioning
