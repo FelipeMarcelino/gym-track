@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.config import ApplicationSettings, Environment, MappingSecretsProvider, load_settings
+from app.config import (
+    ApplicationSettings,
+    Environment,
+    MappingSecretsProvider,
+    ServiceName,
+    load_settings,
+)
 from app.entrypoints.dispatcher import build_client
 from app.entrypoints.workflow_worker import _owned_partitions
 from app.infrastructure.whatsapp.fake_client import FakeWhatsAppClient
@@ -12,6 +18,15 @@ from tests.unit.test_settings import EXAMPLE_SECRETS
 
 
 def settings_for(environment: Environment) -> ApplicationSettings:
+    """Settings built from nothing but this file.
+
+    The roles are derived from `ServiceName` rather than listed. A literal list
+    silently goes stale the moment a sprint adds a process -- which is exactly
+    what happened when the session-expiration worker arrived, and it was hidden
+    because another suite's session fixture had already exported the missing
+    variable into the environment. Settings assembled from a source of truth
+    cannot drift that way.
+    """
     return load_settings(
         MappingSecretsProvider(EXAMPLE_SECRETS),
         _env_file=None,
@@ -21,11 +36,8 @@ def settings_for(environment: Environment) -> ApplicationSettings:
             "database": "gym_track",
             "admin": {"user": "gym_track"},
             "roles": {
-                "api": {"user": "gym_api"},
-                "message-aggregator": {"user": "gym_message_aggregator"},
-                "workflow-worker": {"user": "gym_workflow_worker"},
-                "outbox-publisher": {"user": "gym_outbox_publisher"},
-                "dispatcher": {"user": "gym_dispatcher"},
+                service.value: {"user": f"gym_{service.value.replace('-', '_')}"}
+                for service in ServiceName
             },
         },
         rabbitmq={"host": "rabbitmq", "user": "gym_track"},
