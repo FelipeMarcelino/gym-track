@@ -89,6 +89,24 @@ class PlannedTask:
     #: workflow reports a failure the user did not cause.
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        """Copy the mappings in.
+
+        `frozen=True` stops the *field* being rebound; it does nothing about
+        the dictionary behind it. A planner that kept a reference to what it
+        passed could mutate a plan after construction -- including one already
+        written into a checkpoint, which is the value this whole module
+        promises will not change under the run that wrote it.
+
+        A copy, not a `MappingProxyType`: this object gets serialized into a
+        checkpoint, and a proxy is not something every serializer can carry.
+        The copy defends against the aliasing that can actually happen here;
+        reaching into `task.payload` and mutating it in place is a different
+        kind of mistake, and one the type says not to make.
+        """
+        object.__setattr__(self, "payload", dict(self.payload))
+        object.__setattr__(self, "facts", dict(self.facts))
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionPlan:
@@ -98,12 +116,15 @@ class ExecutionPlan:
         if not self.tasks:
             raise EmptyPlanError
 
-        keys = [task.key for task in self.tasks]
-        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        known: set[str] = set()
+        duplicates: set[str] = set()
+        for task in self.tasks:
+            if task.key in known:
+                duplicates.add(task.key)
+            known.add(task.key)
         if duplicates:
-            raise PlanError(f"duplicate task keys in the plan: {', '.join(duplicates)}")
+            raise PlanError(f"duplicate task keys in the plan: {', '.join(sorted(duplicates))}")
 
-        known = set(keys)
         for task in self.tasks:
             for dependency in task.depends_on:
                 if dependency.task_key not in known:
@@ -218,7 +239,7 @@ class ExecutionPlan:
         return self._with(key, status=TaskStatus.RUNNING)
 
     def completed(self, key: str, *, facts: Mapping[str, str]) -> ExecutionPlan:
-        return self._with(key, status=TaskStatus.COMPLETED, facts=dict(facts))
+        return self._with(key, status=TaskStatus.COMPLETED, facts=facts)
 
     def waiting(self, key: str) -> ExecutionPlan:
         """The task interrupted. Its dependants stay PENDING rather than being
@@ -268,8 +289,13 @@ class ExecutionPlan:
             return replace(
                 task,
                 status=status,
-                facts=dict(facts) if facts is not None else task.facts,
-                error=error if error is not None else task.error,
+                # `PlannedTask.__post_init__` copies, so this does not have to.
+                facts=facts if facts is not None else task.facts,
+                # Not preserved. The error belongs to the failure that set it,
+                # and carrying it through a later transition would report a
+                # failure for a task that did not fail -- exactly the
+                # distinction `SKIPPED is not FAILED` rests on.
+                error=error,
             )
 
         return ExecutionPlan(

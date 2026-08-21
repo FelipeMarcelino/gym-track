@@ -333,3 +333,52 @@ def test_the_golden_plans_walk_the_same_way(case: dict[str, Any]) -> None:
     assert plan.is_terminal()
     assert plan.outcome() is WorkflowOutcome(case["outcome"])
     assert {task.key: task.status.value for task in plan.tasks} == case["final_statuses"]
+
+
+def test_a_plan_does_not_share_the_dictionary_it_was_given() -> None:
+    """`frozen=True` stops the field being rebound and nothing more.
+
+    A planner holding a reference to what it passed could otherwise mutate a
+    plan after construction -- including one already written into a checkpoint,
+    which is the value this module promises cannot change under the run that
+    wrote it.
+    """
+    payload = {"exercise": "supino"}
+    plan = ExecutionPlan(
+        tasks=(
+            PlannedTask(
+                key="a",
+                task_type=TaskType.LOG_WORKOUT,
+                result_visibility=ResultVisibility.USER_VISIBLE,
+                payload=payload,
+            ),
+        )
+    )
+
+    payload["exercise"] = "agachamento"
+
+    assert plan.task("a").payload == {"exercise": "supino"}
+
+
+def test_completing_does_not_share_the_facts_it_was_given() -> None:
+    facts = {"sets": "3"}
+    plan = ExecutionPlan(tasks=(_task("a"),)).completed("a", facts=facts)
+
+    facts["sets"] = "4"
+
+    assert plan.task("a").facts == {"sets": "3"}
+
+
+def test_an_error_does_not_survive_a_later_transition() -> None:
+    """`error` belongs to the failure that set it.
+
+    Carrying it forward would report a failure for a task that did not fail,
+    which is the distinction the whole SKIPPED-is-not-FAILED rule rests on.
+    """
+    plan = ExecutionPlan(tasks=(_task("a"),))
+
+    failed = plan.failed("a", error="boom")
+    assert failed.task("a").error == "boom"
+
+    recovered = failed.completed("a", facts={})
+    assert recovered.task("a").error is None
