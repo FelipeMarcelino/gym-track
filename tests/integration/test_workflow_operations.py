@@ -101,7 +101,7 @@ def _clarification(
         "status": ClarificationStatus.WAITING,
         "spec": {"schema_version": "clarification-spec.v1"},
         "expires_at": datetime.now(UTC) + timedelta(hours=6),
-        "checkpoint_ns": f"{workflow.execution_id}:{uuid4()}",
+        "checkpoint_thread_id": f"{workflow.conversation_id}:{workflow.execution_id}:{uuid4()}",
         "checkpoint_id": str(uuid4()),
     }
     values.update(overrides)

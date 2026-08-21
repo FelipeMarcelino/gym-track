@@ -77,7 +77,7 @@ the two documents no longer disagree.
 | Area | What ships | Traceability |
 | --- | --- | --- |
 | Graph runtime | `langgraph` pinned; a compiled static `MainGraph`; `graph_version` recorded on every execution | §11.1, Q121, Q132, DEC-002 |
-| Checkpointer | `AsyncPostgresSaver` on a dedicated `langgraph` schema, `thread_id = conversation_id` | §11.5, Q123, Q124 |
+| Checkpointer | `AsyncPostgresSaver` on a dedicated `langgraph` schema; the thread names conversation, execution and delivery | §11.5, Q123, Q124 |
 | Graph state | `MainGraphState` as declared in §11.4 — working state and references only | §11.4, Q27 |
 | Execution plan | `ExecutionTask`, `DependencyPolicy`, `ExecutionPlan`; parallelism derived from dependencies, never stored | §11.2, Q122, Q127 |
 | Scheduler | READY fan-out, task-result reducer, `SKIPPED` propagation, terminal detection | §11.1, Q122, Q127 |
@@ -237,7 +237,7 @@ a merge, one PR each, reviewed and CI-green before merging.
 
 ### WS-7 — The worker runs the graph
 1. `WorkflowWorker.handle` invokes the compiled graph on
-   `thread_id = conversation_id` instead of resolving a handler itself.
+   the composite thread instead of resolving a handler itself.
 2. Everything Sprint 1 established is preserved and re-asserted, not assumed:
    one transaction for `workflow_executions` + `outbound_messages` +
    `domain_events` + `outbox_events`, ACK after that commit and never after
@@ -368,7 +368,8 @@ a merge, one PR each, reviewed and CI-green before merging.
    list, it has been unwritten since Sprint 1, and this is the sprint that earns
    it.
 2. **ADR-015** — LangGraph checkpoint storage: dedicated schema, `search_path`
-   isolation, admin-owned DDL, `thread_id = conversation_id`, and the explicit
+   isolation, admin-owned DDL, the composite thread and why Q123's literal
+   reading could not be kept, and the explicit
    statement that a checkpoint is never authoritative for business state.
 3. **ADR-016** — Clarification as an interrupt: why `pending_clarifications`
    exists beside the checkpoint (Q125), why at most one is open per
@@ -412,7 +413,7 @@ that checks each line, not by agreement that it feels done.
 - [ ] Checkpoint tables exist only in the `langgraph` schema; none of the four exists in `public` (Q124).
 - [ ] The workflow-worker role can read and write checkpoints and cannot create a table in that schema (Q145).
 - [ ] A checkpoint written before a rolled-back domain transaction produces exactly one set on redelivery, not zero and not two (DEC-005).
-- [ ] `thread_id` equals `conversation_id` for every execution (Q123).
+- [ ] Every execution's thread names its conversation, itself and its delivery — the first segment keeping Q123's intent (ADR-015).
 - [ ] A failed `REQUIRE_SUCCESS` predecessor leaves its dependants `SKIPPED`, and an independent sibling still `COMPLETED` (Q127, Q28).
 - [ ] `execution_tasks` reports every task's terminal status, queryable without reading a checkpoint (Q118, Q128).
 - [ ] A workflow with one committed task and one failed task ends `PARTIAL_SUCCESS` and does not roll back the committed work (Q28).
@@ -434,7 +435,7 @@ measured**, not a commitment.
 | D1 | Orchestration library | **LangGraph 1.x**, pinned `>=1.2,<2`. The spec mandates it by name (§11, DEC-002); the cost is `langchain-core` in the dependency tree for a sprint with no LLM |
 | D2 | Checkpoint isolation | **A dedicated `langgraph` schema**, selected by `search_path` on the checkpointer's connection. Measured: version 3.1.2 exposes no schema parameter. A separate database is the fallback if `search_path` proves unreliable |
 | D3 | Who creates the checkpoint tables | **The admin identity, from `make migrate`.** The worker role gets DML only; a service role with DDL is a least-privilege hole (Q145) |
-| D4 | `thread_id` | **`conversation_id`**, per Q123 — not `training_session_id`, which expires on its own clock while a clarification must survive that. Paired with `checkpoint_ns = workflow_execution_id`, because Q29 allows a paused workflow and a new one in the same conversation, and one namespace between them means the new run becomes the checkpoint the answer would resume |
+| D4 | `thread_id` | **`conversation:execution:delivery`**, composite — *revised in WS-4 by measurement*. `checkpoint_ns` cannot carry the isolation: a run started under a top-level namespace writes, but `aget_state` refuses to read it back, and WS-9 has to read it. The conversation keeps Q123's intent (not `training_session_id`, which expires on its own clock while a clarification must survive that), the execution keeps Q29's two runs apart, and the delivery keeps a retry from inheriting a rolled-back attempt's checkpoint. ADR-015 records the deviation |
 | D5 | Intent routing this sprint | **Sprint 2's `route()` behind `IntentRouterPort`.** The port is the Sprint 4 seam; nothing else changes |
 | D6 | Planner this sprint | **Deterministic, single-task plans for real traffic.** The DAG engine is verified by plan-level tests over synthetic plans, and that gap is stated in Scope rather than papered over |
 | D7 | Clarification transport | **LangGraph `interrupt()` + `Command(resume=…)`**, with `pending_clarifications` as the searchable mirror the checkpoint cannot be (Q125) |

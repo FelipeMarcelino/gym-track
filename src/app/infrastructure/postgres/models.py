@@ -996,8 +996,13 @@ class PendingClarification(Base):
 
     It also carries where to resume from. A redelivered answer must fork from
     the checkpoint the interrupt was taken at rather than from wherever the
-    previous attempt died, so `checkpoint_ns` and `checkpoint_id` are durable
+    previous attempt died, so the thread and the checkpoint id are durable
     facts about the pause, not something reconstructed later.
+
+    `checkpoint_thread_id` is the *composite* thread -- conversation, execution
+    and delivery -- because LangGraph's `checkpoint_ns` cannot be read back
+    when set at the top level (measured in WS-4, pinned in
+    `tests/graph/test_langgraph_semantics.py`).
     """
 
     __tablename__ = "pending_clarifications"
@@ -1051,7 +1056,7 @@ class PendingClarification(Base):
     #: be re-asked or audited without reconstructing it from the domain.
     spec: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
-    checkpoint_ns: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    checkpoint_thread_id: Mapped[str] = mapped_column(sa.String(160), nullable=False)
     checkpoint_id: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     answer_message_batch_id: Mapped[UUID | None] = mapped_column(

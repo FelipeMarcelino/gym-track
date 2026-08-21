@@ -20,13 +20,17 @@ Sprint 2 shipped a scorer the plan had named wrongly, and the only reason it was
 
 Consequences, applied throughout this plan: isolation comes from `search_path` on the checkpointer's own connection (D2), `setup()` is run by the admin identity because it issues DDL (D3), and WS-1's first test asserts *where the four tables actually landed* rather than trusting any of this.
 
-Two more items are named but **not yet measured**; measure them before writing the code they belong to, and record the result in the PR:
+**Measured in WS-4, and one of them was false.** The five items below were open when this plan was written; `tests/graph/test_langgraph_semantics.py` now pins each answer, so a LangGraph upgrade that changes one fails loudly instead of WS-8 and WS-9 failing subtly:
 
-- **`interrupt()` semantics under a resumed thread with a modified input.** The plan assumes `Command(resume=value)` re-enters the interrupted node and that nodes before it do not re-run. Verify against the pinned version before WS-8 hardens around it.
-- **What `ainvoke` returns for a suspended graph.** WS-8 reads the pending interrupt out of it through a single accessor; confirm the shape in WS-4.
-- **`checkpoint_ns` as a top-level isolation key.** D4 uses it to keep two runs in one conversation apart. It is documented as the subgraph namespace, and using it this way must be verified before WS-9 depends on it. **Fallback:** a composite `thread_id` of `f"{conversation_id}:{execution_id}:{attempt}"`, which works but reads Q123 loosely and would need an ADR amendment saying so. Decide in WS-4, not in WS-9.
-- **Forking from an explicit `checkpoint_id`.** WS-7's reconciliation depends on a resume re-entering the interrupt point rather than the latest checkpoint of that namespace. **Fallback** if it will not: re-run the whole batch in a fresh namespace and let `processed_operations` absorb the already-committed half.
-- **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
+| Question | Answer | Consequence |
+| --- | --- | --- |
+| What does `ainvoke` return for a suspended graph? | `{"__interrupt__": [Interrupt(value=..., id=...)], ...}`, and `aget_state` reports `next` plus the checkpoint id | WS-8's accessor reads `__interrupt__`; the pause point comes from `aget_state(...).config` |
+| Do nodes before the interrupt re-run on resume? | **No** | As assumed |
+| Does the interrupted node resume *at* the `interrupt()` call? | **No — it re-runs from the top of the node** | Everything the handler does before `ask()` happens twice. WS-8's commit is idempotent under `processed_operations`, which is now load-bearing rather than belt-and-braces |
+| Can `checkpoint_ns` isolate two runs of one thread? | **No.** The run writes, but `aget_state` raises `ValueError: Subgraph … not found` | **D4 changed.** Isolation moved into a composite `thread_id`; ADR-015 records the deviation from a literal Q123 |
+| Can a resume fork from an explicit `checkpoint_id`? | Yes, and it **replays the resume value already recorded** — a second `Command(resume=…)` with a different value is ignored | WS-7's reconciliation works; a retry re-applies the same answer and cannot correct one |
+
+Still unmeasured, and belonging to WS-7: **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
 
 ## Decisions applied
 
@@ -35,7 +39,7 @@ Two more items are named but **not yet measured**; measure them before writing t
 | D1 | `langgraph>=1.2,<2` and `langgraph-checkpoint-postgres>=3.1,<4` in `[project].dependencies` (WS-1) |
 | D2 | `CHECKPOINT_SCHEMA = "langgraph"` in `app/infrastructure/langgraph/checkpointer.py`; the psycopg DSN carries `options=-c%20search_path%3Dlanggraph` |
 | D3 | `scripts/checkpointer_setup.py`, invoked by `make migrate` after `alembic upgrade head`, connecting as the admin role |
-| D4 | `thread_id=str(conversation_id)` **and** `checkpoint_ns=str(workflow_execution_id)`, built by one function, `thread_for(...)`, so no call site can invent its own. Q123 is satisfied by the thread; the namespace is what keeps two runs in one conversation from overwriting each other |
+| D4 | ~~`checkpoint_ns`~~ — **superseded by measurement.** `thread_id = f"{conversation_id}:{execution_id}:{delivery_id}"`, built by `thread_id_for(...)` so no call site can invent its own. The conversation keeps Q123's intent, the execution keeps Q29's two runs apart, and the delivery keeps a retry from inheriting a rolled-back attempt's checkpoint |
 | D5 | `IntentRouterPort` in `app/application/ports/routing.py`; `DeterministicIntentRouter` wraps Sprint 2's `route()` |
 | D6 | `DeterministicExecutionPlanner` in `app/application/services/execution_planner.py`; one task per routed intent |
 | D7 | `app/graphs/main/interrupts.py` owns every `interrupt()` call; no other module imports it from `langgraph` |
@@ -252,7 +256,7 @@ pending_clarifications
   status                   varchar(64) not null check
   spec                     jsonb not null           -- the frozen ClarificationSpec
   expires_at               timestamptz not null
-  checkpoint_ns            text not null            -- where the pause lives
+  checkpoint_thread_id     text not null            -- the composite thread the pause lives on
   checkpoint_id            text not null            -- the exact point to fork from
   created_at               timestamptz not null default now()
   updated_at               timestamptz not null default now()
@@ -518,14 +522,18 @@ def build_main_graph(
 ) -> CompiledStateGraph:
     """Compiled once, at process start (Q121)."""
 
-def thread_for(conversation_id: UUID, *, checkpoint_ns: str,
-               checkpoint_id: str | None = None) -> dict[str, Any]:
+def thread_id_for(conversation_id: UUID, execution_id: UUID, delivery_id: UUID) -> str:
 
-def fresh_namespace(execution_id: UUID) -> str:
-    """`f"{execution_id}:{uuid4()}"` -- see WS-7 on why this is not a counter."""
-    """`{"configurable": {"thread_id": ..., "checkpoint_ns": ...}}` (Q123, D4).
+def thread_for(conversation_id: UUID, execution_id: UUID, delivery_id: UUID, *,
+               checkpoint_id: str | None = None) -> RunnableConfig:
 
-    The thread is the conversation, as Q123 requires. The namespace is the
+def new_delivery_id() -> UUID:
+    """A uuid per delivery -- see WS-7 on why this is not a counter."""
+    """`{"configurable": {"thread_id": "<conversation>:<execution>:<delivery>"}}`.
+
+    Three parts, each earning its place. The conversation keeps Q123's
+    intent, the execution keeps Q29's two runs apart, and the delivery keeps a
+    retry from inheriting a rolled-back attempt's checkpoint. The namespace is the
     execution *and its attempt*, and neither half is decoration:
 
     * the execution, because a conversation can have a paused workflow **and**
@@ -892,8 +900,8 @@ class WorkflowWorker:
 
             await graph.ainvoke(
                 initial_state,
-                config=thread_for(batch.conversation_id,
-                                  checkpoint_ns=fresh_namespace(execution.id)),
+                config=thread_for(batch.conversation_id, execution.id,
+                                  new_delivery_id()),
                 context=WorkerContext(session=session,
                                       delivery_execution_id=execution.id,
                                       task_execution_id=execution.id,
@@ -925,8 +933,8 @@ missing half fails in the *opposite* direction to a duplicate:
 So the reconciliation is explicit, and it is built out of the only thing that is
 authoritative: SQL.
 
-**A fresh run gets a namespace nobody has used.**
-`checkpoint_ns = f"{execution_id}:{delivery_id}"`, where `delivery_id` is a
+**A fresh run gets a thread nobody has used.**
+`thread_id = f"{conversation_id}:{execution_id}:{delivery_id}"`, where `delivery_id` is a
 `uuid4()` minted **per delivery** and stored nowhere by default.
 
 The obvious choice — `workflow_executions.attempts` — does not work, and the
@@ -938,13 +946,13 @@ with the transaction cannot be the thing that recovers from that transaction.
 
 A fresh uuid has no fate to share. If the transaction commits, whatever needs to
 find the namespace later has it durably: the `pending_clarifications` row records
-`checkpoint_ns` in the same commit. If it rolls back, the namespace is garbage
+`checkpoint_thread_id` in the same commit. If it rolls back, the thread is garbage
 nobody references, and the retry starts from nothing — which is exactly what it
 should do. Orphaned checkpoints are storage, not correctness; retention is
 Sprint 10's.
 
 **A resume forks from the checkpoint the interrupt was taken at, every time.**
-`pending_clarifications` stores `checkpoint_ns` and `checkpoint_id` at the moment
+`pending_clarifications` stores `checkpoint_thread_id` and `checkpoint_id` at the moment
 of suspension — durable, in the same transaction as the WAITING row — and the
 resume config carries both. A redelivered answer forks from the same point again
 instead of resuming wherever the last attempt died, and the double-commit that
@@ -969,7 +977,7 @@ rows.
 `tests/integration/test_workflow_worker_graph.py`
 
 - The whole of Sprint 1's and Sprint 2's worker suites, still green, with **no assertion relaxed**. If a test needs changing to accommodate the graph, that is a finding for the PR description, not a quiet edit.
-- `test_the_thread_is_the_conversation` — the checkpoint lands under `str(conversation_id)` (Q123).
+- `test_the_thread_names_the_conversation_the_execution_and_the_delivery` — the checkpoint lands under the composite thread, and its first segment is the conversation, which is Q123's intent (ADR-015).
 - `test_two_batches_in_one_conversation_share_a_thread` — and the second does not resume the first.
 - `test_a_graph_that_raises_fails_the_execution` — status FAILED, error recorded, the exception propagates so the broker retries.
 - `test_a_redelivered_question_is_not_asked_twice` — a batch that committed `WAITING_FOR_USER` and lost its ACK returns without effects: one outbound question, one WAITING row, no second run.
@@ -1115,12 +1123,13 @@ So the interrupt is completed **by the worker, outside the paused graph**, in th
 transaction it already owns (WS-7):
 
 ```text
-state = await graph.ainvoke(initial_state, config=thread_for(conversation_id))
+state = await graph.ainvoke(initial_state,
+                            config=thread_for(conversation_id, execution.id, delivery_id))
 
 if interrupt_of(state) is not None:              # LangGraph reports the pending interrupt
     pause = interrupt_of(state)                  # a Suspension
     write pending_clarifications(pause.spec)     # WAITING, expires_at = now + D10,
-                                                 # checkpoint_ns and checkpoint_id stored
+                                                 # checkpoint_thread_id and checkpoint_id stored
     write outbound_messages(reply_for(pause))    # confirmation + question + dropped items
     execution.status = WAITING_FOR_USER
     # commit, then ACK -- unchanged from Q130
@@ -1291,9 +1300,9 @@ decision = await resolver.classify(session, conversation_id=..., texts=...)
 ANSWER        -> row = decision.clarification
                  await graph.ainvoke(
                      Command(resume=decision.answer),
-                     config=thread_for(conversation_id,
-                                       checkpoint_ns=row.checkpoint_ns,
-                                       checkpoint_id=row.checkpoint_id),
+                     config={"configurable": {
+                         "thread_id": row.checkpoint_thread_id,
+                         "checkpoint_id": row.checkpoint_id}},
                      context=WorkerContext(
                          session=session,
                          delivery_execution_id=answer_execution.id,
@@ -1304,8 +1313,8 @@ ANSWER        -> row = decision.clarification
 
 NEW_INTENT    -> await graph.ainvoke(
                      initial_state | {"pending_decision": decision},
-                     config=thread_for(conversation_id,
-                                       checkpoint_ns=fresh_namespace(new_execution.id)),
+                     config=thread_for(conversation_id, new_execution.id,
+                                       new_delivery_id()),
                      context=WorkerContext(session=session,
                                            delivery_execution_id=new_execution.id,
                                            task_execution_id=new_execution.id, ...))
@@ -1588,7 +1597,7 @@ The demo runs green against `make up`, and red against a stack with the worker s
 
 **ADR-005 — Static MainGraph with ExecutionPlan DAG as data.** §43 has listed it since Sprint 1 and no sprint had earned it. Traceability: §11.1, §11.2, Q121, Q122, Q127, DEC-002. Enforced by: the topology test, the compile-once test, the absence of `can_run_parallel`.
 
-**ADR-015 — LangGraph checkpoint isolation.** The dedicated schema, `search_path` rather than a parameter that does not exist, admin-owned DDL, `thread_id = conversation_id`, and the sentence that matters most: *a checkpoint is never authoritative for business state.* Traceability: §11.5, Q123, Q124, Q145, DEC-005. Enforced by: the schema-location test, the role tests, and the checkpoint-ahead-of-rollback failure injection.
+**ADR-015 — LangGraph checkpoint isolation.** The dedicated schema, `search_path` rather than a parameter that does not exist, admin-owned DDL, the **composite thread id** and why Q123's literal reading could not be kept (`checkpoint_ns` is unreadable at the top level; measured in WS-4), and the sentence that matters most: *a checkpoint is never authoritative for business state.* Traceability: §11.5, Q123, Q124, Q145, DEC-005. Enforced by: the schema-location test, the role tests, and the checkpoint-ahead-of-rollback failure injection.
 
 **ADR-016 — Clarification as an interrupt.** Why `pending_clarifications` exists beside the checkpoint (Q125), why at most one is open per conversation, why the marker check precedes the parse (Q29), why `expected_response_schema` had to gain a `kind` §40.2 does not name, why the pause is completed by the worker rather than by the suspended graph, and why `resolve_pending_workflow` records a decision it does not compute. Traceability: §15, §39.2, §40.2, Q29, Q125, Q126. Enforced by: the partial unique index test, the Q29 ordering test, the golden spec fixture.
 
@@ -1637,7 +1646,7 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | Checkpoint tables only in `langgraph` | WS-1 |
 | The worker role writes checkpoints, creates nothing | WS-1 |
 | A checkpoint ahead of a rollback yields one set | WS-7 |
-| `thread_id` equals `conversation_id` | WS-4, WS-7 |
+| The thread names conversation, execution and delivery | WS-4, WS-7 |
 | A failed required predecessor skips its subtree | WS-3, WS-5 |
 | `execution_tasks` reports terminal status | WS-5 |
 | A mixed outcome ends `PARTIAL_SUCCESS` | WS-3, WS-6 |
