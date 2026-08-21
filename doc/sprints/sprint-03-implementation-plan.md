@@ -20,13 +20,17 @@ Sprint 2 shipped a scorer the plan had named wrongly, and the only reason it was
 
 Consequences, applied throughout this plan: isolation comes from `search_path` on the checkpointer's own connection (D2), `setup()` is run by the admin identity because it issues DDL (D3), and WS-1's first test asserts *where the four tables actually landed* rather than trusting any of this.
 
-Two more items are named but **not yet measured**; measure them before writing the code they belong to, and record the result in the PR:
+**Measured in WS-4, and one of them was false.** The five items below were open when this plan was written; `tests/graph/test_langgraph_semantics.py` now pins each answer, so a LangGraph upgrade that changes one fails loudly instead of WS-8 and WS-9 failing subtly:
 
-- **`interrupt()` semantics under a resumed thread with a modified input.** The plan assumes `Command(resume=value)` re-enters the interrupted node and that nodes before it do not re-run. Verify against the pinned version before WS-8 hardens around it.
-- **What `ainvoke` returns for a suspended graph.** WS-8 reads the pending interrupt out of it through a single accessor; confirm the shape in WS-4.
-- **`checkpoint_ns` as a top-level isolation key.** D4 uses it to keep two runs in one conversation apart. It is documented as the subgraph namespace, and using it this way must be verified before WS-9 depends on it. **Fallback:** a composite `thread_id` of `f"{conversation_id}:{execution_id}:{attempt}"`, which works but reads Q123 loosely and would need an ADR amendment saying so. Decide in WS-4, not in WS-9.
-- **Forking from an explicit `checkpoint_id`.** WS-7's reconciliation depends on a resume re-entering the interrupt point rather than the latest checkpoint of that namespace. **Fallback** if it will not: re-run the whole batch in a fresh namespace and let `processed_operations` absorb the already-committed half.
-- **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
+| Question | Answer | Consequence |
+| --- | --- | --- |
+| What does `ainvoke` return for a suspended graph? | `{"__interrupt__": [Interrupt(value=..., id=...)], ...}`, and `aget_state` reports `next` plus the checkpoint id | WS-8's accessor reads `__interrupt__`; the pause point comes from `aget_state(...).config` |
+| Do nodes before the interrupt re-run on resume? | **No** | As assumed |
+| Does the interrupted node resume *at* the `interrupt()` call? | **No — it re-runs from the top of the node** | Everything the handler does before `ask()` happens twice. WS-8's commit is idempotent under `processed_operations`, which is now load-bearing rather than belt-and-braces |
+| Can `checkpoint_ns` isolate two runs of one thread? | **No.** The run writes, but `aget_state` raises `ValueError: Subgraph … not found` | **D4 changed.** Isolation moved into a composite `thread_id`; ADR-005 records the deviation from a literal Q123 |
+| Can a resume fork from an explicit `checkpoint_id`? | Yes, and it **replays the resume value already recorded** — a second `Command(resume=…)` with a different value is ignored | WS-7's reconciliation works; a retry re-applies the same answer and cannot correct one |
+
+Still unmeasured, and belonging to WS-7: **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
 
 ## Decisions applied
 
@@ -35,7 +39,7 @@ Two more items are named but **not yet measured**; measure them before writing t
 | D1 | `langgraph>=1.2,<2` and `langgraph-checkpoint-postgres>=3.1,<4` in `[project].dependencies` (WS-1) |
 | D2 | `CHECKPOINT_SCHEMA = "langgraph"` in `app/infrastructure/langgraph/checkpointer.py`; the psycopg DSN carries `options=-c%20search_path%3Dlanggraph` |
 | D3 | `scripts/checkpointer_setup.py`, invoked by `make migrate` after `alembic upgrade head`, connecting as the admin role |
-| D4 | `thread_id=str(conversation_id)` **and** `checkpoint_ns=str(workflow_execution_id)`, built by one function, `thread_for(...)`, so no call site can invent its own. Q123 is satisfied by the thread; the namespace is what keeps two runs in one conversation from overwriting each other |
+| D4 | ~~`checkpoint_ns`~~ — **superseded by measurement.** `thread_id = f"{conversation_id}:{execution_id}:{delivery_id}"`, built by `thread_id_for(...)` so no call site can invent its own. The conversation keeps Q123's intent, the execution keeps Q29's two runs apart, and the delivery keeps a retry from inheriting a rolled-back attempt's checkpoint |
 | D5 | `IntentRouterPort` in `app/application/ports/routing.py`; `DeterministicIntentRouter` wraps Sprint 2's `route()` |
 | D6 | `DeterministicExecutionPlanner` in `app/application/services/execution_planner.py`; one task per routed intent |
 | D7 | `app/graphs/main/interrupts.py` owns every `interrupt()` call; no other module imports it from `langgraph` |
