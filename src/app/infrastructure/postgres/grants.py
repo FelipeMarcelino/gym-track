@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Final
 
 from app.config import ServiceName
+from app.infrastructure.langgraph.checkpointer import CHECKPOINT_SCHEMA
 
 #: table -> privileges, per service. Anything absent is denied by omission.
 SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
@@ -89,6 +90,20 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
         "outbound_messages": ("SELECT", "UPDATE"),
         "domain_events": ("SELECT", "INSERT"),
         "outbox_events": ("SELECT", "INSERT"),
+    },
+}
+
+#: schema -> privileges on every table in it, per service, for schemas outside
+#: `public`. Only one exists: LangGraph's checkpoint store (ADR-015).
+#:
+#: This is the single place in the system where DELETE is granted, and the
+#: invariant test above is right to say no *service table* grants it: §26's soft
+#: deletion is about domain rows whose history is worth keeping. A checkpointer
+#: that cannot delete its own superseded writes grows without bound, and a
+#: checkpoint is rebuildable coordination state rather than history.
+SCHEMA_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
+    ServiceName.WORKFLOW_WORKER: {
+        CHECKPOINT_SCHEMA: ("SELECT", "INSERT", "UPDATE", "DELETE"),
     },
 }
 

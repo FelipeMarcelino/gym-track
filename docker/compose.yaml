@@ -97,7 +97,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["alembic", "upgrade", "head"]
+    # Two statements, because the checkpoint tables arrive by script rather
+    # than by a migration (§11.5): a fresh volume that ran only the first would
+    # start the workflow worker against an empty schema it cannot populate.
+    command:
+      - "sh"
+      - "-c"
+      - "alembic upgrade head && python -m app.infrastructure.langgraph.checkpointer"
     restart: "no"
 
   api:

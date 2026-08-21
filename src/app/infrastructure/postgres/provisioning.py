@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
 from app.config import ApplicationSettings, ServiceName
-from app.infrastructure.postgres.grants import SERVICE_GRANTS
+from app.infrastructure.postgres.grants import SCHEMA_GRANTS, SERVICE_GRANTS
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,42 @@ def existing_tables(connection: Connection) -> frozenset[str]:
     return frozenset(rows)
 
 
+def _schema_exists(connection: Connection, schema: str) -> bool:
+    found = connection.execute(
+        sa.text("SELECT 1 FROM information_schema.schemata WHERE schema_name = :name"),
+        {"name": schema},
+    ).first()
+    return found is not None
+
+
+def _sync_schema_grants(connection: Connection, service: ServiceName, role: str) -> None:
+    """Grants on a schema outside `public`, applied convergently.
+
+    `ALTER DEFAULT PRIVILEGES` is the half that matters. The checkpoint tables
+    are created after this runs -- by `make migrate`, not by a migration -- and
+    a checkpointer release that adds a fifth table must not need a migration
+    before the worker can write to it. Default privileges make the grant apply
+    to whatever the admin creates there next.
+    """
+    for schema, privileges in SCHEMA_GRANTS.get(service, {}).items():
+        if not _schema_exists(connection, schema):
+            logger.info(
+                "skipping grants for a schema that does not exist yet",
+                extra={"schema": schema, "role": role},
+            )
+            continue
+        name = _identifier(schema)
+        granted = ", ".join(_privilege(privilege) for privilege in privileges)
+        connection.execute(sa.text(f"GRANT USAGE ON SCHEMA {name} TO {role}"))
+        connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {name} FROM {role}"))
+        connection.execute(sa.text(f"GRANT {granted} ON ALL TABLES IN SCHEMA {name} TO {role}"))
+        connection.execute(
+            sa.text(
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {name} GRANT {granted} ON TABLES TO {role}"
+            )
+        )
+
+
 def sync_service_roles(connection: Connection, settings: ApplicationSettings) -> None:
     """Create or update every service role and reset its grants to the policy.
 
@@ -103,12 +139,28 @@ def sync_service_roles(connection: Connection, settings: ApplicationSettings) ->
             granted = ", ".join(_privilege(privilege) for privilege in privileges)
             connection.execute(sa.text(f"GRANT {granted} ON {_identifier(table)} TO {name}"))
 
+        _sync_schema_grants(connection, service, name)
+
 
 def drop_service_roles(connection: Connection, settings: ApplicationSettings) -> None:
     for service in ServiceName:
         name = _identifier(settings.postgres.roles[service].user)
         if not _role_exists(connection, name):
             continue
+        for schema in SCHEMA_GRANTS.get(service, {}):
+            if not _schema_exists(connection, schema):
+                continue
+            qualified = _identifier(schema)
+            connection.execute(
+                sa.text(
+                    f"ALTER DEFAULT PRIVILEGES IN SCHEMA {qualified} "
+                    f"REVOKE ALL ON TABLES FROM {name}"
+                )
+            )
+            connection.execute(
+                sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {qualified} FROM {name}")
+            )
+            connection.execute(sa.text(f"REVOKE ALL ON SCHEMA {qualified} FROM {name}"))
         connection.execute(sa.text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {name}"))
         connection.execute(sa.text(f"REVOKE ALL ON SCHEMA public FROM {name}"))
         connection.execute(sa.text(f"DROP OWNED BY {name}"))

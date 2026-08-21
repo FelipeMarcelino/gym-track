@@ -108,3 +108,45 @@ async def test_async_test_runner_is_wired() -> None:
     """pytest-asyncio in auto mode: an `async def` test must actually run."""
     await asyncio.sleep(0)
     assert asyncio.get_running_loop().is_running()
+
+
+ORCHESTRATION_PACKAGES = ("langgraph", "langchain", "langchain_core")
+
+#: Where an orchestration import is allowed to appear. LangGraph is an adapter:
+#: the domain must stay pure (it already may not import SQLAlchemy) and the
+#: application layer must keep talking through its own ports, or Sprint 4 swaps
+#: a node and finds the coupling everywhere.
+ORCHESTRATION_ALLOWED = (
+    "src/app/graphs/",
+    "src/app/infrastructure/langgraph/",
+)
+
+
+def _python_sources() -> list[Path]:
+    return sorted((REPO_ROOT / "src" / "app").rglob("*.py"))
+
+
+def _imported_roots(source: Path) -> set[str]:
+    import ast
+
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+@pytest.mark.parametrize("source", _python_sources(), ids=lambda path: path.name)
+def test_only_the_graph_package_imports_the_orchestration_library(source: Path) -> None:
+    relative = source.relative_to(REPO_ROOT).as_posix()
+    if relative.startswith(ORCHESTRATION_ALLOWED):
+        return
+
+    offending = _imported_roots(source) & set(ORCHESTRATION_PACKAGES)
+    assert not offending, (
+        f"{relative} imports {sorted(offending)}; LangGraph is an adapter and "
+        "belongs behind app/graphs/ or app/infrastructure/langgraph/"
+    )
