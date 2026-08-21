@@ -29,10 +29,26 @@ class TaskStatus(StrEnum):
     SKIPPED = "skipped"
 
 
-#: Statuses that mean the task is over and will not run again in this delivery.
-TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+#: The task ran -- or was skipped -- and produced whatever it is ever going to
+#: produce. This is the set that pairs with `finished_at` in the database, and
+#: the one a dependant with `ALLOW_PARTIAL` waits for: "run with whatever it
+#: produced" needs something to have been produced.
+FINISHED_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED}
 )
+
+#: Nothing more will happen in *this delivery*. A wider set, and the difference
+#: is exactly `WAITING_FOR_USER`: a paused task has not finished -- it has no
+#: result, no `finished_at`, and its dependants may still run when the user
+#: answers -- but the message is answered and acked, so the plan is done for
+#: now.
+#:
+#: Keeping these two apart is not pedantry. Collapsing them either lets an
+#: `ALLOW_PARTIAL` dependant run while its dependency is still waiting on a
+#: human, or holds a partition open until somebody replies.
+DELIVERY_TERMINAL_STATUSES: frozenset[TaskStatus] = FINISHED_TASK_STATUSES | {
+    TaskStatus.WAITING_FOR_USER
+}
 
 
 class DependencyPolicy(StrEnum):
