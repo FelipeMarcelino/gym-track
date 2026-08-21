@@ -111,7 +111,8 @@ def thread_id_for(conversation_id: UUID, execution_id: UUID, delivery_id: UUID) 
     a run started under a top-level `checkpoint_ns` writes, but `aget_state`
     refuses to read it back -- LangGraph treats the field as a subgraph
     namespace. WS-9 has to read and resume that state, so the composite thread
-    id is what ships. ADR-005 records the deviation from a literal Q123.
+    id is what ships. ADR-015 -- which owns checkpoint isolation -- records
+    the deviation from a literal Q123.
     """
     return f"{conversation_id}:{execution_id}:{delivery_id}"
 

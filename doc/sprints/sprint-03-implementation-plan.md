@@ -27,7 +27,7 @@ Consequences, applied throughout this plan: isolation comes from `search_path` o
 | What does `ainvoke` return for a suspended graph? | `{"__interrupt__": [Interrupt(value=..., id=...)], ...}`, and `aget_state` reports `next` plus the checkpoint id | WS-8's accessor reads `__interrupt__`; the pause point comes from `aget_state(...).config` |
 | Do nodes before the interrupt re-run on resume? | **No** | As assumed |
 | Does the interrupted node resume *at* the `interrupt()` call? | **No — it re-runs from the top of the node** | Everything the handler does before `ask()` happens twice. WS-8's commit is idempotent under `processed_operations`, which is now load-bearing rather than belt-and-braces |
-| Can `checkpoint_ns` isolate two runs of one thread? | **No.** The run writes, but `aget_state` raises `ValueError: Subgraph … not found` | **D4 changed.** Isolation moved into a composite `thread_id`; ADR-005 records the deviation from a literal Q123 |
+| Can `checkpoint_ns` isolate two runs of one thread? | **No.** The run writes, but `aget_state` raises `ValueError: Subgraph … not found` | **D4 changed.** Isolation moved into a composite `thread_id`; ADR-015 records the deviation from a literal Q123 |
 | Can a resume fork from an explicit `checkpoint_id`? | Yes, and it **replays the resume value already recorded** — a second `Command(resume=…)` with a different value is ignored | WS-7's reconciliation works; a retry re-applies the same answer and cannot correct one |
 
 Still unmeasured, and belonging to WS-7: **`psycopg_pool` behaviour under the worker's shutdown path.** The plan assumes an explicit `close()` is enough for §37.4; verify no task is left pending on SIGTERM.
@@ -531,7 +531,9 @@ def new_delivery_id() -> UUID:
     """A uuid per delivery -- see WS-7 on why this is not a counter."""
     """`{"configurable": {"thread_id": "<conversation>:<execution>:<delivery>"}}`.
 
-    The thread is the conversation, as Q123 requires. The namespace is the
+    Three parts, each earning its place. The conversation keeps Q123's
+    intent, the execution keeps Q29's two runs apart, and the delivery keeps a
+    retry from inheriting a rolled-back attempt's checkpoint. The namespace is the
     execution *and its attempt*, and neither half is decoration:
 
     * the execution, because a conversation can have a paused workflow **and**
@@ -975,7 +977,7 @@ rows.
 `tests/integration/test_workflow_worker_graph.py`
 
 - The whole of Sprint 1's and Sprint 2's worker suites, still green, with **no assertion relaxed**. If a test needs changing to accommodate the graph, that is a finding for the PR description, not a quiet edit.
-- `test_the_thread_is_the_conversation` — the checkpoint lands under `str(conversation_id)` (Q123).
+- `test_the_thread_names_the_conversation_the_execution_and_the_delivery` — the checkpoint lands under the composite thread, and its first segment is the conversation, which is Q123's intent (ADR-015).
 - `test_two_batches_in_one_conversation_share_a_thread` — and the second does not resume the first.
 - `test_a_graph_that_raises_fails_the_execution` — status FAILED, error recorded, the exception propagates so the broker retries.
 - `test_a_redelivered_question_is_not_asked_twice` — a batch that committed `WAITING_FOR_USER` and lost its ACK returns without effects: one outbound question, one WAITING row, no second run.
@@ -1595,7 +1597,7 @@ The demo runs green against `make up`, and red against a stack with the worker s
 
 **ADR-005 — Static MainGraph with ExecutionPlan DAG as data.** §43 has listed it since Sprint 1 and no sprint had earned it. Traceability: §11.1, §11.2, Q121, Q122, Q127, DEC-002. Enforced by: the topology test, the compile-once test, the absence of `can_run_parallel`.
 
-**ADR-015 — LangGraph checkpoint isolation.** The dedicated schema, `search_path` rather than a parameter that does not exist, admin-owned DDL, `thread_id = conversation_id`, and the sentence that matters most: *a checkpoint is never authoritative for business state.* Traceability: §11.5, Q123, Q124, Q145, DEC-005. Enforced by: the schema-location test, the role tests, and the checkpoint-ahead-of-rollback failure injection.
+**ADR-015 — LangGraph checkpoint isolation.** The dedicated schema, `search_path` rather than a parameter that does not exist, admin-owned DDL, the **composite thread id** and why Q123's literal reading could not be kept (`checkpoint_ns` is unreadable at the top level; measured in WS-4), and the sentence that matters most: *a checkpoint is never authoritative for business state.* Traceability: §11.5, Q123, Q124, Q145, DEC-005. Enforced by: the schema-location test, the role tests, and the checkpoint-ahead-of-rollback failure injection.
 
 **ADR-016 — Clarification as an interrupt.** Why `pending_clarifications` exists beside the checkpoint (Q125), why at most one is open per conversation, why the marker check precedes the parse (Q29), why `expected_response_schema` had to gain a `kind` §40.2 does not name, why the pause is completed by the worker rather than by the suspended graph, and why `resolve_pending_workflow` records a decision it does not compute. Traceability: §15, §39.2, §40.2, Q29, Q125, Q126. Enforced by: the partial unique index test, the Q29 ordering test, the golden spec fixture.
 
@@ -1644,7 +1646,7 @@ Every DoD line in the sprint file, and the workstream that must deliver it. A li
 | Checkpoint tables only in `langgraph` | WS-1 |
 | The worker role writes checkpoints, creates nothing | WS-1 |
 | A checkpoint ahead of a rollback yields one set | WS-7 |
-| `thread_id` equals `conversation_id` | WS-4, WS-7 |
+| The thread names conversation, execution and delivery | WS-4, WS-7 |
 | A failed required predecessor skips its subtree | WS-3, WS-5 |
 | `execution_tasks` reports terminal status | WS-5 |
 | A mixed outcome ends `PARTIAL_SUCCESS` | WS-3, WS-6 |
