@@ -18,10 +18,13 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.domain.clarification.status import ClarificationReason, ClarificationStatus
 from app.domain.exercises.catalog import AliasSource, ExerciseRelationType, MuscleRole
+from app.domain.results import ResultVisibility, TaskType
 from app.domain.training.activities import ActivityType, LoadMode, SetType
 from app.domain.training.effort import EffortMethod
 from app.domain.training.provenance import ExerciseGroupType, Provenance, SourceRole
+from app.domain.workflow.tasks import TaskStatus
 from app.infrastructure.postgres.base import Base, SoftDeleteMixin, enum_column
 
 
@@ -57,9 +60,53 @@ class MessageBatchStatus(StrEnum):
 
 
 class WorkflowExecutionStatus(StrEnum):
+    """How one delivery of one batch ended.
+
+    `WAITING_FOR_USER` and `PARTIAL_SUCCESS` are *committed outcomes*, not
+    failures (Q28): a workflow that asked a question or recorded half of a
+    mixed batch did its job, and a redelivery of it must produce no second
+    effect. Only RUNNING (a crash mid-flight) and FAILED are re-run.
+    """
+
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    WAITING_FOR_USER = "waiting_for_user"
+    PARTIAL_SUCCESS = "partial_success"
+
+
+#: The execution finished. Paired with `finished_at` by a CHECK constraint --
+#: `WAITING_FOR_USER` is deliberately absent, because a paused execution has
+#: not finished and stamping it would make "how long do users take to answer"
+#: unanswerable.
+FINISHED_WORKFLOW_STATUSES: frozenset[WorkflowExecutionStatus] = frozenset(
+    {
+        WorkflowExecutionStatus.SUCCEEDED,
+        WorkflowExecutionStatus.FAILED,
+        WorkflowExecutionStatus.PARTIAL_SUCCESS,
+    }
+)
+
+#: This delivery committed an outcome, so a redelivery of its batch must
+#: produce nothing. A *different* set from the one above, and the two
+#: differences are the whole point:
+#:
+#: * `WAITING_FOR_USER` is here and not there -- a question that committed is
+#:   durable work even though the execution has not finished. Re-running it
+#:   would ask twice, or collide with its own row on the open-clarification
+#:   index.
+#: * `FAILED` is there and not here -- a failed delivery is exactly the one the
+#:   broker should redeliver.
+#:
+#: The same distinction `FINISHED_TASK_STATUSES` and
+#: `DELIVERY_TERMINAL_STATUSES` draw one level down.
+COMMITTED_WORKFLOW_OUTCOMES: frozenset[WorkflowExecutionStatus] = frozenset(
+    {
+        WorkflowExecutionStatus.SUCCEEDED,
+        WorkflowExecutionStatus.WAITING_FOR_USER,
+        WorkflowExecutionStatus.PARTIAL_SUCCESS,
+    }
+)
 
 
 class DeliveryState(StrEnum):
@@ -239,7 +286,16 @@ class WorkflowExecution(Base):
     """One execution per batch: redelivery resumes it, never duplicates it (§28)."""
 
     __tablename__ = "workflow_executions"
-    __table_args__ = (sa.UniqueConstraint("message_batch_id", name="uq_workflow_executions_batch"),)
+    __table_args__ = (
+        sa.UniqueConstraint("message_batch_id", name="uq_workflow_executions_batch"),
+        # Terminality and its timestamp are two statements of the same fact.
+        # A SUCCEEDED row with no `finished_at` makes every duration query
+        # silently wrong, and `WAITING_FOR_USER` must *not* be stamped.
+        sa.CheckConstraint(
+            "(status IN ('succeeded', 'failed', 'partial_success')) = (finished_at IS NOT NULL)",
+            name="ck_workflow_executions_finished_when_terminal",
+        ),
+    )
 
     message_batch_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("message_batches.id", ondelete="CASCADE"), nullable=False
@@ -251,7 +307,11 @@ class WorkflowExecution(Base):
         sa.ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
     )
     status: Mapped[WorkflowExecutionStatus] = mapped_column(
-        enum_column(WorkflowExecutionStatus),
+        # Named explicitly. Migration 0011 had to drop SQLAlchemy's
+        # auto-generated `workflowexecutionstatus` to widen the vocabulary, and
+        # a model that still asked for the old name would leave the schema and
+        # the metadata disagreeing -- which the drift test catches, loudly.
+        enum_column(WorkflowExecutionStatus, name="ck_workflow_executions_status"),
         default=WorkflowExecutionStatus.RUNNING,
         nullable=False,
     )
@@ -263,6 +323,17 @@ class WorkflowExecution(Base):
     error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
     correlation_id: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    #: Q132. A column rather than checkpoint state, because ADR-015 says the
+    #: checkpoint is not authoritative and may be pruned -- traceability that
+    #: lives only there disappears with it. Nullable: rows written before this
+    #: column existed have no honest value for it.
+    graph_version: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    #: The paused execution this one resumed, when it is an answer to a
+    #: clarification. An answer is its own `MessageBatch` and therefore its own
+    #: execution; without this link the pair is unrecoverable afterwards.
+    resumed_execution_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("workflow_executions.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class ProcessedOperation(Base):
@@ -853,3 +924,136 @@ class EntitySource(Base):
         sa.ForeignKey("message_batches.id", ondelete="CASCADE"), nullable=True
     )
     source_role: Mapped[SourceRole] = mapped_column(enum_column(SourceRole), nullable=False)
+
+
+class ExecutionTask(Base):
+    """One task of one execution's plan, outside the checkpoint (Q118, Q128).
+
+    §11.2's contract as columns. It exists so "what is this workflow doing" is
+    a SQL question during the run and an audit afterwards, rather than
+    something answerable only by decoding a LangGraph checkpoint -- which is
+    coordination state, not a record of what happened.
+    """
+
+    __tablename__ = "execution_tasks"
+    __table_args__ = (
+        # Referenced by `pending_clarifications`' composite foreign key, which
+        # is what stops a clarification from pointing at a task key that exists
+        # under a different execution.
+        sa.UniqueConstraint(
+            "workflow_execution_id", "task_key", name="uq_execution_tasks_key_per_execution"
+        ),
+        sa.CheckConstraint(
+            "(status IN ('completed', 'failed', 'skipped')) = (finished_at IS NOT NULL)",
+            name="ck_execution_tasks_finished_when_terminal",
+        ),
+    )
+
+    workflow_execution_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflow_executions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: Stable within a plan: the plan's own identifier for the task, not a row
+    #: id, so a re-planned redelivery collides with the row it already wrote.
+    task_key: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    task_type: Mapped[TaskType] = mapped_column(
+        enum_column(TaskType, name="ck_execution_tasks_task_type"), nullable=False
+    )
+    status: Mapped[TaskStatus] = mapped_column(
+        enum_column(TaskStatus, name="ck_execution_tasks_status"),
+        default=TaskStatus.PENDING,
+        nullable=False,
+    )
+    result_visibility: Mapped[ResultVisibility] = mapped_column(
+        enum_column(ResultVisibility, name="ck_execution_tasks_result_visibility"),
+        default=ResultVisibility.USER_VISIBLE,
+        nullable=False,
+    )
+    #: `[{"task_key": ..., "policy": ...}]`. Stored rather than derived because
+    #: this table is read after the plan object is gone.
+    depends_on: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=sa.text("'[]'::jsonb"), nullable=False
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=sa.text("'{}'::jsonb"), nullable=False
+    )
+    #: The facts the handler produced, kept for debugging and for the response
+    #: guard's after-the-fact questions. Null until the task completes.
+    result_facts: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(sa.Integer, default=0, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+
+class PendingClarification(Base):
+    """A question the system is waiting on, as operational state (Q125).
+
+    The checkpoint knows a workflow is suspended; it cannot be *searched* for
+    "does this conversation have an open question", which is what every
+    incoming message needs to ask. So the pause is mirrored here, in the same
+    transaction, and this row -- not the checkpoint -- is what the resolver
+    reads.
+
+    It also carries where to resume from. A redelivered answer must fork from
+    the checkpoint the interrupt was taken at rather than from wherever the
+    previous attempt died, so `checkpoint_ns` and `checkpoint_id` are durable
+    facts about the pause, not something reconstructed later.
+    """
+
+    __tablename__ = "pending_clarifications"
+    __table_args__ = (
+        sa.UniqueConstraint("clarification_id", name="uq_pending_clarifications_clarification_id"),
+        sa.ForeignKeyConstraint(
+            ["workflow_execution_id", "task_key"],
+            ["execution_tasks.workflow_execution_id", "execution_tasks.task_key"],
+            name="fk_pending_clarifications_task_in_same_execution",
+            ondelete="CASCADE",
+        ),
+        # At most one open question per conversation (D11). Two would make "the
+        # answer" ambiguous with no deterministic way to disambiguate, and the
+        # database is where that invariant belongs -- not in the resolver that
+        # would otherwise have to guess.
+        sa.Index(
+            "uq_pending_clarifications_open_per_conversation",
+            "conversation_id",
+            unique=True,
+            postgresql_where=sa.text("status = 'waiting'"),
+        ),
+        sa.CheckConstraint(
+            "(status = 'waiting') = (resolved_at IS NULL)",
+            name="ck_pending_clarifications_resolved_when_closed",
+        ),
+        sa.Index("ix_pending_clarifications_expiry", "expires_at"),
+    )
+
+    #: What the `ClarificationSpec` carries, so the row and the checkpointed
+    #: spec can be matched without decoding the checkpoint.
+    clarification_id: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    workflow_execution_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflow_executions.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    task_key: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    reason: Mapped[ClarificationReason] = mapped_column(
+        enum_column(ClarificationReason, name="ck_pending_clarifications_reason"), nullable=False
+    )
+    status: Mapped[ClarificationStatus] = mapped_column(
+        enum_column(ClarificationStatus, name="ck_pending_clarifications_status"),
+        default=ClarificationStatus.WAITING,
+        nullable=False,
+    )
+    #: The frozen `ClarificationSpec`, as sent. Stored whole so a question can
+    #: be re-asked or audited without reconstructing it from the domain.
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    checkpoint_ns: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    checkpoint_id: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    answer_message_batch_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("message_batches.id", ondelete="SET NULL"), nullable=True
+    )

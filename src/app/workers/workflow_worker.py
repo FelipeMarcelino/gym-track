@@ -34,6 +34,7 @@ from app.graphs.main.handlers import (
 from app.graphs.main.routing import route
 from app.infrastructure.postgres.engine import unit_of_work
 from app.infrastructure.postgres.models import (
+    COMMITTED_WORKFLOW_OUTCOMES,
     DeliveryState,
     Message,
     MessageBatch,
@@ -101,10 +102,16 @@ class WorkflowWorker:
                 execution, resumed = await self._execution_for(session, batch)
                 with_workflow_execution(str(execution.id))
 
-                if resumed and execution.status is WorkflowExecutionStatus.SUCCEEDED:
+                if resumed and execution.status in COMMITTED_WORKFLOW_OUTCOMES:
                     # A redelivery of work that already committed. The outbound
                     # rows exist, the dispatcher owns them, and doing anything
                     # else here would double the user's reply.
+                    #
+                    # Every committed outcome, not only SUCCEEDED: a delivery
+                    # that asked a clarification or recorded half a mixed batch
+                    # is durable work too, and re-running it would ask twice or
+                    # collide with its own row on the open-clarification index.
+                    # Only RUNNING (a crash mid-flight) and FAILED re-run.
                     logger.info(
                         "workflow execution already completed; skipping",
                         extra={"message_batch_id": str(message_batch_id)},

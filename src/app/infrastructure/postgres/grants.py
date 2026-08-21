@@ -62,6 +62,8 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
         "message_batches": ("SELECT", "UPDATE"),
         "message_batch_items": ("SELECT",),
         "workflow_executions": ("SELECT", "INSERT", "UPDATE"),
+        "execution_tasks": ("SELECT", "INSERT", "UPDATE"),
+        "pending_clarifications": ("SELECT", "INSERT", "UPDATE"),
         "processed_operations": ("SELECT", "INSERT"),
         "outbound_messages": ("SELECT", "INSERT"),
         "domain_events": ("SELECT", "INSERT"),
@@ -76,6 +78,14 @@ SERVICE_GRANTS: Final[dict[ServiceName, dict[str, tuple[str, ...]]]] = {
         # No INSERT, deliberately: a bug that made the sweep *open* a session
         # is refused by PostgreSQL rather than discovered in a user's history.
         "training_sessions": ("SELECT", "UPDATE"),
+        # Expiring a question has to terminate the execution and the task that
+        # were waiting on it, in the same transaction. Closing only the
+        # clarification leaves nothing able to resume its checkpoint, so the
+        # pair would sit in WAITING_FOR_USER forever and every "what is waiting
+        # on a user" query would be wrong from then on (WS-9).
+        "pending_clarifications": ("SELECT", "UPDATE"),
+        "workflow_executions": ("SELECT", "UPDATE"),
+        "execution_tasks": ("SELECT", "UPDATE"),
         # It closes sessions, so it attributes them.
         "audit_events": ("SELECT", "INSERT"),
         "domain_events": ("SELECT", "INSERT"),
@@ -128,6 +138,8 @@ ALL_TABLES: Final[tuple[str, ...]] = (
     "message_batches",
     "message_batch_items",
     "workflow_executions",
+    "execution_tasks",
+    "pending_clarifications",
     "processed_operations",
     "outbound_messages",
     "domain_events",

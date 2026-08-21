@@ -157,11 +157,17 @@ class WorkflowSettings(BaseModel):
     conversation_timeout: timedelta = Field(default=timedelta(hours=12))
     training_session_timeout: timedelta = Field(default=timedelta(hours=3))
     correction_grace_period: timedelta = Field(default=timedelta(minutes=30))
+    # §44: calibrated by product policy, not by architecture. Long enough to
+    # survive a gym session, short enough that yesterday's question cannot
+    # capture today's message.
+    clarification_timeout: timedelta = Field(default=timedelta(hours=6))
 
     @model_validator(mode="after")
     def windows_are_ordered(self) -> WorkflowSettings:
         if self.debounce_window <= timedelta(0):
             raise ValueError("debounce_window must be positive")
+        if self.clarification_timeout <= timedelta(0):
+            raise ValueError("clarification_timeout must be positive")
         if self.debounce_window >= self.max_batch_window:
             raise ValueError(
                 "debounce_window must be shorter than max_batch_window, otherwise the "
