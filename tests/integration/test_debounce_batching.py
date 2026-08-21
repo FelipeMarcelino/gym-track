@@ -163,13 +163,20 @@ async def test_three_fragments_inside_the_window_become_one_batch(
 ) -> None:
     """The demo of the sprint: three messages, one batch, one workflow input."""
     user_id, conversation_id = conversation
+    # In the past, like its sibling below. The fragments only need distinct,
+    # ordered timestamps -- but `_unbatched_messages` bounds its query by
+    # `received_at <= claim_time`, so a fragment stamped in the future is
+    # excluded from the very batch this test is asserting it lands in. The
+    # margin used to be milliseconds, which held only while the flush was
+    # slower than the writes.
+    base = datetime.now(UTC) - timedelta(seconds=5)
     for index, text in enumerate(["fiz supino", "3x10", "80kg"]):
         message_id = await _add_message(
             session_factory,
             user_id=user_id,
             conversation_id=conversation_id,
             text=text,
-            received_at=datetime.now(UTC) + timedelta(milliseconds=index),
+            received_at=base + timedelta(milliseconds=index),
         )
         await _register(
             aggregator, user_id=user_id, conversation_id=conversation_id, message_id=message_id
