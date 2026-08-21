@@ -12,7 +12,6 @@ still work and would quietly make the "static" in DEC-002 a comment.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import cache
 from itertools import pairwise
 from typing import Any, Final
 
@@ -41,43 +40,27 @@ NODE_SEQUENCE: Final[tuple[str, ...]] = (
 )
 
 
-@cache
-def compiled_main_graph(
-    *,
-    router: IntentRouterPort,
-    planner: ExecutionPlannerPort,
-    checkpointer: BaseCheckpointSaver[str] | None = None,
-) -> CompiledStateGraph[MainGraphState, WorkerContext]:
-    """The process's graph. Built on first use and reused afterwards (Q121).
-
-    `build_main_graph` below is the pure constructor -- tests want a fresh one
-    per case. This is the accessor an entrypoint calls, and the memo is what
-    makes "static" a property of the running process rather than a claim in a
-    docstring: compilation walks every node and edge, and doing it per message
-    would still work while paying for a rebuild on every WhatsApp fragment.
-
-    The cache is keyed on the collaborators, so a worker composed differently
-    -- one without the workout service, say -- gets its own graph rather than
-    silently reusing another's.
-
-    `cache` rather than a bounded LRU, and that is the point rather than an
-    oversight. A bound of one would make two coexisting compositions evict each
-    other: A, then B, then A
-    again compiles A twice, which is exactly the reuse this function exists to
-    provide. There is no growth to bound anyway -- an entry is one composition,
-    and a process composes at startup. Something building compositions in a
-    loop is the bug this accessor is meant to prevent, not a case to cap.
-    """
-    return build_main_graph(router=router, planner=planner, checkpointer=checkpointer)
-
-
 def build_main_graph(
     *,
     router: IntentRouterPort,
     planner: ExecutionPlannerPort,
     checkpointer: BaseCheckpointSaver[str] | None = None,
 ) -> CompiledStateGraph[MainGraphState, WorkerContext]:
-    """Compile the graph. Call once, at process start (Q121)."""
+    """Compile the graph.
+
+    **Called once, by the composition root** -- `worker_runtime` builds it at
+    process start and hands it to the worker, the same way it already hands
+    over the engine, the session factory and the handlers. Q121 is a property
+    of that startup, not of this function.
+
+    An earlier draft memoised this instead, and review took it apart in two
+    steps: a bound of one made two compositions evict each other, and keying a
+    cache on the collaborators requires them to be hashable, which no port
+    demands and a plain `@dataclass` implementation does not satisfy. Both are
+    symptoms of the same mistake -- a cache pretending there is no composition
+    root when there is one. The entrypoint owns the graph; WS-7 wires it and
+    asserts it builds once.
+    """
     builder: StateGraph[MainGraphState, WorkerContext, MainGraphState, MainGraphState] = StateGraph(
         MainGraphState, context_schema=WorkerContext
     )

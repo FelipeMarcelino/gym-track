@@ -19,7 +19,7 @@ from app.application.services.execution_planner import (
     DeterministicExecutionPlanner,
     DeterministicIntentRouter,
 )
-from app.graphs.main.graph import NODE_SEQUENCE, build_main_graph, compiled_main_graph
+from app.graphs.main.graph import NODE_SEQUENCE, build_main_graph
 from app.graphs.main.state import GRAPH_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -85,57 +85,19 @@ def test_the_edges_are_the_straight_line_the_spec_draws(graph) -> None:  # type:
 
 
 def test_the_graph_is_compiled_from_a_fixed_topology(graph) -> None:  # type: ignore[no-untyped-def]
-    """Q121, first half: nothing about the shape depends on an input.
+    """Nothing about the shape depends on an input: two independent builds
+    agree. That is what makes the topology static (DEC-002).
 
-    Two independent builds agree, which is what makes the topology static.
-    It says nothing about *how often* the process builds one -- see below.
+    It says nothing about *how often* a process builds one, and this file
+    cannot: "compiled once at process start" (Q121) is a property of the
+    composition root, and the worker entrypoint that owns it arrives in WS-7
+    with the test that asserts it.
     """
     other = build_main_graph(
         router=DeterministicIntentRouter(), planner=DeterministicExecutionPlanner()
     )
 
     assert set(other.get_graph().nodes) == set(graph.get_graph().nodes)
-
-
-def test_the_process_compiles_the_graph_once() -> None:
-    """Q121, second half, and the half a shape comparison cannot make.
-
-    Two builds producing the same topology is not the same as a process
-    building it once. Compilation walks every node and edge; doing it per
-    message would still work, and would quietly turn "static" into a comment
-    while paying for a graph rebuild on every WhatsApp fragment.
-
-    `compiled_main_graph` is the accessor the entrypoint uses, and it is
-    memoised. The counter here proves the memo rather than trusting it.
-    """
-    router = DeterministicIntentRouter()
-    planner = DeterministicExecutionPlanner()
-
-    compiled_main_graph.cache_clear()
-    first = compiled_main_graph(router=router, planner=planner)
-    second = compiled_main_graph(router=router, planner=planner)
-
-    assert first is second, "a second call must return the graph already compiled"
-
-
-def test_two_compositions_do_not_evict_each_other() -> None:
-    """The memo is keyed on collaborators, so it must hold more than one.
-
-    A bound of one turns "a differently composed worker gets its own graph"
-    into "whichever composition ran last keeps its graph": A, then B, then A
-    again would compile A twice. That is the reuse this accessor exists to
-    provide, so the sequence is the test.
-    """
-    composition_a = (DeterministicIntentRouter(), DeterministicExecutionPlanner())
-    composition_b = (DeterministicIntentRouter(), DeterministicExecutionPlanner())
-
-    compiled_main_graph.cache_clear()
-    first_a = compiled_main_graph(router=composition_a[0], planner=composition_a[1])
-    graph_b = compiled_main_graph(router=composition_b[0], planner=composition_b[1])
-    second_a = compiled_main_graph(router=composition_a[0], planner=composition_a[1])
-
-    assert first_a is second_a, "B must not have evicted A"
-    assert graph_b is not first_a, "distinct compositions get distinct graphs"
 
 
 def test_the_graph_version_is_a_pinned_constant() -> None:
