@@ -213,14 +213,43 @@ async def test_a_privilege_removed_from_the_policy_stops_reaching_new_tables(
             ).scalars()
             assert set(allowed) == {"SELECT"}
     finally:
+        # Undo the patch *before* reprovisioning. pytest restores the attribute
+        # after the test returns, so a `sync_service_roles` call inside this
+        # block still sees the reduced policy and would leave the worker role
+        # SELECT-only for the rest of the session -- database state that no
+        # fixture teardown reverses, and that surfaces as an unrelated test
+        # failing with insufficient privileges.
+        monkeypatch.undo()
         with engine.begin() as connection:
             connection.execute(
                 sa.text(f"DROP TABLE IF EXISTS {CHECKPOINT_SCHEMA}.checkpoint_reduced")
             )
-            # Put the real policy back: the schema grants are session state for
-            # every test that runs after this one.
             provisioning.sync_service_roles(connection, checkpoint_store)
         engine.dispose()
+
+
+async def test_the_reduced_policy_test_puts_the_grants_back(
+    checkpoint_store: ApplicationSettings,
+) -> None:
+    """The guard for the test above.
+
+    Reprovisioning writes database state, and no fixture teardown reverses it.
+    If the restore ever stops working, the symptom is an unrelated test failing
+    on privileges much later in the run -- so it is asserted here instead.
+    """
+    worker = checkpoint_store.postgres.roles[ServiceName.WORKFLOW_WORKER]
+
+    async with await psycopg.AsyncConnection.connect(
+        _unscoped_admin_dsn(checkpoint_store), autocommit=True
+    ) as connection:
+        cursor = await connection.execute(
+            "SELECT DISTINCT privilege_type FROM information_schema.table_privileges "
+            "WHERE table_schema = %s AND grantee = %s",
+            (CHECKPOINT_SCHEMA, worker.user),
+        )
+        allowed = {privilege for (privilege,) in await cursor.fetchall()}
+
+    assert allowed == {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
 
 async def test_the_search_path_is_what_isolates_it(
